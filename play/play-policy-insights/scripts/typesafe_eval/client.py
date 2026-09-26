@@ -441,6 +441,14 @@ class HeuristicJevClient(JevClient):
     if qid == "evidence_supports_claim":
       pattern = str(signal.get("matched_pattern", ""))
       return 0.9 if pattern and pattern in snippet else 0.3
+    if qid == "is_account_deletion":
+      # Real deletion verbs score high; generic "deactivate"/local delete low.
+      pattern = str(signal.get("matched_pattern", "")).lower()
+      strong = ("deleteaccount", "purgeuserdata", "closeaccount", "removeuser",
+                "requestdelete", "destroy_account", "delete_profile")
+      return 0.9 if any(s in pattern for s in strong) else 0.15
+    if qid == "declaration_covers":
+      return 0.5
     return 0.5
 
   @staticmethod

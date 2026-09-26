@@ -170,6 +170,27 @@ def permission_battery(policy_id: str, data_type: str) -> Dict[str, Dict[str, An
   }
 
 
+def account_deletion_gate(data_type: str, description: str) -> Dict[str, Dict[str, Any]]:
+  """A single Noul that filters false-positive account-deletion signals.
+
+  The scanner's ACCOUNT_DELETION patterns (e.g. ``deactivate``, ``delete``) match
+  generic code — a proxy toggle, a local DB delete, a comment, a translation.
+  This asks whether the snippet really implements *user account* deletion.
+  """
+  return {
+      "is_account_deletion": _noul(
+          instructions=(
+              "Does `code_snippet` implement deletion of the user's ACCOUNT or "
+              "profile/identity data — not merely logging out, deactivating a "
+              "VPN/proxy/subscription/feature, deleting a local database record, "
+              "or a UI string/translation?"
+          ),
+          yes="It deletes the user's account or profile/identity data.",
+          no="It does something else (deactivate a feature, local delete, text).",
+      ),
+  }
+
+
 def critic_battery() -> Dict[str, Dict[str, Any]]:
   """One cheap Noul: does the cited evidence support the claim?
 

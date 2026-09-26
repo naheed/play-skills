@@ -110,7 +110,11 @@ def _reduce_noise(data_sources: Dict[str, List[str]]) -> Dict[str, List[str]]:
     per_file: Dict[str, int] = {}
     kept: List[str] = []
     for f in findings:
-      if any(f"/src/{flavor}/" in ("/" + f) for flavor in excluded):
+      path = "/" + f
+      if any(f"/src/{flavor}/" in path for flavor in excluded):
+        continue
+      # Skip string-catalog / UI-text resources (translations cause FPs).
+      if any(frag in path for frag in constants.EXCLUDED_PATH_SUBSTRINGS):
         continue
       relpath, _ = snippets.parse_finding(f)
       relpath = relpath or f
@@ -186,9 +190,21 @@ def run(
   code_tasks = [t for t in tasks if t.spec.kind == registry.CODE_SIGNAL]
   det_tasks = [t for t in tasks if t.spec.kind == registry.DETERMINISTIC]
 
-  # Deterministic policies: no model call.
+  # Deterministic policies: no model call, except an optional evidence gate that
+  # filters generic-pattern false positives.
   for task in det_tasks:
     state = snippets.build_state(app_dir, task.finding_str, task.data_type, app_facts)
+    if task.spec.gate_battery is not None:
+      try:
+        gate = client.system_one(
+            state, task.spec.gate_battery(task.data_type, _description(task.data_type)),
+            model=model,
+        )
+        passed = (gate[task.spec.gate_key].noul or 0.0) >= task.spec.gate_threshold
+      except Exception:  # pylint: disable=broad-exception-caught
+        passed = True  # recall-safe: keep the finding if the gate call failed
+      if not passed:
+        continue
     try:
       finding = task.spec.compose_deterministic(task.data_type, task.finding_str, state)
     except Exception as exc:  # pylint: disable=broad-exception-caught

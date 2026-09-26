@@ -39,6 +39,7 @@ from typing import Dict
 from typing import Optional
 from typing import Tuple
 
+from typesafe_eval import constants
 from typesafe_eval import evaluate
 from typesafe_eval import questions as q
 from typesafe_eval import templates
@@ -71,6 +72,12 @@ class PolicySpec:
   make_battery: Optional[Callable[[str, str], Dict[str, Any]]] = None
   compose: Optional[Callable[..., Optional[Dict[str, Any]]]] = None
   compose_deterministic: Optional[Callable[..., Optional[Dict[str, Any]]]] = None
+  # Optional false-positive gate for deterministic policies: a light model check
+  # that must pass for the finding to be emitted. Filters generic-pattern FPs
+  # (e.g. "deactivate" matching a proxy toggle) without a full battery.
+  gate_battery: Optional[Callable[[str, str], Dict[str, Any]]] = None
+  gate_key: str = ""
+  gate_threshold: float = 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +137,10 @@ def _account_deletion_spec() -> PolicySpec:
       goal="user_account",
       applies_data_type=lambda dt: dt == "ACCOUNT_DELETION",
       compose_deterministic=_account_deletion_finding,
+      # Light evidence gate: only emit when the snippet really deletes an account.
+      gate_battery=q.account_deletion_gate,
+      gate_key="is_account_deletion",
+      gate_threshold=constants.T_ACCOUNT_DELETION,
   )
 
 

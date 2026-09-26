@@ -275,6 +275,7 @@ def _test_reduce_noise() -> None:
                 "app/src/main/B.kt (Pattern: e)"],  # same file x3 -> capped to 2
       "AUDIO": ["app/src/fdroid/C.kt (Pattern: record)",
                 "app/src/play/D.kt (Pattern: MediaRecorder)"],  # fdroid excluded
+      "ACCOUNT_DELETION": ["app/src/main/res/values-tl/strings.xml (Pattern: deactivate)"],
   }
   reduced = engine._reduce_noise(ds)
   _check("reduce_type_cap", len(reduced["NAME"]) == 3, str(len(reduced["NAME"])))
@@ -282,6 +283,31 @@ def _test_reduce_noise() -> None:
   _check("reduce_flavor_excludes_fdroid",
          reduced["AUDIO"] == ["app/src/play/D.kt (Pattern: MediaRecorder)"],
          str(reduced["AUDIO"]))
+  _check("reduce_excludes_values_strings", "ACCOUNT_DELETION" not in reduced,
+         str(reduced.get("ACCOUNT_DELETION")))
+
+
+def _test_account_deletion_gate() -> None:
+  from typesafe_eval import engine
+  from typesafe_eval.client import HeuristicJevClient
+  with tempfile.TemporaryDirectory() as d:
+    os.makedirs(os.path.join(d, "app"))
+    # A generic "deactivate" match (proxy toggle) should be gated out; a real
+    # deleteAccount should pass.
+    with open(os.path.join(d, "app/Rpn.kt"), "w", encoding="utf-8") as f:
+      f.write("fun deactivateRpn() { proxy.deactivate() }\n")
+    with open(os.path.join(d, "app/Acct.kt"), "w", encoding="utf-8") as f:
+      f.write("fun deleteAccount() { api.deleteAccount(userId) }\n")
+    scratch = os.path.join(d, ".scratch")
+    _write_scratch(d, scratch, {"ACCOUNT_DELETION": [
+        "app/Rpn.kt (Pattern: deactivate)",
+        "app/Acct.kt (Pattern: deleteAccount)",
+    ]})
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    ua = json.load(open(os.path.join(scratch, "worker_user_account.json"), encoding="utf-8"))
+    files = [(x.get("files_involved") or [""])[0] for x in ua["findings"]]
+    _check("gate_keeps_real_deletion", any("Acct.kt" in f for f in files), str(files))
+    _check("gate_drops_deactivate_fp", not any("Rpn.kt" in f for f in files), str(files))
 
 
 def _test_cache_roundtrip() -> None:
@@ -315,6 +341,7 @@ def main() -> int:
   _test_batch_state_and_namespace()
   _test_registry_and_plan()
   _test_reduce_noise()
+  _test_account_deletion_gate()
   _test_engine_offline_and_robustness()
   _test_cache_roundtrip()
   print()

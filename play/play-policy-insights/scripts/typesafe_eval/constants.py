@@ -44,6 +44,12 @@ PRIORITIZED_FLAVORS = ("main", "play")
 MAX_PER_FILE_PER_TYPE = 2   # at most N findings of one data type from one file
 MAX_FINDINGS_PER_TYPE = 3   # global cap per data type
 
+# Path fragments whose files are string catalogs / UI text, not behavior. A
+# generic pattern like "deactivate" or "record" matching a localized
+# ``res/values-tl/strings.xml`` translation is a false positive, so exclude these
+# from signal activation. Layout XML (res/layout) and code are still scanned.
+EXCLUDED_PATH_SUBSTRINGS = ("/res/values",)
+
 # Documented System One evaluation endpoint.
 DEFAULT_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 
@@ -65,6 +71,8 @@ T_CORE_FUNCTION = 0.60     # the access is core to the app's stated purpose
 T_USER_INITIATED = 0.60    # the transfer is triggered by an explicit user action
 T_THIRD_PARTY = 0.60       # the sink is outside the developer's control
 T_EVIDENCE_SUPPORTS = 0.50  # critic: the snippet actually supports the claim
+T_ACCOUNT_DELETION = 0.60   # deterministic gate: snippet really deletes an account
+T_DECLARATION_COVERS = 0.50  # play_declaration: declaration covers a detected type
 
 # ---------------------------------------------------------------------------
 # Confidence gates (Choice/Score answers carry a calibrated confidence in [0, 1]).
