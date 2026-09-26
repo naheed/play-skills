@@ -59,6 +59,15 @@ def main(argv=None) -> int:
   run_p.add_argument("--client", default="heuristic", choices=["heuristic", "http"])
   run_p.add_argument("--model", default=constants.DEFAULT_MODEL)
   run_p.add_argument("--goals", nargs="*", default=None)
+  run_p.add_argument(
+      "--batch", action="store_true",
+      help="Batch by file: one request per source file instead of per finding.",
+  )
+
+  bench_p = sub.add_parser("benchmark", help="Compare per-finding vs batched.")
+  bench_p.add_argument("temp_dir")
+  bench_p.add_argument("--client", default="http", choices=["heuristic", "http"])
+  bench_p.add_argument("--model", default=constants.DEFAULT_MODEL)
 
   crit_p = sub.add_parser("critic", help="Verify findings into critic_output_<i>.json.")
   crit_p.add_argument("temp_dir")
@@ -82,12 +91,20 @@ def main(argv=None) -> int:
     from typesafe_eval import livetest
     return livetest.main(model=args.model)
 
+  if args.command == "benchmark":
+    from typesafe_eval import benchmark
+    return benchmark.main([args.temp_dir, "--client", args.client, "--model", args.model])
+
   client = _make_client(args.client, args.model)
 
   if args.command == "run":
-    written = evaluate.run(
-        args.temp_dir, client, model=args.model, goals=args.goals
-    )
+    if args.batch:
+      from typesafe_eval import batch
+      written = batch.run_batched(args.temp_dir, client, model=args.model)
+    else:
+      written = evaluate.run(
+          args.temp_dir, client, model=args.model, goals=args.goals
+      )
     print(f"Wrote worker files for goals: {', '.join(written) or '(none)'}")
     return 0
 

@@ -178,6 +178,37 @@ def _test_compose_end_to_end() -> None:
       _check("compose_logs_answers", "typesafe_answers" in f0)
 
 
+def _test_batch_state_and_namespace() -> None:
+  from typesafe_eval import batch
+  with tempfile.TemporaryDirectory() as d:
+    rel = "app/Loc.kt"
+    os.makedirs(os.path.join(d, "app"))
+    with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
+      f.write(
+          "import okhttp3.OkHttpClient\n"
+          "val loc = FusedLocationProviderClient()\n"
+          "val lat = loc.latitude\n"
+          "http.newCall(request).execute()\n"
+          "val email_address = prefs.get(\"email\")\n"
+      )
+    asks = [
+        batch.Ask("data_safety_part_1", "PRECISE_LOCATION",
+                  None, f"{rel} (Pattern: FusedLocationProviderClient)", "loc"),
+        batch.Ask("data_safety_part_1", "EMAIL",
+                  None, f"{rel} (Pattern: email_address)", "email"),
+    ]
+    state, per_ask = batch.build_file_state(d, rel, asks, {"name": "X"})
+    _check("batch_two_signals", len(state["signals"]) == 2, str(len(state["signals"])))
+    _check("batch_snippet_has_both",
+           "FusedLocationProviderClient" in state["code_snippet"]
+           and "email_address" in state["code_snippet"])
+    _check("batch_related_network", bool(state["related_lines"]))
+    _check("batch_per_ask", len(per_ask) == 2)
+    # Namespacing round-trips.
+    ns = batch._namespace(1, {"transmits_offdevice": {"type": "noul"}})  # pylint: disable=protected-access
+    _check("batch_namespace_key", "a1__transmits_offdevice" in ns)
+
+
 def main() -> int:
   _test_parse_finding()
   _test_snippet_and_colocation()
@@ -185,6 +216,7 @@ def main() -> int:
   _test_http_payload_and_parse()
   _test_heuristic_battery()
   _test_compose_end_to_end()
+  _test_batch_state_and_namespace()
   print()
   if _FAILURES:
     print(f"{len(_FAILURES)} check(s) FAILED: {', '.join(_FAILURES)}")
