@@ -47,7 +47,7 @@ API_KEY_ENV = "TYPESAFE_API_KEY"
 # the eval harness before trusting them on real traffic.
 # ---------------------------------------------------------------------------
 
-T_TRANSMIT = 0.60          # is_transferred: data leaves the device / goes off-device
+T_TRANSMIT = 0.55          # is_transferred: data leaves the device / goes off-device
 T_DISCLOSURE = 0.50        # a prominent disclosure gate is present
 T_CORE_FUNCTION = 0.60     # the access is core to the app's stated purpose
 T_USER_INITIATED = 0.60    # the transfer is triggered by an explicit user action
@@ -72,12 +72,54 @@ SEVERITY_LEVELS = ["SUGGESTION", "IMPORTANT", "CRITICAL"]
 SEVERITY_RISK_FLOOR = 1.0
 
 # ---------------------------------------------------------------------------
-# Eval harness acceptance bar (used by eval/run_eval.py). A policy domain should
-# only be promoted from the offline heuristic to the live Jev path when a labeled
-# run clears these.
+# Severity is derived in code from Jev's atomic booleans, not asked as a broad
+# Score (live testing showed the broad "rate the risk" question is context-poor:
+# it cannot see that a disclosed, core-functionality use is compliant). Jev
+# supplies transmits/disclosure/core; these tables turn them into a severity.
 # ---------------------------------------------------------------------------
 
-EVAL_MIN_AGREEMENT = 0.85  # fraction of labeled cases whose decision matches
+# Data types where an undisclosed off-device transfer is CRITICAL (vs IMPORTANT).
+SENSITIVE_DATA_TYPES = frozenset({
+    "PRECISE_LOCATION",
+    "APPROX_LOCATION",
+    "CONTACTS",
+    "SMS_CALL_LOG",
+    "AUDIO",
+    "EMAILS",
+    "HEALTH",
+    "FITNESS",
+    "PHOTOS",
+    "VIDEOS",
+    "CREDIT_DEBIT_BANK_ACCOUNT_NUMBER",
+    "CREDIT_SCORE",
+    "FINANCIAL_INFO_OTHER",
+    "RACE_ETHNICITY",
+    "POLITICAL_RELIGIOUS_BELIEFS",
+    "SEXUAL_ORIENTATION",
+})
+
+# Restricted-permission policies where a non-core, undisclosed use is a real
+# risk even without observed transmission (the permission itself is the concern).
+HIGH_RISK_PERMISSION_POLICIES = frozenset({
+    "location_access_policy",
+    "contacts_access_policy",
+    "audio_recording_policy",
+    "sms_call_log_policy",
+    "all_files_access_policy",
+    "accessibility_api_policy",
+    "package_visibility_policy",
+})
+
+# ---------------------------------------------------------------------------
+# Eval harness acceptance bar (used by eval/run_eval.py). A policy domain should
+# only be promoted from the offline heuristic to the live Jev path when a labeled
+# run clears these. Recall is weighted highest: a missed violation (false
+# negative) is worse than a false alarm a human can dismiss.
+# ---------------------------------------------------------------------------
+
+EVAL_MIN_AGREEMENT = 0.85   # fraction of labeled per-field decisions that match
+EVAL_MIN_RECALL = 0.90      # fraction of true risks the tool flags
+EVAL_MIN_PRECISION = 0.75   # fraction of flagged risks that are real
 
 
 def severity_name(score: float) -> str:

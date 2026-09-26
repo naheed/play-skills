@@ -79,6 +79,43 @@ def _taxonomy() -> Dict[str, dict]:
     return {}
 
 
+def derive_data_safety_severity(
+    data_type: str, transmits: bool, disclosure_status: str
+) -> str:
+  """Severity for a data-safety finding, composed in code from Jev's booleans.
+
+  Local-only or properly disclosed/exempt collection is a SUGGESTION (inventory).
+  Undisclosed off-device transfer is CRITICAL for sensitive data types and
+  IMPORTANT otherwise.
+  """
+  if not transmits:
+    return "SUGGESTION"
+  if disclosure_status in ("DISCLOSED", "EXEMPT"):
+    return "SUGGESTION"
+  return "CRITICAL" if data_type in constants.SENSITIVE_DATA_TYPES else "IMPORTANT"
+
+
+def derive_permission_severity(
+    policy_id: str, is_core: bool, has_disclosure: bool, transmits: bool
+) -> Optional[str]:
+  """Severity for a permission-hygiene finding, or None when compliant.
+
+  Core functionality with a disclosure is compliant (None). Core without a
+  disclosure is a SUGGESTION to add one. A non-core use of a restricted
+  permission is IMPORTANT, escalating to CRITICAL when data is also transmitted
+  off-device without disclosure.
+  """
+  if is_core and has_disclosure:
+    return None
+  if is_core:
+    return "SUGGESTION"
+  if policy_id in constants.HIGH_RISK_PERMISSION_POLICIES:
+    if transmits and not has_disclosure:
+      return "CRITICAL"
+    return "IMPORTANT"
+  return "IMPORTANT"
+
+
 def _load_json(path: str) -> dict:
   try:
     with open(path, "r", encoding="utf-8") as f:
@@ -128,7 +165,14 @@ def _compose_data_safety_finding(
   user_initiated = (answers["user_initiated"].noul or 0.0) >= constants.T_USER_INITIATED
   is_third_party = (answers["is_third_party"].noul or 0.0) >= constants.T_THIRD_PARTY
   disclosure_status = answers["disclosure_status"].choice or "MISSING"
-  severity = constants.severity_name(answers["severity"].score or 0.0)
+  # Local-only data needs no disclosure by definition, so compose EXEMPT in code
+  # rather than relying on the model to infer it (it reads the question literally
+  # and reports MISSING when no gate is present, even for on-device data).
+  if not transmits:
+    disclosure_status = "EXEMPT"
+  # Severity is derived in code from the atomic booleans, not read off Jev's
+  # advisory Score (which is logged for comparison only).
+  severity = derive_data_safety_severity(data_type, transmits, disclosure_status)
 
   # A transmitted, undisclosed sensitive type is a prominent-disclosure risk;
   # otherwise it is inventory for the Data Safety section reconciliation.
@@ -136,8 +180,6 @@ def _compose_data_safety_finding(
     policy_id = "prominent_disclosure_policy"
   else:
     policy_id = "data_safety_section"
-    if not transmits:
-      severity = "SUGGESTION"
 
   if is_third_party:
     purpose = "Analytics or third-party sharing"
@@ -181,14 +223,14 @@ def _compose_permission_finding(
   has_disclosure = (
       answers["has_prominent_disclosure"].noul or 0.0
   ) >= constants.T_DISCLOSURE
-  severity = constants.severity_name(answers["severity"].score or 0.0)
+  transmits = (answers["transmits_offdevice"].noul or 0.0) >= constants.T_TRANSMIT
 
-  # Core functionality with a disclosure is compliant: emit nothing.
-  if is_core and has_disclosure:
+  # Severity derived in code; None means compliant (emit nothing).
+  severity = derive_permission_severity(
+      policy_id, is_core, has_disclosure, transmits
+  )
+  if severity is None:
     return None
-  # Core (but undisclosed) is at most a suggestion to add disclosure.
-  if is_core:
-    severity = "SUGGESTION"
 
   return {
       "policy_id": policy_id,
