@@ -34,12 +34,19 @@ Run the commands from the `scripts/` directory (or put it on `PYTHONPATH`).
 ## Commands
 
 ```bash
-python -m typesafe_eval run <temp_dir> [--client heuristic|http] [--model ID] [--goals ...]
+python -m typesafe_eval run <temp_dir> [--client heuristic|http] [--model ID] [--goals ...] [--batch]
 python -m typesafe_eval critic <temp_dir> [--client heuristic|http]
+python -m typesafe_eval benchmark <temp_dir> [--client http]   # per-finding vs batched: requests/tokens/latency/agreement
 python -m typesafe_eval selftest                 # offline unit checks
 python -m typesafe_eval smoketest                # live smoke test (SKIPs without a key)
 python -m typesafe_eval.eval.run_eval [--client heuristic|http] [--sweep]  # recall/precision + threshold sweep
 ```
+
+`--batch` sends **one request per source file** (fanning out every policy
+question about that file) instead of one per finding — Jev has no cross-request
+cache, so batching questions that share a file's code is the way to avoid
+re-sending it. See
+[`../../docs/request-batching-optimization.md`](../../docs/request-batching-optimization.md).
 
 See [`../../docs/evaluation-charter.md`](../../docs/evaluation-charter.md) for the
 quality dimensions and bars, and
