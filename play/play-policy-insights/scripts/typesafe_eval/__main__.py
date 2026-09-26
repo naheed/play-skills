@@ -63,6 +63,7 @@ def main(argv=None) -> int:
       "--batch", action="store_true",
       help="Batch by file: one request per source file instead of per finding.",
   )
+  run_p.add_argument("--cache", default=None, help="Path to a JSON result cache.")
 
   bench_p = sub.add_parser("benchmark", help="Compare per-finding vs batched.")
   bench_p.add_argument("temp_dir")
@@ -73,6 +74,7 @@ def main(argv=None) -> int:
   crit_p.add_argument("temp_dir")
   crit_p.add_argument("--client", default="heuristic", choices=["heuristic", "http"])
   crit_p.add_argument("--model", default=constants.DEFAULT_MODEL)
+  crit_p.add_argument("--cache", default=None, help="Path to a JSON result cache.")
 
   sub.add_parser("selftest", help="Run offline unit checks.")
 
@@ -96,6 +98,11 @@ def main(argv=None) -> int:
     return benchmark.main([args.temp_dir, "--client", args.client, "--model", args.model])
 
   client = _make_client(args.client, args.model)
+
+  if getattr(args, "cache", None):
+    from typesafe_eval.cache import CachingClient
+    from typesafe_eval.cache import ResultCache
+    client = CachingClient(client, ResultCache(args.cache))
 
   if args.command == "run":
     if args.batch:
