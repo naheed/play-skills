@@ -1,0 +1,192 @@
+{
+  "description": "Labeled cases for measuring a JevClient against expected policy decisions and for tuning thresholds. Labels are hand-assigned ground truth. 'is_risk' is the headline label: true when the tool should surface a finding at IMPORTANT or CRITICAL. Run against --client http (real Jev) to measure quality; the heuristic client trivially agrees because it is derived from the same signals.",
+  "cases": [
+    {
+      "name": "ds_location_transmitted_undisclosed",
+      "battery": "data_safety",
+      "data_type": "PRECISE_LOCATION",
+      "description": "Precise device location.",
+      "state": {
+        "signal": {"data_type": "PRECISE_LOCATION", "matched_pattern": "lastLocation", "file": "Loc.kt", "line": 2},
+        "code_snippet": "val loc = fusedClient.lastLocation.await()\nval body = \"{\\\"lat\\\":${loc.latitude},\\\"lng\\\":${loc.longitude}}\"\nhttp.newCall(Request.Builder().url(\"https://analytics.example/collect\").post(body.toRequestBody()).build()).execute()",
+        "co_located_signals": {"network_transmission": ["http.newCall"], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": "android.permission.ACCESS_FINE_LOCATION"
+      },
+      "expected": {"transmits_offdevice": true, "has_prominent_disclosure": false, "disclosure_status": "MISSING", "is_risk": true}
+    },
+    {
+      "name": "ds_location_disclosed_navigation",
+      "battery": "data_safety",
+      "data_type": "PRECISE_LOCATION",
+      "description": "Precise device location.",
+      "state": {
+        "signal": {"data_type": "PRECISE_LOCATION", "matched_pattern": "lastLocation", "file": "Nav.kt", "line": 5},
+        "code_snippet": "AlertDialog.Builder(ctx).setTitle(\"Location needed for navigation\").setMessage(\"We use your precise location to guide you. Tap Accept to continue, or Cancel to exit.\").setPositiveButton(\"Accept\"){ _,_ -> startNavigation() }.setNegativeButton(\"Cancel\"){ _,_ -> finish() }.setCancelable(false).show()\nval loc = fusedClient.lastLocation.await()",
+        "co_located_signals": {"network_transmission": [], "disclosure": ["AlertDialog", "Accept"]},
+        "app": {"name": "MapsGo", "store_category": "Maps & Navigation"},
+        "permission": "android.permission.ACCESS_FINE_LOCATION"
+      },
+      "expected": {"transmits_offdevice": false, "has_prominent_disclosure": true, "disclosure_status": "DISCLOSED", "is_risk": false}
+    },
+    {
+      "name": "ds_contacts_local_only",
+      "battery": "data_safety",
+      "data_type": "CONTACTS",
+      "description": "Contacts.",
+      "state": {
+        "signal": {"data_type": "CONTACTS", "matched_pattern": "ContactsContract", "file": "Contacts.kt", "line": 2},
+        "code_snippet": "val cursor = resolver.query(ContactsContract.Contacts.CONTENT_URI, null, null, null, null)\nwhile (cursor.moveToNext()) { localCache.add(cursor.getString(0)) }\ncursor.close()",
+        "co_located_signals": {"network_transmission": [], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": "android.permission.READ_CONTACTS"
+      },
+      "expected": {"transmits_offdevice": false, "disclosure_status": "EXEMPT", "is_risk": false}
+    },
+    {
+      "name": "ds_contacts_broad_transmitted",
+      "battery": "data_safety",
+      "data_type": "CONTACTS",
+      "description": "Contacts.",
+      "state": {
+        "signal": {"data_type": "CONTACTS", "matched_pattern": "ContactsContract", "file": "Referral.kt", "line": 3},
+        "code_snippet": "val cursor = resolver.query(ContactsContract.Contacts.CONTENT_URI, null, null, null, null)\nval all = mutableListOf<String>()\nwhile (cursor.moveToNext()) { all.add(cursor.getString(0)) }\napi.post(\"/referrals/upload\", Json.encode(all))",
+        "co_located_signals": {"network_transmission": ["http.post"], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": "android.permission.READ_CONTACTS"
+      },
+      "expected": {"transmits_offdevice": true, "has_prominent_disclosure": false, "disclosure_status": "MISSING", "is_risk": true}
+    },
+    {
+      "name": "ds_email_transmitted_disclosed",
+      "battery": "data_safety",
+      "data_type": "EMAIL",
+      "description": "Email address.",
+      "state": {
+        "signal": {"data_type": "EMAIL", "matched_pattern": "email_address", "file": "Account.kt", "line": 4},
+        "code_snippet": "AlertDialog.Builder(ctx).setMessage(\"We use your email to create your account. Tap Agree to continue.\").setPositiveButton(\"Agree\"){_,_-> register(email_address) }.setCancelable(false).show()\nfun register(email_address: String) { http.post(\"/register\", email_address) }",
+        "co_located_signals": {"network_transmission": ["http.post"], "disclosure": ["AlertDialog", "Agree"]},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": null
+      },
+      "expected": {"transmits_offdevice": true, "has_prominent_disclosure": true, "disclosure_status": "DISCLOSED", "is_risk": false}
+    },
+    {
+      "name": "ds_device_id_ads_undisclosed",
+      "battery": "data_safety",
+      "data_type": "DEVICE_ID",
+      "description": "Device or other IDs.",
+      "state": {
+        "signal": {"data_type": "DEVICE_ID", "matched_pattern": "AdvertisingIdClient", "file": "Ads.kt", "line": 3},
+        "code_snippet": "val adId = AdvertisingIdClient.getAdvertisingIdInfo(ctx).id\nadSdk.track(mapOf(\"adid\" to adId))\nhttp.post(\"https://ads.thirdparty.example/track\", adId)",
+        "co_located_signals": {"network_transmission": ["http.post"], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": null
+      },
+      "expected": {"transmits_offdevice": true, "is_third_party": true, "disclosure_status": "MISSING", "is_risk": true}
+    },
+    {
+      "name": "ds_name_local_only",
+      "battery": "data_safety",
+      "data_type": "NAME",
+      "description": "Name.",
+      "state": {
+        "signal": {"data_type": "NAME", "matched_pattern": "display_name", "file": "Profile.kt", "line": 2},
+        "code_snippet": "val display_name = prefs.getString(\"display_name\", \"\")\ntitleView.text = \"Hello, $display_name\"",
+        "co_located_signals": {"network_transmission": [], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": null
+      },
+      "expected": {"transmits_offdevice": false, "disclosure_status": "EXEMPT", "is_risk": false}
+    },
+    {
+      "name": "ds_photos_transmitted_undisclosed",
+      "battery": "data_safety",
+      "data_type": "PHOTOS",
+      "description": "Photos.",
+      "state": {
+        "signal": {"data_type": "PHOTOS", "matched_pattern": "MediaStore.Images", "file": "Upload.kt", "line": 2},
+        "code_snippet": "val uri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI\nval bytes = resolver.openInputStream(uri).readBytes()\nhttp.post(\"https://cdn.example/upload\", bytes)",
+        "co_located_signals": {"network_transmission": ["http.post"], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": "android.permission.READ_MEDIA_IMAGES"
+      },
+      "expected": {"transmits_offdevice": true, "disclosure_status": "MISSING", "is_risk": true}
+    },
+    {
+      "name": "perm_audio_recording_shopping",
+      "battery": "permission",
+      "data_type": "AUDIO",
+      "policy_id": "audio_recording_policy",
+      "description": "Voice or sound recordings.",
+      "state": {
+        "signal": {"data_type": "AUDIO", "matched_pattern": "MediaRecorder", "file": "Voice.kt", "line": 2},
+        "code_snippet": "val recorder = MediaRecorder()\nrecorder.setAudioSource(MediaRecorder.AudioSource.MIC)\nrecorder.start()  // used for an optional voice-search box",
+        "co_located_signals": {"network_transmission": [], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": "android.permission.RECORD_AUDIO"
+      },
+      "expected": {"is_core_functionality": false, "has_prominent_disclosure": false, "is_risk": true}
+    },
+    {
+      "name": "perm_audio_voice_recorder_core",
+      "battery": "permission",
+      "data_type": "AUDIO",
+      "policy_id": "audio_recording_policy",
+      "description": "Voice or sound recordings.",
+      "state": {
+        "signal": {"data_type": "AUDIO", "matched_pattern": "MediaRecorder", "file": "Recorder.kt", "line": 2},
+        "code_snippet": "val recorder = MediaRecorder()\nrecorder.setAudioSource(MediaRecorder.AudioSource.MIC)\nrecorder.setOutputFile(userSelectedPath)\nrecorder.start()  // the app's main record button",
+        "co_located_signals": {"network_transmission": [], "disclosure": []},
+        "app": {"name": "Easy Voice Recorder", "store_category": "Music & Audio"},
+        "permission": "android.permission.RECORD_AUDIO"
+      },
+      "expected": {"is_core_functionality": true, "is_risk": false}
+    },
+    {
+      "name": "perm_contacts_referral_shopping",
+      "battery": "permission",
+      "data_type": "CONTACTS",
+      "policy_id": "contacts_access_policy",
+      "description": "Contacts.",
+      "state": {
+        "signal": {"data_type": "CONTACTS", "matched_pattern": "ContactsContract", "file": "Referral.kt", "line": 2},
+        "code_snippet": "val cursor = resolver.query(ContactsContract.Contacts.CONTENT_URI, null, null, null, null)\n// enumerate the whole address book for a 'refer a friend' feature",
+        "co_located_signals": {"network_transmission": [], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": "android.permission.READ_CONTACTS"
+      },
+      "expected": {"is_core_functionality": false, "is_risk": true}
+    },
+    {
+      "name": "perm_location_weather_disclosed_core",
+      "battery": "permission",
+      "data_type": "APPROX_LOCATION",
+      "policy_id": "location_access_policy",
+      "description": "Approximate location.",
+      "state": {
+        "signal": {"data_type": "APPROX_LOCATION", "matched_pattern": "LocationManager", "file": "Weather.kt", "line": 3},
+        "code_snippet": "AlertDialog.Builder(ctx).setMessage(\"We use your approximate location to show local weather. Accept?\").setPositiveButton(\"Accept\"){_,_-> loadWeather() }.show()\nval loc = locationManager.getLastKnownLocation(NETWORK_PROVIDER)",
+        "co_located_signals": {"network_transmission": [], "disclosure": ["AlertDialog", "Accept"]},
+        "app": {"name": "Local Weather", "store_category": "Weather"},
+        "permission": "android.permission.ACCESS_COARSE_LOCATION"
+      },
+      "expected": {"is_core_functionality": true, "has_prominent_disclosure": true, "is_risk": false}
+    },
+    {
+      "name": "perm_location_shopping_transmitted_undisclosed",
+      "battery": "permission",
+      "data_type": "PRECISE_LOCATION",
+      "policy_id": "location_access_policy",
+      "description": "Precise device location.",
+      "state": {
+        "signal": {"data_type": "PRECISE_LOCATION", "matched_pattern": "FusedLocationProviderClient", "file": "Track.kt", "line": 3},
+        "code_snippet": "val loc = fusedClient.lastLocation.await()\nhttp.post(\"https://analytics.example/collect\", \"${loc.latitude},${loc.longitude}\")",
+        "co_located_signals": {"network_transmission": ["http.post"], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": "android.permission.ACCESS_FINE_LOCATION"
+      },
+      "expected": {"is_core_functionality": false, "transmits_offdevice": true, "has_prominent_disclosure": false, "is_risk": true}
+    }
+  ]
+}
