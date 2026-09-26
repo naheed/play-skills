@@ -58,5 +58,27 @@ python -m typesafe_eval.eval.run_eval [--client heuristic|http]   # labeled agre
 Phase A prototype: data-safety disclosure, location, contacts, and audio
 domains. The heuristic client cannot judge permission-*justification* severity
 (e.g. broad contacts/mic access for a non-core feature) because it keys off data
-transmission; those cases are where the real Jev path is expected to add value.
-See the design doc for the rollout plan.
+transmission; those cases are where the real Jev path adds value.
+
+### Validated against live Jev (`jev-1.13.0`)
+
+The `http` client has been run end-to-end against the real API on the synthetic
+sample app. Findings from that run:
+
+- The full worker battery for the app completes in ~1.6s (all questions run in
+  parallel per request).
+- Live Jev is well-calibrated and generally *stricter* than the offline
+  heuristic (e.g. it rates broad contacts access CRITICAL and the audio case
+  IMPORTANT — which the heuristic misses).
+- Real testing exposed a state-quality bug the heuristic hid: anchoring the
+  snippet on the first pattern match (a constructor type) missed the actual
+  transmission code, so Jev correctly rated a weak snippet low. `snippets.py`
+  now appends the co-located data-flow lines; after the fix the precise-location
+  `transmits_offdevice` noul rose 0.58 → 0.93 and severity confidence 0.28 →
+  0.90, and the report is correctly Non-Compliant.
+- Offline heuristic vs. the provisional labeled set agrees 0.94, but that number
+  is circular (the heuristic is derived from the same signals). Live Jev vs. the
+  same provisional labels is ~0.72; the gap is a mix of genuinely debatable
+  labels (which need a proper labeling pass) and threshold tuning
+  (`T_TRANSMIT=0.60` clips a real 0.58 boundary case). This is the intended use
+  of the eval harness.

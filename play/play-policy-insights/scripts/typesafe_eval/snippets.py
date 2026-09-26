@@ -115,6 +115,24 @@ def extract_snippet(
   }
 
 
+def matching_lines(
+    content: str, patterns: List[str], max_lines: int = 6
+) -> List[str]:
+  """Returns ``"Lnn: <source>"`` for lines containing any of ``patterns``.
+
+  Used to surface the actual data-flow (e.g. the network POST) to the model even
+  when the signal pattern that anchored the finding (e.g. a constructor type)
+  lives elsewhere in the file.
+  """
+  out: List[str] = []
+  for i, line in enumerate(content.splitlines()):
+    if any(p in line for p in patterns):
+      out.append(f"L{i + 1}: {line.strip()}")
+      if len(out) >= max_lines:
+        break
+  return out
+
+
 def co_located_signals(app_dir: str, relpath: str) -> Dict[str, List[str]]:
   """Detects network-transmission and disclosure signals in the same file.
 
@@ -159,6 +177,22 @@ def build_state(
   snippet = extract_snippet(app_dir, relpath, pattern, context=context)
   co = co_located_signals(app_dir, relpath)
 
+  # The pattern that anchors a finding (e.g. a constructor type) is often not
+  # where the sensitive data actually flows. Append the specific lines in the
+  # same file that contain the co-located network/disclosure patterns, so the
+  # model sees the transmission/disclosure code even when it sits in another
+  # method. Without this, a model correctly rates an out-of-context snippet as
+  # low risk (observed against live Jev).
+  content = _read_file(app_dir, relpath) or ""
+  sink_patterns = co.get("network_transmission", []) + co.get("disclosure", [])
+  related = matching_lines(content, sink_patterns) if sink_patterns else []
+
+  code_snippet = snippet["snippet"]
+  if related:
+    code_snippet += "\n\n// Related data-flow lines in the same file:\n" + "\n".join(
+        related
+    )
+
   return {
       "signal": {
           "data_type": data_type,
@@ -167,8 +201,9 @@ def build_state(
           "line": snippet["line"],
           "matched_line": snippet.get("matched_line", ""),
       },
-      "code_snippet": snippet["snippet"],
+      "code_snippet": code_snippet,
       "co_located_signals": co,
+      "related_lines": related,
       "app": app_facts,
       "permission": permission,
   }
