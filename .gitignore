@@ -1,0 +1,9 @@
+# Local test apps used for evaluating skills — never commit these.
+sample-apps/
+
+# Scratch output produced by play-policy-insights runs.
+.scratch/
+
+# Python bytecode.
+__pycache__/
+*.pyc
