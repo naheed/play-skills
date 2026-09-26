@@ -344,26 +344,28 @@ def run(
     model: Optional[str] = None,
     goals: Optional[List[str]] = None,
 ) -> List[str]:
-  """Evaluates every ``input_worker_<goal>.json`` and writes ``worker_<goal>.json``.
+  """Per-finding evaluation via the registry engine (one request per finding).
 
-  Returns the list of goal names that were written.
+  Kept as a thin wrapper so existing callers (CLI, benchmark) are unchanged; the
+  ``goals`` argument is deprecated (the engine activates from the registry).
   """
-  written: List[str] = []
-  inputs = sorted(glob.glob(os.path.join(temp_dir, "input_worker_*.json")))
-  for input_path in inputs:
-    goal_name = os.path.basename(input_path)[len("input_worker_"):-len(".json")]
-    if goals and goal_name not in goals:
-      continue
-    base_context = _load_json(input_path)
-    app_dir = base_context.get("APP_DIR") or ""
-    worker = evaluate_goal(
-        goal_name, base_context, app_dir, temp_dir, client, model=model
-    )
-    out_path = os.path.join(temp_dir, f"worker_{goal_name}.json")
-    with open(out_path, "w", encoding="utf-8") as f:
-      json.dump(worker, f, indent=2, sort_keys=True)
-    written.append(goal_name)
-  return written
+  from typesafe_eval import engine  # lazy import avoids an import cycle
+  return engine.run(temp_dir, client, model=model, batched=False)
+
+
+def _critic_decision(supports: float) -> Dict[str, str]:
+  """Turns the evidence-supports-claim probability into a routed verdict.
+
+  Recall-weighted: only strong evidence of a false positive prunes; a middling
+  probability goes to a human rather than being dropped.
+  """
+  if supports >= constants.CONF_ACT:
+    return {"action": "VERIFIED", "confidence": "High"}
+  if supports >= constants.T_EVIDENCE_SUPPORTS:
+    return {"action": "VERIFIED", "confidence": "Medium"}
+  if supports < (1.0 - constants.CONF_ACT):
+    return {"action": "PRUNED", "confidence": "High"}
+  return {"action": "MANUAL_REVIEW", "confidence": "Low"}
 
 
 def evaluate_critic_chunk(
@@ -371,7 +373,7 @@ def evaluate_critic_chunk(
     client: JevClient,
     model: Optional[str] = None,
 ) -> Dict[str, dict]:
-  """Runs the citation-check battery per finding and returns critic decisions."""
+  """One cheap Noul per high-severity finding; routes it in code. Robust per finding."""
   decisions: Dict[str, dict] = {}
   for fid, finding in chunk.items():
     state = {
@@ -382,35 +384,19 @@ def evaluate_critic_chunk(
             "policy_id": finding.get("policy_id", ""),
         }
     }
-    answers = client.system_one(state, q.critic_battery(), model=model)
-    verdict = answers["critic_verdict"]
-    supports = (answers["evidence_supports_claim"].noul or 0.0) >= (
-        constants.T_EVIDENCE_SUPPORTS
-    )
-    action = verdict.choice or "MANUAL_REVIEW"
-    confidence = verdict.confidence if verdict.confidence is not None else 0.0
-
-    # Confidence-gated routing: an unconfident verdict becomes MANUAL_REVIEW.
-    if confidence < constants.CONF_REVIEW_FLOOR:
-      action = "MANUAL_REVIEW"
-    elif action == "VERIFIED" and not supports:
-      action = "MANUAL_REVIEW"
-
-    band = (
-        "High"
-        if confidence >= constants.CONF_ACT
-        else "Low"
-        if confidence < constants.CONF_REVIEW_FLOOR
-        else "Medium"
-    )
-    decisions[fid] = {
-        "action": action,
-        "confidence": band,
-        "critic_justification": (
-            f"evidence_supports_claim={answers['evidence_supports_claim'].noul:.2f},"
-            f" verdict_confidence={confidence:.2f}"
-        ),
-    }
+    try:
+      answers = client.system_one(state, q.critic_battery(), model=model)
+      supports = answers["evidence_supports_claim"].noul or 0.0
+      decision = _critic_decision(supports)
+      decision["critic_justification"] = f"evidence_supports_claim={supports:.2f}"
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      # Never drop a high-severity finding because the critic call failed.
+      decision = {
+          "action": "MANUAL_REVIEW",
+          "confidence": "Low",
+          "critic_justification": f"critic evaluation failed: {str(exc)[:120]}",
+      }
+    decisions[fid] = decision
   return decisions
 
 

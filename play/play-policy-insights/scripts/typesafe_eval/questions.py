@@ -171,11 +171,14 @@ def permission_battery(policy_id: str, data_type: str) -> Dict[str, Dict[str, An
 
 
 def critic_battery() -> Dict[str, Dict[str, Any]]:
-  """Battery for verifying one finding against its cited evidence.
+  """One cheap Noul: does the cited evidence support the claim?
 
-  This is the citation-check pattern: a Noul asks whether the snippet actually
-  supports the claim, and a Choice returns the verdict with a calibrated
-  confidence that ``evaluate.py`` routes on.
+  With Jev answering atomic questions against the real snippet and severity
+  composed in code, a separate multi-question critic pass is redundant. The
+  aggregate step only routes non-SUGGESTION (IMPORTANT/CRITICAL) findings here,
+  so this single false-positive check runs only where it matters (citation-check
+  pattern). ``evaluate.py`` turns the probability into VERIFIED / MANUAL_REVIEW /
+  PRUNED in code.
   """
   return {
       "evidence_supports_claim": _noul(
@@ -187,21 +190,4 @@ def critic_battery() -> Dict[str, Dict[str, Any]]:
           yes="The snippet concretely supports the claimed violation.",
           no="The snippet does not support the claim, or is too abstract.",
       ),
-      "critic_verdict": {
-          "type": "choice",
-          "instructions": (
-              "Decide the verdict for the finding described in `finding`, based "
-              "only on `finding.evidence_snippet`."
-          ),
-          "criteria": {
-              "VERIFIED": "The evidence confirms the policy violation.",
-              "MANUAL_REVIEW": (
-                  "The code is ambiguous or abstract; a human must decide."
-              ),
-              "PRUNED": (
-                  "The evidence does not support a violation; likely a false"
-                  " positive."
-              ),
-          },
-      },
   }

@@ -80,6 +80,19 @@ class JevAnswer:
     """Serializes the answer, dropping unset fields, for logging next to a finding."""
     return {k: v for k, v in dataclasses.asdict(self).items() if v is not None}
 
+  @classmethod
+  def from_dict(cls, data: Dict[str, Any]) -> "JevAnswer":
+    """Rebuilds an answer from its serialized form (used by the result cache)."""
+    return cls(
+        type=data.get("type", ""),
+        noul=data.get("noul"),
+        choice=data.get("choice"),
+        score=data.get("score"),
+        probabilities=data.get("probabilities"),
+        confidence=data.get("confidence"),
+        legend=data.get("legend"),
+    )
+
 
 class JevClient:
   """Interface: evaluate a state against typed questions, return answers by id.
@@ -327,8 +340,12 @@ class HeuristicJevClient(JevClient):
 
     answers: Dict[str, JevAnswer] = {}
     for qid, question in questions.items():
+      # Batched requests namespace question ids as ``a<i>__<base>``; match on
+      # the base id. (The real API keys off instructions, not ids, so this only
+      # matters for the offline heuristic.)
+      base_qid = qid.split("__")[-1]
       answers[qid] = self._answer(
-          qid,
+          base_qid,
           question,
           data_type=data_type,
           has_network=has_network,

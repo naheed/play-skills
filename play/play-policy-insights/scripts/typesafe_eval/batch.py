@@ -178,7 +178,21 @@ def run_batched(
     client: JevClient,
     model: Optional[str] = None,
 ) -> List[str]:
-  """One request per file; writes the same ``worker_<goal>.json`` files as ``run``."""
+  """File-batched evaluation via the registry engine (one request per file).
+
+  Thin wrapper so existing callers (CLI, benchmark) keep working; the batching
+  itself now lives in ``engine._run_batched`` driven by the policy registry.
+  """
+  from typesafe_eval import engine  # lazy import avoids an import cycle
+  return engine.run(temp_dir, client, model=model, batched=True)
+
+
+def _run_batched_legacy(
+    temp_dir: str,
+    client: JevClient,
+    model: Optional[str] = None,
+) -> List[str]:
+  """Original input_worker-based batching, retained for reference/tests."""
   asks_by_file, goal_names, app_dir = plan_by_file(temp_dir)
 
   # App facts are shared across the whole app.
