@@ -170,7 +170,8 @@ live eval still recall/precision 1.00; benchmark unchanged):
 - **Source of truth** — the registry is primary; the legacy `goal_*.md` matrices
   remain as the fallback path, to be gated by the parity harness (P1-4).
 
-Precision fixes (from the rethink-app run): deterministic policies can carry an
+Precision fixes (surfaced by running on a large real-world app): deterministic
+policies can carry an
 optional **evidence gate** (a single Noul) so generic patterns don't leak —
 `account_deletion` now emits only when Jev confirms the snippet really deletes an
 account (not a proxy toggle / local delete / translation); and engine activation

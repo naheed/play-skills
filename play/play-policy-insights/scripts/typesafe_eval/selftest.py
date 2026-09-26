@@ -302,14 +302,15 @@ def _test_reduce_noise() -> None:
       "NAME": [f"app/src/main/A{i}.kt (Pattern: name)" for i in range(6)],
       "EMAIL": ["app/src/main/B.kt (Pattern: e)", "app/src/main/B.kt (Pattern: e)",
                 "app/src/main/B.kt (Pattern: e)"],  # same file x3 -> capped to 2
-      "AUDIO": ["app/src/fdroid/C.kt (Pattern: record)",
-                "app/src/play/D.kt (Pattern: MediaRecorder)"],  # fdroid excluded
-      "ACCOUNT_DELETION": ["app/src/main/res/values-tl/strings.xml (Pattern: deactivate)"],
+      # A non-prioritized product flavor should be excluded in favor of "play".
+      "AUDIO": ["app/src/nonplay/C.kt (Pattern: record)",
+                "app/src/play/D.kt (Pattern: MediaRecorder)"],
+      "ACCOUNT_DELETION": ["app/src/main/res/values-xx/strings.xml (Pattern: deactivate)"],
   }
   reduced = engine._reduce_noise(ds)
   _check("reduce_type_cap", len(reduced["NAME"]) == 3, str(len(reduced["NAME"])))
   _check("reduce_per_file_cap", len(reduced["EMAIL"]) == 2, str(len(reduced["EMAIL"])))
-  _check("reduce_flavor_excludes_fdroid",
+  _check("reduce_flavor_excludes_nonplay",
          reduced["AUDIO"] == ["app/src/play/D.kt (Pattern: MediaRecorder)"],
          str(reduced["AUDIO"]))
   _check("reduce_excludes_values_strings", "ACCOUNT_DELETION" not in reduced,
