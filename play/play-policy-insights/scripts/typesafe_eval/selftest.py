@@ -266,6 +266,24 @@ def _test_engine_offline_and_robustness() -> None:
            len(errs) >= 1 and errs[0].get("needs_manual_review") is True)
 
 
+def _test_reduce_noise() -> None:
+  from typesafe_eval import engine
+  # Global cap per type (3) and per-file cap (2); Play flavor prioritized.
+  ds = {
+      "NAME": [f"app/src/main/A{i}.kt (Pattern: name)" for i in range(6)],
+      "EMAIL": ["app/src/main/B.kt (Pattern: e)", "app/src/main/B.kt (Pattern: e)",
+                "app/src/main/B.kt (Pattern: e)"],  # same file x3 -> capped to 2
+      "AUDIO": ["app/src/fdroid/C.kt (Pattern: record)",
+                "app/src/play/D.kt (Pattern: MediaRecorder)"],  # fdroid excluded
+  }
+  reduced = engine._reduce_noise(ds)
+  _check("reduce_type_cap", len(reduced["NAME"]) == 3, str(len(reduced["NAME"])))
+  _check("reduce_per_file_cap", len(reduced["EMAIL"]) == 2, str(len(reduced["EMAIL"])))
+  _check("reduce_flavor_excludes_fdroid",
+         reduced["AUDIO"] == ["app/src/play/D.kt (Pattern: MediaRecorder)"],
+         str(reduced["AUDIO"]))
+
+
 def _test_cache_roundtrip() -> None:
   from typesafe_eval.cache import ResultCache, CachingClient
   from typesafe_eval.client import JevAnswer, JevClient
@@ -296,6 +314,7 @@ def main() -> int:
   _test_compose_end_to_end()
   _test_batch_state_and_namespace()
   _test_registry_and_plan()
+  _test_reduce_noise()
   _test_engine_offline_and_robustness()
   _test_cache_roundtrip()
   print()

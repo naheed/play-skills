@@ -31,16 +31,20 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
+import re
 from typing import Any
 from typing import Dict
 from typing import List
 from typing import Optional
 
 from typesafe_eval import batch
+from typesafe_eval import constants
 from typesafe_eval import evaluate
 from typesafe_eval import registry
 from typesafe_eval import snippets
 from typesafe_eval.client import JevClient
+
+_FLAVOR_RE = re.compile(r"/src/([^/]+)/")
 
 _GOAL_DOMAIN = {
     "permissions_and_apis": "Permissions and APIs",
@@ -82,13 +86,50 @@ def load_artifacts(temp_dir: str):
   return data_sources, manifest, app_facts, app_dir
 
 
+def _reduce_noise(data_sources: Dict[str, List[str]]) -> Dict[str, List[str]]:
+  """Prioritizes the Play flavor and caps findings per data type.
+
+  Mirrors the orchestrator's smart filtering so the evaluator processes the same
+  bounded set the agent path would, instead of every raw signal.
+  """
+  # Detect build flavors present; only filter when a Play flavor exists.
+  flavors = set()
+  for findings in data_sources.values():
+    if isinstance(findings, list):
+      for f in findings:
+        m = _FLAVOR_RE.search("/" + f)
+        if m:
+          flavors.add(m.group(1))
+  prioritized = set(constants.PRIORITIZED_FLAVORS)
+  excluded = (flavors - prioritized) if ("play" in flavors) else set()
+
+  reduced: Dict[str, List[str]] = {}
+  for data_type, findings in data_sources.items():
+    if not isinstance(findings, list):
+      continue
+    per_file: Dict[str, int] = {}
+    kept: List[str] = []
+    for f in findings:
+      if any(f"/src/{flavor}/" in ("/" + f) for flavor in excluded):
+        continue
+      relpath, _ = snippets.parse_finding(f)
+      relpath = relpath or f
+      if per_file.get(relpath, 0) >= constants.MAX_PER_FILE_PER_TYPE:
+        continue
+      kept.append(f)
+      per_file[relpath] = per_file.get(relpath, 0) + 1
+      if len(kept) >= constants.MAX_FINDINGS_PER_TYPE:
+        break
+    if kept:
+      reduced[data_type] = kept
+  return reduced
+
+
 def plan(data_sources: Dict[str, List[str]]) -> List[Task]:
   """Turns raw signals into per-(policy, finding) tasks via the registry."""
   tasks: List[Task] = []
   specs = registry.code_signal_specs() + registry.deterministic_specs()
-  for data_type, findings in data_sources.items():
-    if not isinstance(findings, list):
-      continue
+  for data_type, findings in _reduce_noise(data_sources).items():
     for finding_str in findings:
       relpath, _ = snippets.parse_finding(finding_str)
       relpath = relpath or finding_str

@@ -32,6 +32,18 @@ the thresholds below, which your own code applies to Jev's calibrated outputs.
 # is reproducible: the alias can move under you when a new model ships.
 DEFAULT_MODEL = "jev-1.13.0"
 
+# ---------------------------------------------------------------------------
+# Activation noise reduction (mirrors orchestrator.write_agent_prompts). The raw
+# scan can surface hundreds of signals; we prioritize the Play build flavor and
+# cap how many findings per data type reach the model. Caps bound cost but also
+# cap recall — Jev is cheap and parallel, so these can be raised as a recall
+# lever once a gold corpus justifies it.
+# ---------------------------------------------------------------------------
+
+PRIORITIZED_FLAVORS = ("main", "play")
+MAX_PER_FILE_PER_TYPE = 2   # at most N findings of one data type from one file
+MAX_FINDINGS_PER_TYPE = 3   # global cap per data type
+
 # Documented System One evaluation endpoint.
 DEFAULT_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 
