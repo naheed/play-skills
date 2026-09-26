@@ -67,11 +67,20 @@ def main(argv=None) -> int:
 
   sub.add_parser("selftest", help="Run offline unit checks.")
 
+  smoke_p = sub.add_parser(
+      "smoketest", help="Live smoke test against the real API (skips without a key)."
+  )
+  smoke_p.add_argument("--model", default=constants.DEFAULT_MODEL)
+
   args = parser.parse_args(argv)
 
   if args.command == "selftest":
     from typesafe_eval import selftest
     return selftest.main()
+
+  if args.command == "smoketest":
+    from typesafe_eval import livetest
+    return livetest.main(model=args.model)
 
   client = _make_client(args.client, args.model)
 
