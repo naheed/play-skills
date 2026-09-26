@@ -57,14 +57,25 @@ for the plan to reach parity across all policies and select models.
 
 | File | Purpose |
 | --- | --- |
-| `constants.py` | All tunable thresholds + model id in one place. |
+| `registry.py` | **Single source of truth**: one `PolicySpec` per policy (id, kind, activation, battery, compose). Add a policy here. |
+| `engine.py` | Generic evaluator: reads raw scan artifacts, activates the registry, batches by file, isolates failures, writes `worker_*.json`. |
+| `constants.py` | All tunable thresholds + sensitivity/risk tables + model id. |
 | `questions.py` | The typed question batteries (Choice/Score/Noul). |
-| `client.py` | `HttpJevClient` (real API) and `HeuristicJevClient` (offline). |
-| `snippets.py` | Deterministic code-snippet + co-located-signal extraction. |
+| `client.py` | `HttpJevClient` (real API) + `HeuristicJevClient` (offline). |
+| `cache.py` | `ResultCache` + `CachingClient`: memoize by (model, questions, state). |
+| `snippets.py` | Deterministic code-snippet + co-located data-flow extraction. |
 | `templates.py` | Deterministic `issue_summary` / `recommendation`. |
-| `evaluate.py` | Reads goal inputs, calls a client, writes `worker_*.json`. |
-| `eval/` | Labeled cases + `run_eval.py` agreement harness. |
-| `selftest.py` | Offline unit checks. |
+| `evaluate.py` | Compose functions + code-derived severity + critic; `run` delegates to the engine. |
+| `batch.py` | File-state builder + namespacing used by the engine's batched path. |
+| `benchmark.py` | Per-finding vs batched: requests / tokens / latency / agreement. |
+| `eval/` | Labeled cases + `run_eval.py` precision/recall harness. |
+| `livetest.py` / `selftest.py` | Live smoke test / offline unit checks. |
+
+The evaluator reads the **raw** artifacts `orchestrator.py init` writes
+(`data_safety_scan.json`, `manifest_details.json`, `play_store_info.json`) and
+activates policies from the registry — it no longer depends on the agent's
+`input_worker_*.json` prompt files. Add `--cache <path>` to `run`/`critic` to
+memoize calls (a warm re-run makes zero API calls).
 
 ## Status
 

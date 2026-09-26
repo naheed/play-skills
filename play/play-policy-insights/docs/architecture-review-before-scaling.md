@@ -147,3 +147,27 @@ engine:
    clear the charter bars (P1-1).
 3. Add robustness (P1-2) and the cache (P1-5) early; decide the critic (P1-3) and
    dual-maintenance (P1-4) before the bulk of policies land.
+
+## Implementation status (2026-09-26)
+
+The foundation and the agreed P1 items are implemented (no behavior change:
+live eval still recall/precision 1.00; benchmark unchanged):
+
+- **P0-1 registry** — `registry.py` (`PolicySpec`); adding a policy = one spec.
+- **P0-2 evaluation kinds** — `code_signal` / `deterministic` run through the
+  engine; `manifest` kind is declared and reserved (its engine path lands with
+  the first manifest policy in the coverage phase).
+- **P0-3 raw-artifact input** — `engine.py` reads `data_safety_scan.json` /
+  `manifest_details.json` / `play_store_info.json` and activates from the
+  registry; the evaluator no longer depends on `input_worker_*.json`.
+- **P1-2 robustness** — per-file/per-finding/per-critic `try/except` emits a
+  recall-safe MANUAL_REVIEW finding instead of crashing the scan.
+- **P1-3 critic** — reduced to a single "evidence-supports-claim" Noul on the
+  high-severity findings `aggregate` already routes to it.
+- **P1-5 cache** — `cache.py` (`ResultCache` + `CachingClient`) memoizes by
+  `(model, questions, state)`; a warm re-run makes 0 API calls.
+- **Source of truth** — the registry is primary; the legacy `goal_*.md` matrices
+  remain as the fallback path, to be gated by the parity harness (P1-4).
+
+Deferred (P2): prompt-injection hardening, egress redaction, an explicit
+determinism policy, and freezing the worker-finding schema.

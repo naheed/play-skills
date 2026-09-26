@@ -21,6 +21,7 @@ answer composition through the heuristic client) without any network access.
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 
@@ -209,6 +210,83 @@ def _test_batch_state_and_namespace() -> None:
     _check("batch_namespace_key", "a1__transmits_offdevice" in ns)
 
 
+def _write_scratch(d, scratch, data_sources):
+  """Writes the minimal raw artifacts the engine reads."""
+  os.makedirs(scratch, exist_ok=True)
+  with open(os.path.join(scratch, "data_safety_scan.json"), "w", encoding="utf-8") as f:
+    json.dump({"data_safety_scan": {"data_sources": data_sources}}, f)
+  with open(os.path.join(scratch, "manifest_details.json"), "w", encoding="utf-8") as f:
+    json.dump({"app_dir": d, "app_label": "Demo", "package_name": "com.x",
+               "target_sdk": 35, "permissions": []}, f)
+  with open(os.path.join(scratch, "play_store_info.json"), "w", encoding="utf-8") as f:
+    json.dump({"category": "Shopping"}, f)
+
+
+def _test_registry_and_plan() -> None:
+  from typesafe_eval import registry
+  from typesafe_eval import engine
+  _check("registry_goals",
+         set(["permissions_and_apis", "data_safety", "user_account"]).issubset(set(registry.goals())))
+  tasks = engine.plan({"PRECISE_LOCATION": ["a.kt (Pattern: FusedLocationProviderClient)"]})
+  policies = {t.spec.policy_id for t in tasks}
+  _check("plan_multi_policy",
+         "location_access_policy" in policies and "data_safety_section" in policies,
+         str(policies))
+
+
+def _test_engine_offline_and_robustness() -> None:
+  import json as _json
+  from typesafe_eval import engine
+  from typesafe_eval.client import HeuristicJevClient, JevClient
+  with tempfile.TemporaryDirectory() as d:
+    rel = "app/Loc.kt"
+    os.makedirs(os.path.join(d, "app"))
+    with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
+      f.write("import okhttp3.OkHttpClient\n"
+              "val loc = FusedLocationProviderClient()\n"
+              "val lat = loc.latitude\n"
+              "http.newCall(request).execute()\n")
+    scratch = os.path.join(d, ".scratch")
+    _write_scratch(d, scratch, {"PRECISE_LOCATION": [f"{rel} (Pattern: FusedLocationProviderClient)"]})
+
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    perms = _json.load(open(os.path.join(scratch, "worker_permissions_and_apis.json"), encoding="utf-8"))
+    loc = [x for x in perms["findings"] if x["policy_id"] == "location_access_policy"]
+    _check("engine_location_finding", len(loc) == 1 and loc[0]["severity"] == "CRITICAL")
+
+    # Robustness: a client that always raises must not crash the scan.
+    class _Failing(JevClient):
+      name = "failing"
+      def system_one(self, state, questions, model=None):
+        raise RuntimeError("boom")
+    engine.run(scratch, _Failing(), batched=True)
+    perms = _json.load(open(os.path.join(scratch, "worker_permissions_and_apis.json"), encoding="utf-8"))
+    errs = [x for x in perms["findings"] if x.get("client") == "error"]
+    _check("engine_robust_error_finding",
+           len(errs) >= 1 and errs[0].get("needs_manual_review") is True)
+
+
+def _test_cache_roundtrip() -> None:
+  from typesafe_eval.cache import ResultCache, CachingClient
+  from typesafe_eval.client import JevAnswer, JevClient
+  with tempfile.TemporaryDirectory() as d:
+    class _Counting(JevClient):
+      name = "counting"
+      def __init__(self):
+        super().__init__()
+        self.calls = 0
+      def system_one(self, state, questions, model=None):
+        self.calls += 1
+        return {"q": JevAnswer(type="noul", noul=0.9)}
+    inner = _Counting()
+    client = CachingClient(inner, ResultCache(os.path.join(d, "c.json")))
+    q1 = {"q": {"type": "noul", "instructions": "?"}}
+    a1 = client.system_one({"s": 1}, q1, model="m")
+    a2 = client.system_one({"s": 1}, q1, model="m")
+    _check("cache_serves_hit", inner.calls == 1 and (a2["q"].noul or 0) == 0.9,
+           f"calls={inner.calls}")
+
+
 def main() -> int:
   _test_parse_finding()
   _test_snippet_and_colocation()
@@ -217,6 +295,9 @@ def main() -> int:
   _test_heuristic_battery()
   _test_compose_end_to_end()
   _test_batch_state_and_namespace()
+  _test_registry_and_plan()
+  _test_engine_offline_and_robustness()
+  _test_cache_roundtrip()
   print()
   if _FAILURES:
     print(f"{len(_FAILURES)} check(s) FAILED: {', '.join(_FAILURES)}")

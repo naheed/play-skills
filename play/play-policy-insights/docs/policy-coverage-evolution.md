@@ -53,24 +53,30 @@ is not asked to do arithmetic.
 
 ## 3. Per-policy porting recipe
 
-For each planned policy:
+Each policy is now **one `PolicySpec` in `registry.py`** (the single source of
+truth) plus fixtures — the engine handles the rest. For each planned policy:
 
 1. **Read the legacy matrix.** Each "Common Evaluation Matrix" row in the
    `goal_*.md` file encodes a condition → severity → recommendation. That row is
    the spec.
-2. **Decompose into atomic questions.** Turn each independent factor into one
-   `Noul`/`Choice`. Never ask a multi-hop question ("trace the worker and decide
-   if deferrable"); split it. Reuse shared questions (`transmits_offdevice`,
-   `has_prominent_disclosure`, `is_core_functionality`) where they apply.
-3. **Compose severity in code.** Extend `derive_permission_severity` /
-   `derive_data_safety_severity` with the policy's rule. Recommendations and
-   summaries come from `templates.py` (keyed by `policy_id`).
-4. **Write labeled fixtures.** At least 2 positive, 2 negative, and 1 boundary
-   case per policy in `eval/labeled_cases.json`, with confident `is_risk` labels.
-5. **Clear the charter bars live.** `run_eval --client http` must meet recall,
+2. **Add a `PolicySpec`.** Pick the evaluation `kind` (`code_signal`,
+   `manifest`, or `deterministic`), its activation (data types or manifest
+   facts), its battery, and its severity rule.
+3. **Decompose into atomic questions.** Turn each independent factor into one
+   `Noul`/`Choice`. Never ask a multi-hop question; split it. Reuse shared
+   questions (`transmits_offdevice`, `has_prominent_disclosure`,
+   `is_core_functionality`).
+4. **Compose severity in code.** Extend `derive_permission_severity` /
+   `derive_data_safety_severity` (or add a rule) for the policy. Recommendations
+   and summaries come from `templates.py` (keyed by `policy_id`).
+5. **Write labeled fixtures.** At least 3 positive, 3 negative, and 2 boundary
+   cases per policy in `eval/labeled_cases.json`, plus a held-out slice never
+   used for threshold tuning.
+6. **Clear the charter bars live.** `run_eval --client http` must meet recall,
    precision, and agreement for the new cases.
-6. **Parity-check vs legacy** on the gold corpus for that domain (Section 5).
-7. **Enable** the policy in the evaluator; keep the legacy path as fallback.
+7. **Parity-check vs legacy** on the gold corpus for that domain (Section 5).
+8. **Enable** by leaving the spec in the registry; keep the legacy `goal_*.md`
+   path as fallback until the parity harness gates the switch.
 
 ## 4. Model selection
 
