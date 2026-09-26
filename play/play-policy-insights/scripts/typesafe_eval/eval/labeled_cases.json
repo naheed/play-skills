@@ -1,0 +1,76 @@
+{
+  "description": "Labeled cases for measuring a JevClient's agreement with expected policy decisions. Ground-truth labels are hand-assigned. Run against the http client (real Jev) to measure quality; the heuristic client trivially agrees because it is derived from the same signals and only validates harness plumbing.",
+  "cases": [
+    {
+      "name": "location_transmitted_undisclosed",
+      "battery": "data_safety",
+      "data_type": "PRECISE_LOCATION",
+      "description": "Precise device location.",
+      "state": {
+        "signal": {"data_type": "PRECISE_LOCATION", "matched_pattern": "FusedLocationProviderClient", "file": "Loc.kt", "line": 3},
+        "code_snippet": "val loc = FusedLocationProviderClient()\nval lat = loc.latitude\nhttp.newCall(Request.Builder().url(\"https://analytics.example/collect\").build()).execute()",
+        "co_located_signals": {"network_transmission": ["http.newCall"], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": "android.permission.ACCESS_FINE_LOCATION"
+      },
+      "expected": {"transmits_offdevice": true, "has_prominent_disclosure": false, "disclosure_status": "MISSING", "severity": "CRITICAL"}
+    },
+    {
+      "name": "location_disclosed_navigation",
+      "battery": "data_safety",
+      "data_type": "PRECISE_LOCATION",
+      "description": "Precise device location.",
+      "state": {
+        "signal": {"data_type": "PRECISE_LOCATION", "matched_pattern": "FusedLocationProviderClient", "file": "Nav.kt", "line": 5},
+        "code_snippet": "AlertDialog.Builder(ctx).setTitle(\"We use your location to navigate\").setPositiveButton(\"Accept\"){ _,_ -> startTracking() }.show()\nval loc = FusedLocationProviderClient()",
+        "co_located_signals": {"network_transmission": [], "disclosure": ["AlertDialog", "Accept"]},
+        "app": {"name": "MapsGo", "store_category": "Maps & Navigation"},
+        "permission": "android.permission.ACCESS_FINE_LOCATION"
+      },
+      "expected": {"transmits_offdevice": false, "has_prominent_disclosure": true, "disclosure_status": "DISCLOSED", "severity": "SUGGESTION"}
+    },
+    {
+      "name": "contacts_local_only",
+      "battery": "data_safety",
+      "data_type": "CONTACTS",
+      "description": "Contacts.",
+      "state": {
+        "signal": {"data_type": "CONTACTS", "matched_pattern": "ContactsContract", "file": "Contacts.kt", "line": 2},
+        "code_snippet": "val cursor = resolver.query(ContactsContract.Contacts.CONTENT_URI, null, null, null, null)\nnames.add(cursor.getString(0))",
+        "co_located_signals": {"network_transmission": [], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": "android.permission.READ_CONTACTS"
+      },
+      "expected": {"transmits_offdevice": false, "disclosure_status": "EXEMPT", "severity": "SUGGESTION"}
+    },
+    {
+      "name": "email_transmitted_disclosed",
+      "battery": "data_safety",
+      "data_type": "EMAIL",
+      "description": "Email address.",
+      "state": {
+        "signal": {"data_type": "EMAIL", "matched_pattern": "email_address", "file": "Account.kt", "line": 4},
+        "code_snippet": "AlertDialog.Builder(ctx).setMessage(\"We use your email to create your account\").setPositiveButton(\"Agree\"){_,_->}.show()\nfirebaseAuth.signInWithEmailAndPassword(email_address, pw)\nhttp.post(\"/register\")",
+        "co_located_signals": {"network_transmission": ["http.post"], "disclosure": ["AlertDialog", "Agree"]},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": null
+      },
+      "expected": {"transmits_offdevice": true, "has_prominent_disclosure": true, "disclosure_status": "DISCLOSED", "severity": "SUGGESTION"}
+    },
+    {
+      "name": "audio_recording_undisclosed",
+      "battery": "permission",
+      "data_type": "AUDIO",
+      "policy_id": "audio_recording_policy",
+      "description": "Voice or sound recordings.",
+      "state": {
+        "signal": {"data_type": "AUDIO", "matched_pattern": "MediaRecorder", "file": "Voice.kt", "line": 2},
+        "code_snippet": "val recorder = MediaRecorder()\nrecorder.setAudioSource(MediaRecorder.AudioSource.MIC)\nrecorder.start()",
+        "co_located_signals": {"network_transmission": [], "disclosure": []},
+        "app": {"name": "ShopDeluxe", "store_category": "Shopping"},
+        "permission": "android.permission.RECORD_AUDIO"
+      },
+      "expected": {"is_core_functionality": false, "has_prominent_disclosure": false, "severity": "IMPORTANT"}
+    }
+  ]
+}
