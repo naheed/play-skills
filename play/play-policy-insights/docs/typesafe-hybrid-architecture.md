@@ -227,23 +227,28 @@ The agent-driven Mode A/B remains the fallback when no client is configured.
 
 ### 9.1 Live validation results (`jev-1.13.0`)
 
-The HTTP path has been exercised against the real API on the synthetic sample
-app (no real proprietary source involved):
+The HTTP path has been exercised against the real API on synthetic sample code
+(no real proprietary source). Iterating against live Jev drove three changes:
 
-- The client works end-to-end; a full app's worker battery completes in ~1.6s.
-- Live Jev is calibrated and generally *stricter* than the offline heuristic; it
-  rated the audio and broad-contacts cases as risks the heuristic under-rated.
-- Real Jev surfaced a state-quality bug the heuristic masked: the snippet was
-  anchored on the first occurrence of the matched pattern (a constructor type),
-  missing the actual transmission code, so Jev reasonably rated it low. Fix:
-  `snippets.py` now appends the co-located data-flow lines to the state. After
-  the fix, the precise-location `transmits_offdevice` noul moved 0.58 → 0.93,
-  severity confidence 0.28 → 0.90, and the report became correctly
-  Non-Compliant.
-- Offline-heuristic agreement with the provisional labels (0.94) is circular;
-  live-Jev agreement (~0.72) is the real signal and reflects both debatable
-  labels (a proper labeling pass is future work) and threshold tuning. This is
-  exactly what the harness is for.
+- **State quality.** The snippet was anchored on the first occurrence of the
+  matched pattern (often a constructor type), missing the transmission code, so
+  Jev reasonably rated it low. `snippets.py` now appends the co-located
+  data-flow lines; the precise-location `transmits_offdevice` noul moved
+  0.58 → 0.93 and the report became correctly Non-Compliant.
+- **Severity is composed in code, not asked.** The broad "rate the risk" Score
+  could not see that a disclosed, core-functionality use is compliant. Severity
+  now derives from Jev's atomic booleans (`evaluate.derive_*_severity`); the
+  Score is logged only as an advisory cross-check.
+- **Thresholds tuned from data.** A `transmits_offdevice` sweep is stable
+  (P=R=1.00 across T∈[0.40, 0.70]); `T_TRANSMIT` set to 0.55 (recall-leaning).
+
+Baseline on the 13-case labeled set: **recall 1.00, precision 1.00**, per-field
+agreement 0.97, ~149 ms/case. See the [evaluation charter](evaluation-charter.md)
+for the dimensions and bars, and the
+[coverage evolution plan](policy-coverage-evolution.md) for scaling to all
+policies and choosing models. The earlier offline-heuristic "0.94 agreement" was
+circular (the heuristic is derived from the same signals); these live numbers are
+the real signal.
 
 ## 10. Rollout
 
