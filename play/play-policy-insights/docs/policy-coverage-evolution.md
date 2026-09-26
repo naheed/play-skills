@@ -33,6 +33,7 @@ Source of truth: `policies.json` + `goal_permissions_and_apis.md` /
 | --- | --- | --- | --- | --- |
 | User Data | `data_safety_section` (35 taxonomy types) | data_safety | **Prototyped** | transmit/disclosure/third-party batteries; per data type |
 | User Data | `prominent_disclosure_policy` | data_safety | **Prototyped** | gate-before-access Noul + disclosure Choice |
+| User Data | `data_safety_section` (declaration coverage) | data_safety | **Prototyped (`play_declaration` kind)** | Jev checks detected off-device transfers vs the developer's declaration; semantic coverage, not string match. Needs a reliable declaration (prefer provided JSON). |
 | Permissions | `location_access_policy` | permissions | **Prototyped** | core + disclosure + transmit |
 | Permissions | `contacts_access_policy` | permissions | **Prototyped** | core + picker-alternative |
 | Permissions | `audio_recording_policy` | permissions | **Prototyped** | core + mic-button alternative |

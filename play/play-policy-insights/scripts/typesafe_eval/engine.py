@@ -42,6 +42,7 @@ from typesafe_eval import constants
 from typesafe_eval import evaluate
 from typesafe_eval import registry
 from typesafe_eval import snippets
+from typesafe_eval import templates
 from typesafe_eval.client import JevClient
 
 _FLAVOR_RE = re.compile(r"/src/([^/]+)/")
@@ -217,6 +218,11 @@ def run(
   else:
     _run_per_finding(code_tasks, app_dir, app_facts, client, model, findings_by_goal)
 
+  # play_declaration kind: cross-reference detected off-device collection against
+  # the developer's Play declaration (runs after code_signal; needs its results).
+  for spec in registry.play_declaration_specs():
+    _run_play_declaration(temp_dir, spec, client, model, findings_by_goal)
+
   written: List[str] = []
   for goal in registry.goals():
     out = {
@@ -241,6 +247,65 @@ def _run_per_finding(tasks, app_dir, app_facts, client, model, findings_by_goal)
     finding = _compose_task(task, state, answers, client.name)
     if finding:
       findings_by_goal[task.spec.goal].append(finding)
+
+
+def _declared_types(store: dict) -> List[str]:
+  """Flattens a Play declaration into declared type + category names."""
+  ds = store.get("data_safety", {}) or {}
+  declared = []
+  for section in ("data_collected", "data_shared"):
+    for cat in ds.get(section, []) or []:
+      if cat.get("category"):
+        declared.append(cat["category"])
+      for t in cat.get("types", []) or []:
+        if t.get("type"):
+          declared.append(t["type"])
+  return sorted(set(declared))
+
+
+def _run_play_declaration(temp_dir, spec, client, model, findings_by_goal) -> None:
+  """Flag detected, transmitted data types that the Play declaration omits.
+
+  Prefers a provided/scraped ``play_store_info.json``. If no usable declaration
+  exists, skips (a reliable declaration is a prerequisite — see the docs).
+  """
+  store = _load_json(os.path.join(temp_dir, "play_store_info.json"))
+  if not store or not store.get("is_published", False):
+    return
+  declared = _declared_types(store)
+
+  # Detected, off-device-transmitted data types from the code-signal pass.
+  transmitted = {}
+  for finding in list(findings_by_goal.get(spec.goal, [])):
+    if finding.get("is_transferred") and finding.get("psl_constant"):
+      transmitted.setdefault(finding["psl_constant"], finding)
+
+  for data_type, finding in sorted(transmitted.items()):
+    name = evaluate._taxonomy().get(data_type, {}).get("data_type", data_type)  # pylint: disable=protected-access
+    state = {
+        "detected": {"data_type": data_type, "name": name,
+                     "evidence": (finding.get("files_involved") or [""])[0]},
+        "declaration": {"declared": declared,
+                        "is_published": store.get("is_published")},
+    }
+    try:
+      answers = client.system_one(state, spec.make_battery(data_type, name), model=model)
+      covers = answers["declaration_covers"].noul or 0.0
+    except Exception:  # pylint: disable=broad-exception-caught
+      continue  # a failed coverage check should not fabricate a mismatch
+    if covers < constants.T_DECLARATION_COVERS:
+      findings_by_goal[spec.goal].append({
+          "policy_id": spec.policy_id,
+          "psl_constant": data_type,
+          "issue_summary": templates.declaration_mismatch_summary(name),
+          "severity": "IMPORTANT",
+          "files_involved": finding.get("files_involved", []),
+          "evidence": f"Detected transmission of {name}; declaration lists: "
+                      f"{', '.join(declared) or '(none)'}",
+          "recommendation": templates.declaration_mismatch_recommendation(name),
+          "client": client.name,
+          "kind": "play_declaration",
+      })
 
 
 def _run_batched(tasks, app_dir, app_facts, client, model, findings_by_goal) -> None:

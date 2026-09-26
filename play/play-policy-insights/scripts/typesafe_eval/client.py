@@ -338,12 +338,20 @@ class HeuristicJevClient(JevClient):
     core_categories = self._CORE_BY_CATEGORY.get(data_type, set())
     is_core = category in core_categories if category else False
 
+    # play_declaration coverage reads the declaration/detected fields of state.
+    declared = (state.get("declaration") or {}).get("declared", []) if isinstance(state, dict) else []
+    detected_name = (state.get("detected") or {}).get("name", "") if isinstance(state, dict) else ""
+
     answers: Dict[str, JevAnswer] = {}
     for qid, question in questions.items():
       # Batched requests namespace question ids as ``a<i>__<base>``; match on
       # the base id. (The real API keys off instructions, not ids, so this only
       # matters for the offline heuristic.)
       base_qid = qid.split("__")[-1]
+      if base_qid == "declaration_covers":
+        answers[qid] = JevAnswer(
+            type="noul", noul=0.9 if detected_name in declared else 0.1)
+        continue
       answers[qid] = self._answer(
           base_qid,
           question,

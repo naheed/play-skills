@@ -47,6 +47,7 @@ from typesafe_eval import templates
 CODE_SIGNAL = "code_signal"
 MANIFEST = "manifest"
 DETERMINISTIC = "deterministic"
+PLAY_DECLARATION = "play_declaration"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -130,6 +131,21 @@ def _account_deletion_finding(data_type, finding_str, state) -> Dict[str, Any]:
   }
 
 
+def _play_declaration_spec() -> PolicySpec:
+  """Cross-reference: detected off-device collection vs the Play declaration.
+
+  This is the ``play_declaration`` kind — an app-level pass (not per-file) run by
+  the engine after code-signal evaluation, using the developer's declaration
+  (`play_store_info.json`, provided or scraped) as an additional input.
+  """
+  return PolicySpec(
+      policy_id="data_safety_section",
+      kind=PLAY_DECLARATION,
+      goal="data_safety",
+      make_battery=q.declaration_battery,
+  )
+
+
 def _account_deletion_spec() -> PolicySpec:
   return PolicySpec(
       policy_id="account_deletion",
@@ -154,6 +170,7 @@ REGISTRY: Tuple[PolicySpec, ...] = (
     _permission_spec("audio_recording_policy", ("AUDIO",)),
     _data_safety_spec(),
     _account_deletion_spec(),
+    _play_declaration_spec(),
 )
 
 
@@ -167,6 +184,10 @@ def deterministic_specs() -> Tuple[PolicySpec, ...]:
 
 def manifest_specs() -> Tuple[PolicySpec, ...]:
   return tuple(s for s in REGISTRY if s.kind == MANIFEST)
+
+
+def play_declaration_specs() -> Tuple[PolicySpec, ...]:
+  return tuple(s for s in REGISTRY if s.kind == PLAY_DECLARATION)
 
 
 def goals() -> Tuple[str, ...]:

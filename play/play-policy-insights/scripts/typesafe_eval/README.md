@@ -77,6 +77,13 @@ activates policies from the registry — it no longer depends on the agent's
 `input_worker_*.json` prompt files. Add `--cache <path>` to `run`/`critic` to
 memoize calls (a warm re-run makes zero API calls).
 
+Evaluation kinds: `code_signal` (per-file battery), `deterministic` (code, with
+an optional model "evidence gate" that filters generic-pattern false positives),
+`play_declaration` (detected off-device collection vs the developer's Play Data
+Safety declaration — semantic coverage), and `manifest` (reserved). Activation
+prioritizes the Play build flavor, caps findings per data type, and skips
+`res/values*` string catalogs (translations caused false positives).
+
 ## Status
 
 Phase A prototype: data-safety disclosure, location, contacts, and audio

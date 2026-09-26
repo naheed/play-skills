@@ -170,6 +170,27 @@ def permission_battery(policy_id: str, data_type: str) -> Dict[str, Dict[str, An
   }
 
 
+def declaration_battery(data_type: str, name: str) -> Dict[str, Dict[str, Any]]:
+  """Does the developer's Play declaration cover a detected, transmitted type?
+
+  Semantic coverage check (more robust than string equality): the declared
+  categories/types are in `declaration.declared`; the detected type is
+  `detected.name`. Used by the ``play_declaration`` evaluation kind.
+  """
+  return {
+      "declaration_covers": _noul(
+          instructions=(
+              f"The app's code collects and transmits off-device: {name} "
+              f"({data_type}). Does the developer's Play Data Safety declaration "
+              "in `declaration.declared` disclose this data type, or a category "
+              "that clearly includes it?"
+          ),
+          yes="The declaration discloses this data type or an equivalent category.",
+          no="The declaration does not disclose this data type.",
+      ),
+  }
+
+
 def account_deletion_gate(data_type: str, description: str) -> Dict[str, Dict[str, Any]]:
   """A single Noul that filters false-positive account-deletion signals.
 

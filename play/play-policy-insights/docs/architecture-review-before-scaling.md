@@ -154,9 +154,10 @@ The foundation and the agreed P1 items are implemented (no behavior change:
 live eval still recall/precision 1.00; benchmark unchanged):
 
 - **P0-1 registry** — `registry.py` (`PolicySpec`); adding a policy = one spec.
-- **P0-2 evaluation kinds** — `code_signal` / `deterministic` run through the
-  engine; `manifest` kind is declared and reserved (its engine path lands with
-  the first manifest policy in the coverage phase).
+- **P0-2 evaluation kinds** — `code_signal`, `deterministic`, and
+  `play_declaration` (code behavior vs the developer's Play Data Safety
+  declaration) run through the engine; the `manifest` kind is declared and
+  reserved (its engine path lands with the first manifest policy).
 - **P0-3 raw-artifact input** — `engine.py` reads `data_safety_scan.json` /
   `manifest_details.json` / `play_store_info.json` and activates from the
   registry; the evaluator no longer depends on `input_worker_*.json`.
@@ -169,5 +170,21 @@ live eval still recall/precision 1.00; benchmark unchanged):
 - **Source of truth** — the registry is primary; the legacy `goal_*.md` matrices
   remain as the fallback path, to be gated by the parity harness (P1-4).
 
+Precision fixes (from the rethink-app run): deterministic policies can carry an
+optional **evidence gate** (a single Noul) so generic patterns don't leak —
+`account_deletion` now emits only when Jev confirms the snippet really deletes an
+account (not a proxy toggle / local delete / translation); and engine activation
+excludes `res/values*` string-catalog files (localized translations were
+matching behavioral patterns).
+
 Deferred (P2): prompt-injection hardening, egress redaction, an explicit
 determinism policy, and freezing the worker-finding schema.
+
+## Evaluation kinds (current)
+
+| Kind | Trigger | State | Example |
+| --- | --- | --- | --- |
+| `code_signal` | a scanner signal in a file | that file's code | location, contacts, audio, data-safety |
+| `deterministic` | a signal, decided in code (optional model gate) | snippet | account deletion |
+| `play_declaration` | a detected off-device transfer | detected type + the Play declaration | Data Safety declaration coverage |
+| `manifest` (reserved) | a manifest permission/component | app-level manifest facts | foreground services, exact alarm |

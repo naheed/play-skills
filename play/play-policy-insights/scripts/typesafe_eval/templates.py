@@ -111,6 +111,17 @@ def recommendation(policy_id: str, severity: str) -> str:
   return entry
 
 
+def declaration_mismatch_summary(name: str) -> str:
+  return f"{name} is collected and transmitted but not declared in Play Data Safety"
+
+
+def declaration_mismatch_recommendation(name: str) -> str:
+  return (
+      f"Declare {name} in the Play Console Data Safety form (collection and, if "
+      "applicable, sharing), or stop transmitting it off-device."
+  )
+
+
 def issue_summary(
     policy_id: str,
     data_type: Optional[str] = None,

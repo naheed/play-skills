@@ -210,7 +210,7 @@ def _test_batch_state_and_namespace() -> None:
     _check("batch_namespace_key", "a1__transmits_offdevice" in ns)
 
 
-def _write_scratch(d, scratch, data_sources):
+def _write_scratch(d, scratch, data_sources, play_store_info=None):
   """Writes the minimal raw artifacts the engine reads."""
   os.makedirs(scratch, exist_ok=True)
   with open(os.path.join(scratch, "data_safety_scan.json"), "w", encoding="utf-8") as f:
@@ -219,7 +219,36 @@ def _write_scratch(d, scratch, data_sources):
     json.dump({"app_dir": d, "app_label": "Demo", "package_name": "com.x",
                "target_sdk": 35, "permissions": []}, f)
   with open(os.path.join(scratch, "play_store_info.json"), "w", encoding="utf-8") as f:
-    json.dump({"category": "Shopping"}, f)
+    json.dump(play_store_info or {"category": "Shopping"}, f)
+
+
+def _test_play_declaration() -> None:
+  from typesafe_eval import engine
+  from typesafe_eval.client import HeuristicJevClient
+  with tempfile.TemporaryDirectory() as d:
+    rel = "app/Loc.kt"
+    os.makedirs(os.path.join(d, "app"))
+    with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
+      f.write("import okhttp3.OkHttpClient\n"
+              "val loc = FusedLocationProviderClient()\n"
+              "val lat = loc.latitude\n"
+              "http.newCall(request).execute()\n")
+    scratch = os.path.join(d, ".scratch")
+    # Declaration discloses Email only, not Precise location.
+    decl = {
+        "category": "Shopping", "is_published": True,
+        "data_safety": {"data_collected": [
+            {"category": "Personal info", "types": [{"type": "Email address"}]}]},
+    }
+    _write_scratch(d, scratch,
+                   {"PRECISE_LOCATION": [f"{rel} (Pattern: FusedLocationProviderClient)"]},
+                   play_store_info=decl)
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    ds = json.load(open(os.path.join(scratch, "worker_data_safety.json"), encoding="utf-8"))
+    mismatches = [x for x in ds["findings"] if x.get("kind") == "play_declaration"]
+    _check("play_declaration_flags_undeclared",
+           any(x.get("psl_constant") == "PRECISE_LOCATION" for x in mismatches),
+           str([x.get("psl_constant") for x in mismatches]))
 
 
 def _test_registry_and_plan() -> None:
@@ -342,6 +371,7 @@ def main() -> int:
   _test_registry_and_plan()
   _test_reduce_noise()
   _test_account_deletion_gate()
+  _test_play_declaration()
   _test_engine_offline_and_robustness()
   _test_cache_roundtrip()
   print()
