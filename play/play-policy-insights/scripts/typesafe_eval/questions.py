@@ -40,41 +40,43 @@ def _noul(instructions: str, yes: str, no: str) -> Dict[str, Any]:
   }
 
 
-# Severity rubric shared by every domain so scores are comparable across findings.
-_SEVERITY = {
-    "type": "score",
-    "instructions": (
-        "Rate the Google Play policy risk of the behavior shown in "
-        "`code_snippet` for the data type `signal.data_type`."
-    ),
-    "criteria": [
-        "SUGGESTION: compliant or informational; no real policy risk.",
-        "IMPORTANT: a real policy gap that should be fixed but is not severe.",
-        "CRITICAL: a direct, high-risk violation likely to cause rejection.",
-    ],
-}
+def _severity(subject: str) -> Dict[str, Any]:
+  return {
+      "type": "score",
+      "instructions": (
+          f"Rate the Google Play policy risk of how {subject} is handled in "
+          "`code_snippet`."
+      ),
+      "criteria": [
+          "SUGGESTION: compliant or informational; no real policy risk.",
+          "IMPORTANT: a real policy gap that should be fixed but is not severe.",
+          "CRITICAL: a direct, high-risk violation likely to cause rejection.",
+      ],
+  }
 
-_DISCLOSURE_STATUS = {
-    "type": "choice",
-    "instructions": (
-        "Classify the prominent-disclosure state for the data access in "
-        "`code_snippet`, considering `co_located_signals.disclosure`."
-    ),
-    "criteria": {
-        "DISCLOSED": (
-            "A disclosure/consent gate is shown BEFORE the data is accessed or"
-            " sent, and the user must accept to proceed."
-        ),
-        "MISSING": (
-            "The data is accessed or transmitted with no prominent disclosure"
-            " gate beforehand."
-        ),
-        "EXEMPT": (
-            "No disclosure is required because the data stays on-device or the"
-            " access is obvious core functionality the user initiated."
-        ),
-    },
-}
+
+def _disclosure_status(subject: str) -> Dict[str, Any]:
+  return {
+      "type": "choice",
+      "instructions": (
+          f"Classify the prominent-disclosure state for {subject} in "
+          "`code_snippet`, considering `co_located_signals.disclosure`."
+      ),
+      "criteria": {
+          "DISCLOSED": (
+              "A disclosure/consent gate is shown BEFORE the data is accessed or"
+              " sent, and the user must accept to proceed."
+          ),
+          "MISSING": (
+              "The data is accessed or transmitted with no prominent disclosure"
+              " gate beforehand."
+          ),
+          "EXEMPT": (
+              "No disclosure is required because the data stays on-device or the"
+              " access is obvious core functionality the user initiated."
+          ),
+      },
+  }
 
 
 def data_safety_battery(data_type: str, description: str) -> Dict[str, Dict[str, Any]]:
@@ -82,9 +84,10 @@ def data_safety_battery(data_type: str, description: str) -> Dict[str, Dict[str,
 
   Produces the typed inputs the existing ``worker_<goal>.json`` schema expects:
   the four data-safety booleans, a disclosure-status choice, and a severity
-  score.
+  score. Instructions embed the literal data type so the battery works whether
+  the state holds one signal or a whole file's worth (see request batching).
   """
-  subject = f"`signal.data_type` ({data_type}: {description})"
+  subject = f"the data type {data_type} ({description})"
   return {
       "transmits_offdevice": _noul(
           instructions=(
@@ -97,16 +100,16 @@ def data_safety_battery(data_type: str, description: str) -> Dict[str, Dict[str,
       ),
       "user_initiated": _noul(
           instructions=(
-              "Is the data transfer in `code_snippet` triggered by an explicit "
-              "user action (a tap on a clearly labeled control), rather than "
-              "happening automatically in the background?"
+              f"Is the transfer of {subject} in `code_snippet` triggered by an "
+              "explicit user action (a tap on a clearly labeled control), rather "
+              "than happening automatically in the background?"
           ),
           yes="An explicit user action triggers the transfer.",
           no="The transfer happens automatically without a user action.",
       ),
       "is_third_party": _noul(
           instructions=(
-              "Does `code_snippet` send the data to a destination outside the "
+              f"Does `code_snippet` send {subject} to a destination outside the "
               "developer's own control, such as an analytics/ads SDK or the "
               "Android share sheet?"
           ),
@@ -115,15 +118,16 @@ def data_safety_battery(data_type: str, description: str) -> Dict[str, Dict[str,
       ),
       "has_prominent_disclosure": _noul(
           instructions=(
-              "Does `code_snippet` (with `co_located_signals.disclosure`) show a "
-              "prominent disclosure or consent dialog BEFORE the data is "
-              "accessed, that the user must accept to continue?"
+              f"For {subject}, does `code_snippet` (with "
+              "`co_located_signals.disclosure`) show a prominent disclosure or "
+              "consent dialog BEFORE the data is accessed, that the user must "
+              "accept to continue?"
           ),
           yes="A gatekeeping disclosure is shown before access.",
           no="No disclosure gate is shown before access.",
       ),
-      "disclosure_status": _DISCLOSURE_STATUS,
-      "severity": _SEVERITY,
+      "disclosure_status": _disclosure_status(subject),
+      "severity": _severity(subject),
   }
 
 
@@ -134,20 +138,20 @@ def permission_battery(policy_id: str, data_type: str) -> Dict[str, Dict[str, An
   and whether a scoped alternative should be used. Severity and disclosure reuse
   the shared rubrics.
   """
+  subject = f"the data type {data_type}"
   return {
       "is_core_functionality": _noul(
           instructions=(
               f"Given the app `app.name` in store category `app.store_category`, "
-              f"is access to `signal.data_type` ({data_type}) core to the app's "
-              "primary purpose, rather than a secondary feature (ads, analytics, "
-              "social sharing)?"
+              f"is access to {subject} core to the app's primary purpose, rather "
+              "than a secondary feature (ads, analytics, social sharing)?"
           ),
           yes="The access is essential to the app's core purpose.",
           no="The app would still work without this access; it is secondary.",
       ),
       "transmits_offdevice": _noul(
           instructions=(
-              "Does `code_snippet` send `signal.data_type` off-device? Consider "
+              f"Does `code_snippet` send {subject} off-device? Consider "
               "`co_located_signals.network_transmission`."
           ),
           yes="The data is transmitted off-device.",
@@ -155,13 +159,14 @@ def permission_battery(policy_id: str, data_type: str) -> Dict[str, Dict[str, An
       ),
       "has_prominent_disclosure": _noul(
           instructions=(
-              "Does `code_snippet` (with `co_located_signals.disclosure`) show a "
-              "prominent disclosure before requesting or using the permission?"
+              f"For {subject}, does `code_snippet` (with "
+              "`co_located_signals.disclosure`) show a prominent disclosure "
+              "before requesting or using the permission?"
           ),
           yes="A disclosure is shown before the permission is used.",
           no="No disclosure is shown before the permission is used.",
       ),
-      "severity": _SEVERITY,
+      "severity": _severity(subject),
   }
 
 

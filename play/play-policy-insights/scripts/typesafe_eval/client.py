@@ -82,9 +82,23 @@ class JevAnswer:
 
 
 class JevClient:
-  """Interface: evaluate a state against typed questions, return answers by id."""
+  """Interface: evaluate a state against typed questions, return answers by id.
+
+  Clients accumulate simple usage counters (requests and input tokens) so the
+  batching benchmark can compare strategies. ``reset_usage`` zeroes them.
+  """
 
   name = "base"
+
+  def __init__(self) -> None:
+    self.request_count = 0
+    self.total_input_tokens = 0
+    self.total_output_tokens = 0
+
+  def reset_usage(self) -> None:
+    self.request_count = 0
+    self.total_input_tokens = 0
+    self.total_output_tokens = 0
 
   def system_one(
       self,
@@ -123,6 +137,7 @@ class HttpJevClient(JevClient):
       max_retries: int = 4,
       opener: Optional[Any] = None,
   ) -> None:
+    super().__init__()
     self.api_key = api_key or os.environ.get(constants.API_KEY_ENV)
     if not self.api_key:
       raise JevApiError(
@@ -198,6 +213,10 @@ class HttpJevClient(JevClient):
       try:
         with self._urlopen(request, timeout=self.timeout) as response:
           body = json.loads(response.read().decode("utf-8"))
+          usage = body.get("usage", {}) or {}
+          self.request_count += 1
+          self.total_input_tokens += int(usage.get("input_tokens", 0) or 0)
+          self.total_output_tokens += int(usage.get("output_tokens", 0) or 0)
           return self.parse_response(body)
       except urllib.error.HTTPError as exc:
         # 429/529 are transient; back off and retry. Everything else is fatal.
@@ -285,6 +304,12 @@ class HeuristicJevClient(JevClient):
       questions: Dict[str, Dict[str, Any]],
       model: Optional[str] = None,
   ) -> Dict[str, JevAnswer]:
+    # Estimate input tokens (~4 chars/token) so the batching benchmark reports
+    # meaningful numbers offline too; the live client uses the API's real count.
+    self.request_count += 1
+    approx_chars = len(json.dumps({"state": state, "questions": questions}))
+    self.total_input_tokens += approx_chars // 4
+
     signal = state.get("signal", {}) if isinstance(state, dict) else {}
     co = state.get("co_located_signals", {}) if isinstance(state, dict) else {}
     app = state.get("app", {}) if isinstance(state, dict) else {}
