@@ -350,6 +350,10 @@ T_CONSENT_DEFAULT_ON = 0.60   # Noul mass for "enabled by default" (raise direct
 CONF_CONSENT_ACT = 0.75       # confident opt-in needed to lower (1 - this on the Noul)
 MAX_GUARDS_IN_STATE = 6       # per anchor scope; nearest to the anchor first
 MAX_STRINGS_IN_STATE = 8      # resolved string resources per state
+# Lines read after a disclosure-symbol reference for ``R.string`` names: dialog
+# builders put ``.setTitle(R.string.x).setMessage(R.string.y)`` on the lines
+# that follow ``AlertDialog.Builder(ctx)``.
+DISCLOSURE_STRING_WINDOW = 4
 MAX_GUARD_DECLARATION_HOPS = 1  # same file, then one first-party hop via the receiver's type
 # Android platform permissions each permission-goal policy rests on, used only
 # to attribute a code finding to the source sets that declare the permission.

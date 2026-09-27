@@ -1599,6 +1599,22 @@ def _test_consent_defaults() -> None:
            and pa2[0].get("strings") == st2["strings"], str(st2.get("strings")))
     _check("state_strings_absent_without_resources",
            "strings" not in context.build_file_state(fs_str, [("CRASH_LOGS", "show(")], profiles, {"package": "com.w8"})[0])
+    # A dialog builder chain puts the R.string arguments on the lines after the
+    # disclosure symbol; the window reads them even when the anchor scope is elsewhere.
+    dlg_src = ["import java.net.URL", "import androidx.appcompat.app.AlertDialog", "class D {",
+               "  fun ask() {", "    AlertDialog.Builder(ctx)", "      .setTitle(R.string.crash_consent_title)",
+               "      .setMessage(R.string.crash_consent_body)", "      .show()", "  }",
+               "  fun send() {", "    val r = report()", "    URL(x).openStream()", "  }", "}"]
+    dlg_profiles = dict(profiles)
+    dlg_profiles["androidx.appcompat.app.AlertDialog"] = caps.CapabilityProfile(
+        "androidx.appcompat.app.AlertDialog", "import", {"USER_DISCLOSURE_UI": 0.9}, ["USER_DISCLOSURE_UI"], "model", "m")
+    fs_dlg = structure.FileStructure("D2.kt", "kotlin", dlg_src, ["java.net.URL", "androidx.appcompat.app.AlertDialog"],
+                                     structure.symbol_references(dlg_src, ["java.net.URL", "androidx.appcompat.app.AlertDialog"]), "com.w8")
+    st_dlg, _ = context.build_file_state(fs_dlg, [("CRASH_LOGS", "report()")], dlg_profiles, {"package": "com.w8"}, resources=res)
+    _check("state_strings_disclosure_window",
+           st_dlg.get("strings") == {"crash_consent_title": "Send crash reports?",
+                                     "crash_consent_body": "Help us fix bugs by sending anonymous reports."},
+           str(st_dlg.get("strings")))
     plain = ["import java.net.URL", "fun f() {", "  val r = report()", "  URL(x).openStream()", "}"]
     fs_plain = structure.FileStructure("P.kt", "kotlin", plain, ["java.net.URL"],
                                        structure.symbol_references(plain, ["java.net.URL"]), "com.w8")

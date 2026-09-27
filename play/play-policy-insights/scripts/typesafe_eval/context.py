@@ -785,10 +785,13 @@ def build_file_state(
     for a in anchors:
       if a.chosen is not None:
         scope_lines.extend(range(a.scope[0], a.scope[1]))
-    # ``fs.references`` is keyed by import module; disclosure symbols are simple names.
+    # ``fs.references`` is keyed by import module; disclosure symbols are simple
+    # names. Each reference line is widened forward by DISCLOSURE_STRING_WINDOW
+    # so the ``R.string`` arguments of a builder chain are read too.
     disclosure_set = set(disclosure)
-    disclosure_lines = [i for module, refs in fs.references.items()
-                        if structure.simple_name(module) in disclosure_set for i in refs]
+    disclosure_lines = [j for module, refs in fs.references.items()
+                        if structure.simple_name(module) in disclosure_set
+                        for i in refs for j in range(i, i + 1 + constants.DISCLOSURE_STRING_WINDOW)]
     strings = resolved_strings(fs, scope_lines + disclosure_lines, resources)
     if strings:
       state["strings"] = strings
