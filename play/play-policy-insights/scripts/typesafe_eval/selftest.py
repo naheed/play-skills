@@ -15,14 +15,22 @@
 """Offline, hermetic unit checks for the evaluator.
 
 Run with ``python -m typesafe_eval selftest``. These exercise the deterministic
-pieces (snippet extraction, templates, HTTP request-build/response-parse, and
-answer composition through the heuristic client) without any network access.
+pieces (structure extraction, capability cache, context building, triage
+ranking, three-way decision composition, critic routing, manifest checks,
+templates, HTTP request-build/response-parse, and answer composition through
+the heuristic client) without any network access.
+
+Fixtures below name real library packages (e.g. an HTTP client) on purpose:
+they are *test inputs* that the semantic layer must classify without a lookup
+table. The identifier lint (:func:`_test_identifier_lint`) enforces that no
+such name appears in the evaluator's own logic.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import tempfile
 
 from typesafe_eval import evaluate
@@ -34,6 +42,18 @@ from typesafe_eval.client import HttpJevClient
 
 
 _FAILURES = []
+
+# A Kotlin file where the location value flows into a referenced network sink.
+_KT_LOCATION_SINK = (
+    "import okhttp3.OkHttpClient\n"
+    "import okhttp3.Request\n"
+    "fun report() {\n"
+    "  val http = OkHttpClient()\n"
+    "  val loc = FusedLocationProviderClient()\n"
+    "  val lat = loc.latitude\n"
+    "  http.newCall(Request.Builder().url(\"https://x/\" + lat).build()).execute()\n"
+    "}\n"
+)
 
 
 def _check(name: str, condition: bool, detail: str = "") -> None:
@@ -229,10 +249,7 @@ def _test_play_declaration() -> None:
     rel = "app/Loc.kt"
     os.makedirs(os.path.join(d, "app"))
     with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
-      f.write("import okhttp3.OkHttpClient\n"
-              "val loc = FusedLocationProviderClient()\n"
-              "val lat = loc.latitude\n"
-              "http.newCall(request).execute()\n")
+      f.write(_KT_LOCATION_SINK)
     scratch = os.path.join(d, ".scratch")
     # Declaration discloses Email only, not Precise location.
     decl = {
@@ -271,17 +288,33 @@ def _test_engine_offline_and_robustness() -> None:
     rel = "app/Loc.kt"
     os.makedirs(os.path.join(d, "app"))
     with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
-      f.write("import okhttp3.OkHttpClient\n"
-              "val loc = FusedLocationProviderClient()\n"
-              "val lat = loc.latitude\n"
-              "http.newCall(request).execute()\n")
+      f.write(_KT_LOCATION_SINK)
     scratch = os.path.join(d, ".scratch")
     _write_scratch(d, scratch, {"PRECISE_LOCATION": [f"{rel} (Pattern: FusedLocationProviderClient)"]})
 
     engine.run(scratch, HeuristicJevClient(), batched=True)
     perms = _json.load(open(os.path.join(scratch, "worker_permissions_and_apis.json"), encoding="utf-8"))
     loc = [x for x in perms["findings"] if x["policy_id"] == "location_access_policy"]
-    _check("engine_location_finding", len(loc) == 1 and loc[0]["severity"] == "CRITICAL")
+    _check("engine_location_finding", len(loc) == 1 and loc[0]["severity"] == "CRITICAL",
+           str([(x["policy_id"], x["severity"]) for x in perms["findings"]]))
+    ds = _json.load(open(os.path.join(scratch, "worker_data_safety.json"), encoding="utf-8"))
+    loc_ds = [x for x in ds["findings"] if x.get("psl_constant") == "PRECISE_LOCATION"
+              and x.get("kind") != "play_declaration"]
+    _check("engine_ds_transmits",
+           len(loc_ds) == 1 and loc_ds[0]["transfer_decision"] == "TRANSMITS"
+           and loc_ds[0]["is_transferred"] is True,
+           str([(x.get("transfer_decision"), x.get("is_transferred")) for x in loc_ds]))
+    if loc_ds:
+      trace = loc_ds[0].get("decision_trace") or {}
+      _check("engine_ds_trace", trace.get("evaluator_version") and trace.get("sinks")
+             and trace["anchor"].get("sink_in_scope") is True, str(trace.get("anchor")))
+      _check("engine_ds_sink_labelled",
+             any("NETWORK_EGRESS" in (s.get("capabilities") or []) for s in loc_ds[0]["sinks"]),
+             str(loc_ds[0]["sinks"]))
+    triage = _json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    _check("engine_triage_written",
+           triage.get("counters", {}).get("kept") == 1 and "capabilities" in triage,
+           str(triage.get("counters")))
 
     # Robustness: a client that always raises must not crash the scan.
     class _Failing(JevClient):
@@ -297,7 +330,7 @@ def _test_engine_offline_and_robustness() -> None:
 
 def _test_reduce_noise() -> None:
   from typesafe_eval import engine
-  # Global cap per type (3) and per-file cap (2); Play flavor prioritized.
+  # Global cap per type (4) and per-file cap (2); Play flavor prioritized.
   ds = {
       "NAME": [f"app/src/main/A{i}.kt (Pattern: name)" for i in range(6)],
       "EMAIL": ["app/src/main/B.kt (Pattern: e)", "app/src/main/B.kt (Pattern: e)",
@@ -308,7 +341,7 @@ def _test_reduce_noise() -> None:
       "ACCOUNT_DELETION": ["app/src/main/res/values-xx/strings.xml (Pattern: deactivate)"],
   }
   reduced = engine._reduce_noise(ds)
-  _check("reduce_type_cap", len(reduced["NAME"]) == 3, str(len(reduced["NAME"])))
+  _check("reduce_type_cap", len(reduced["NAME"]) == 4, str(len(reduced["NAME"])))
   _check("reduce_per_file_cap", len(reduced["EMAIL"]) == 2, str(len(reduced["EMAIL"])))
   _check("reduce_flavor_excludes_nonplay",
          reduced["AUDIO"] == ["app/src/play/D.kt (Pattern: MediaRecorder)"],
@@ -361,6 +394,352 @@ def _test_cache_roundtrip() -> None:
            f"calls={inner.calls}")
 
 
+def _test_structure_layer() -> None:
+  from typesafe_eval import structure
+  with tempfile.TemporaryDirectory() as d:
+    os.makedirs(os.path.join(d, "gradle"))
+    os.makedirs(os.path.join(d, "app"))
+    with open(os.path.join(d, "app", "build.gradle.kts"), "w", encoding="utf-8") as f:
+      f.write('dependencies {\n  implementation("com.example.net:client:1.2")\n'
+              '  implementation(libs.analytics)\n  testImplementation("junit:junit:4.13")\n}\n')
+    with open(os.path.join(d, "gradle", "libs.toml"), "w", encoding="utf-8") as f:
+      f.write('[libraries]\nanalytics = { module = "com.vendor.sdk:analytics", version = "1" }\n'
+              'ui = { group = "org.ui", name = "widgets", version.ref = "v" }\n')
+    with open(os.path.join(d, "package.json"), "w", encoding="utf-8") as f:
+      f.write('{"dependencies": {"@scope/net": "^1", "left-pad": "1.0"}}\n')
+    deps = {(x.ecosystem, x.coordinate) for x in structure.dependency_inventory(d)}
+    _check("deps_gradle", ("maven", "com.example.net:client") in deps, str(deps))
+    _check("deps_toml_module", ("maven", "com.vendor.sdk:analytics") in deps)
+    _check("deps_toml_group_name", ("maven", "org.ui:widgets") in deps)
+    _check("deps_npm_scoped", ("npm", "@scope/net") in deps)
+
+  kt = ("package a.b\n"
+        "import java.net.Socket\n"
+        "import android.util.Log\n"
+        "// Socket is used below\n"
+        "class C {\n"
+        "  fun send(x: String) {\n"
+        "    val s = Socket(host, 21)\n"
+        "    s.getOutputStream().write(x.toByteArray())\n"
+        "  }\n"
+        "  fun log(x: String) { Log.d(TAG, x) }\n"
+        "}\n")
+  lines = kt.splitlines()
+  imports = structure.import_inventory(kt, "kotlin")
+  _check("imports_kotlin", imports == ["java.net.Socket", "android.util.Log"], str(imports))
+  refs = structure.symbol_references(lines, imports)
+  _check("refs_skip_import_line", refs.get("java.net.Socket") == [6], str(refs))
+  hits = structure.all_occurrences(lines, "Socket")
+  _check("occurrences_demote_comment", hits == [6], str(hits))
+  scope = structure.enclosing_scope(lines, 6, "kotlin")
+  _check("enclosing_scope_method", scope == (5, 9), str(scope))
+  _check("package_of_dotted", structure.package_of("java.net.Socket") == "java.net")
+  _check("package_of_dart", structure.package_of("package:http/http.dart") == "package:http")
+  _check("package_of_npm_scoped", structure.package_of("@scope/pkg/sub") == "@scope/pkg")
+  _check("package_of_dart_core", structure.package_of("dart:io") == "dart:io")
+  dart = "import 'package:http/http.dart' as http;\nimport 'dart:io';\n"
+  _check("imports_dart", structure.import_inventory(dart, "dart") == ["package:http/http.dart", "dart:io"])
+  js = "import axios from 'axios';\nconst fs = require('fs');\nimport './local';\n"
+  _check("imports_js_skips_relative", structure.import_inventory(js, "javascript") == ["axios", "fs"],
+         str(structure.import_inventory(js, "javascript")))
+
+
+def _test_capabilities_layer() -> None:
+  from typesafe_eval import capabilities as caps
+  from typesafe_eval import constants
+  # Threshold -> labels, including the UNKNOWN indecision band.
+  _check("labels_confident", caps.labels_from_probabilities({"NETWORK_EGRESS": 0.9}) == ["NETWORK_EGRESS"])
+  _check("labels_unknown_band",
+         caps.labels_from_probabilities({"NETWORK_EGRESS": 0.5, "LOGGING": 0.1}) == ["UNKNOWN"])
+  _check("labels_confident_negative", caps.labels_from_probabilities({"NETWORK_EGRESS": 0.1}) == [])
+  _check("unknown_is_sink",
+         caps.CapabilityProfile("x", "import", {}, ["UNKNOWN"], "model", None).is_transfer_sink)
+  _check("ipc_is_sharing", "IPC_SHARING" in caps.SHARING_CAPABILITIES
+         and "IPC_SHARING" in caps.TRANSFER_CAPABILITIES)
+  # Definitions must not name products: crude check that they are behavioural.
+  _check("definitions_behavioural",
+         all(len(v) > 40 and v[0].isupper() for v in caps.CAPABILITIES.values()))
+
+  with tempfile.TemporaryDirectory() as d:
+    path = os.path.join(d, "caps.json")
+    cache = caps.CapabilityCache(path)
+    client = HeuristicJevClient()
+    symbols = [{"identifier": "java.net.Socket", "kind": "import"},
+               {"identifier": "java.util.List", "kind": "import"}]
+    profiles = caps.classify(symbols, client, cache, {"package": "a.b"}, model="m")
+    _check("classify_network", "NETWORK_EGRESS" in profiles["java.net.Socket"].labels,
+           str(profiles["java.net.Socket"].labels))
+    _check("classify_not_sink", not profiles["java.util.List"].is_transfer_sink,
+           str(profiles["java.util.List"].labels))
+    _check("classify_source_tagged", profiles["java.net.Socket"].source == "heuristic")
+    calls = client.request_count
+    cache2 = caps.CapabilityCache(path)
+    caps.classify(symbols, client, cache2, {"package": "a.b"}, model="m")
+    _check("cache_hit_no_call", client.request_count == calls and cache2.hits == 2,
+           f"calls={client.request_count} hits={cache2.hits}")
+    # A human entry wins over the model and survives a model re-answer.
+    human = caps.CapabilityProfile("java.util.List", "import", {"IPC_SHARING": 1.0},
+                                   ["IPC_SHARING"], "human", None)
+    cache2.put(human)
+    cache2.save()
+    cache3 = caps.CapabilityCache(path)
+    got = caps.classify(symbols, client, cache3, {"package": "a.b"}, model="m")
+    _check("human_override_wins", got["java.util.List"].labels == ["IPC_SHARING"]
+           and got["java.util.List"].source == "human")
+    # Different taxonomy/model key -> re-asked, never silently reused.
+    _check("cache_key_model_scoped", caps.CapabilityCache.key("x", "m1") != caps.CapabilityCache.key("x", "m2"))
+    _check("t_capability_between", 0 < constants.T_CAPABILITY_UNKNOWN_LOW < constants.T_CAPABILITY <= 1)
+
+
+def _test_context_anchor() -> None:
+  from typesafe_eval import capabilities as caps
+  from typesafe_eval import context
+  from typesafe_eval import structure
+  src = ("import java.net.Socket\n"
+         "import java.util.Locale\n"
+         "// getLastKnownLocation is documented here (comment, must not anchor)\n"
+         "class A {\n"
+         "  fun show() {\n"
+         "    val l = getLastKnownLocation()\n"
+         "    textView.text = l.toString()\n"
+         "  }\n"
+         "  fun upload() {\n"
+         "    val l = getLastKnownLocation()\n"
+         "    Socket(h, 80).getOutputStream().write(l.toString().toByteArray())\n"
+         "  }\n"
+         "}\n")
+  with tempfile.TemporaryDirectory() as d:
+    with open(os.path.join(d, "A.kt"), "w", encoding="utf-8") as f:
+      f.write(src)
+    fs = structure.analyze_file(d, "A.kt")
+  profiles = {
+      "java.net.Socket": caps.CapabilityProfile("java.net.Socket", "import", {"NETWORK_EGRESS": 0.95},
+                                                ["NETWORK_EGRESS"], "model", "m"),
+      "java.util.Locale": caps.CapabilityProfile("java.util.Locale", "import", {}, [], "model", "m"),
+  }
+  sinks = context.file_sinks(fs, profiles)
+  _check("sinks_only_transfer", [s.symbol for s in sinks] == ["Socket"], str(sinks))
+  anchor = context.anchor_signal(fs, "getLastKnownLocation", "PRECISE_LOCATION", sinks)
+  _check("anchor_all_occurrences", anchor.hit_lines == [5, 9], str(anchor.hit_lines))
+  _check("anchor_prefers_sink_scope", anchor.chosen == 9 and anchor.sink_in_scope, str(anchor))
+  state, per = context.build_file_state(fs, [("PRECISE_LOCATION", "getLastKnownLocation")], profiles, {"name": "X"})
+  _check("state_sinks_labelled", state["sinks"][0]["capabilities"] == ["NETWORK_EGRESS"])
+  _check("state_snippet_is_upload_scope",
+         "fun upload" in state["code_snippet"] and "fun show" not in state["code_snippet"],
+         state["code_snippet"][:200])
+  _check("per_ask_anchor", per[0]["anchor"]["sink_in_scope"] is True and per[0]["signal"]["line"] == 10)
+  # Unreferenced (wildcard) transfer import is still a file-level sink.
+  fs2 = structure.FileStructure("B.kt", "kotlin", ["import java.net.*", "val x = 1"], ["java.net"], {})
+  p2 = {"java.net": caps.CapabilityProfile("java.net", "package", {"NETWORK_EGRESS": 0.9}, ["NETWORK_EGRESS"], "model", "m")}
+  _check("file_level_sink_without_refs", [s.lines for s in context.file_sinks(fs2, p2)] == [[]])
+  # Ranking: sink-in-scope first, then proximity, then scanner order.
+  a_in = context.Anchor("T", "p", [1], 1, (0, 3), 0, True)
+  a_near = context.Anchor("T", "p", [1], 1, (0, 3), 4, False)
+  a_far = context.Anchor("T", "p", [1], 1, (0, 3), None, False)
+  ranked = sorted([(a_far, 0), (a_near, 1), (a_in, 2)], key=lambda t: context.rank_key(*t))
+  _check("rank_key_order", [r[1] for r in ranked] == [2, 1, 0])
+
+
+def _test_three_way_decision() -> None:
+  from typesafe_eval import constants
+  from typesafe_eval.client import JevAnswer
+  _check("decision_transmits", evaluate.transfer_decision(constants.T_TRANSMIT_HIGH) == "TRANSMITS")
+  _check("decision_local", evaluate.transfer_decision(constants.T_TRANSMIT_LOW - 0.01) == "LOCAL")
+  mid = (constants.T_TRANSMIT_LOW + constants.T_TRANSMIT_HIGH) / 2
+  _check("decision_uncertain", evaluate.transfer_decision(mid) == "UNCERTAIN")
+
+  def _answers(p_transmit, relevant=0.9):
+    return {
+        "signal_relevant": JevAnswer("noul", noul=relevant),
+        "transmits_offdevice": JevAnswer("noul", noul=p_transmit),
+        "user_initiated": JevAnswer("noul", noul=0.2),
+        "is_third_party": JevAnswer("noul", noul=0.2),
+        "has_prominent_disclosure": JevAnswer("noul", noul=0.1),
+        "disclosure_status": JevAnswer("choice", choice="MISSING"),
+        "severity": JevAnswer("score", score=1.0),
+    }
+  state = {
+      "signal": {"data_type": "PRECISE_LOCATION", "matched_pattern": "loc", "file": "A.kt",
+                 "line": 10, "matched_line": "val l = loc()", "all_lines": [3, 10]},
+      "code_snippet": "L10: val l = loc()",
+      "sinks": [{"symbol": "Intent", "capabilities": ["IPC_SHARING"], "lines": [11]}],
+      "anchor": {"scope": [9, 12], "proximity": 0, "sink_in_scope": True},
+      "app": {},
+  }
+  unc = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", state, _answers(mid), "test")  # pylint: disable=protected-access
+  _check("uncertain_is_transferred_true", unc["is_transferred"] is True and unc["transfer_decision"] == "UNCERTAIN")
+  _check("uncertain_severity_important", unc["severity"] == "IMPORTANT", unc["severity"])
+  _check("uncertain_needs_review", unc.get("needs_manual_review") is True)
+  _check("uncertain_summary_marked", "uncertain" in unc["issue_summary"].lower())
+  _check("ipc_in_scope_is_sharing", unc["is_third_party"] is True, str(unc["decision_trace"].get("sharing_sinks_in_scope")))
+  _check("trace_has_thresholds",
+         unc["decision_trace"]["thresholds"]["T_TRANSMIT_HIGH"] == constants.T_TRANSMIT_HIGH
+         and "provenance" in unc["decision_trace"]["thresholds"])
+  loc = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", state, _answers(0.1), "test")  # pylint: disable=protected-access
+  _check("local_exempt_suggestion", loc["is_transferred"] is False
+         and loc["prominent_disclosure_status"] == "EXEMPT" and loc["severity"] == "SUGGESTION")
+  tx = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", state, _answers(0.95), "test")  # pylint: disable=protected-access
+  _check("transmits_critical", tx["severity"] == "CRITICAL" and tx["claim_kind"] == "transfer")
+  gated = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", state, _answers(0.95, relevant=0.1), "test")  # pylint: disable=protected-access
+  _check("relevance_gate_drops", gated is None)
+  perm = evaluate._compose_permission_finding("PRECISE_LOCATION", "location_access_policy", state, {  # pylint: disable=protected-access
+      **_answers(mid), "is_core_functionality": JevAnswer("noul", noul=0.1)}, "test")
+  _check("permission_uncertain_review", perm is not None and perm.get("needs_manual_review") is True
+         and perm["claim_kind"] == "generic", str(perm and perm.get("severity")))
+
+
+def _test_critic_routing() -> None:
+  from typesafe_eval import constants
+  from typesafe_eval.client import JevAnswer, JevClient
+  _check("critic_prunes_confident_fp", evaluate._critic_decision(0.05)["action"] == "PRUNED")  # pylint: disable=protected-access
+  _check("critic_uncertain_never_pruned",
+         evaluate._critic_decision(0.05, uncertain=True)["action"] == "MANUAL_REVIEW")  # pylint: disable=protected-access
+  _check("critic_uncertain_upgrade",
+         evaluate._critic_decision(constants.CONF_ACT, uncertain=True)["action"] == "VERIFIED")  # pylint: disable=protected-access
+  _check("critic_transfer_battery", "evidence_shows_transfer" in q.critic_battery("transfer"))
+  _check("critic_generic_battery", "evidence_supports_claim" in q.critic_battery("generic"))
+
+  class _Fixed(JevClient):
+    name = "fixed"
+    def __init__(self, p): super().__init__(); self.p = p; self.seen = []
+    def system_one(self, state, questions, model=None):
+      self.seen.append((state, list(questions)))
+      return {qid: JevAnswer("noul", noul=self.p) for qid in questions}
+
+  chunk = {
+      "f1": {"issue_summary": "x", "severity": "CRITICAL", "claim_kind": "transfer",
+             "claim": "loc sent", "evidence_snippet": "L1: send(loc)", "sinks": [{"symbol": "S"}],
+             "transfer_decision": "TRANSMITS"},
+      "f2": {"issue_summary": "y", "severity": "IMPORTANT", "client": "error"},
+      "f3": {"issue_summary": "z", "severity": "IMPORTANT", "claim_kind": "transfer",
+             "transfer_decision": "UNCERTAIN", "evidence_snippet": "L1: x"},
+  }
+  c = _Fixed(0.05)
+  out = evaluate.evaluate_critic_chunk(chunk, c)
+  _check("critic_error_upstream_review", out["f2"]["action"] == "MANUAL_REVIEW")
+  _check("critic_prunes_fp_transfer", out["f1"]["action"] == "PRUNED")
+  _check("critic_keeps_uncertain", out["f3"]["action"] == "MANUAL_REVIEW")
+  _check("critic_asks_transfer_question",
+         any("evidence_shows_transfer" in qs for _, qs in c.seen) and len(c.seen) == 2)
+  _check("critic_state_has_claim_and_sinks",
+         c.seen[0][0]["finding"]["claim"] == "loc sent" and c.seen[0][0]["finding"]["sinks"])
+
+
+def _test_manifest_fgs() -> None:
+  from typesafe_eval import registry
+  manifest = {
+      "target_sdk": 34,
+      "permissions": ["android.permission.FOREGROUND_SERVICE",
+                      "android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"],
+      "foreground_services": [
+          {"name": ".VpnSvc", "type": ""},
+          {"name": ".DevSvc", "type": "connectedDevice"},
+          {"name": ".LocSvc", "type": "location|dataSync"},
+      ],
+  }
+  found = registry._foreground_service_findings(manifest)  # pylint: disable=protected-access
+  by_name = {f["decision_trace"]["service"]: f for f in found}
+  _check("fgs_missing_type_important", by_name[".VpnSvc"]["severity"] == "IMPORTANT")
+  _check("fgs_type_with_permission_suggestion", by_name[".DevSvc"]["severity"] == "SUGGESTION")
+  _check("fgs_missing_permission_important",
+         by_name[".LocSvc"]["severity"] == "IMPORTANT" and "FOREGROUND_SERVICE_LOCATION" in by_name[".LocSvc"]["evidence"])
+  _check("fgs_permission_mechanical",
+         registry._fgs_permission_for_type("mediaPlayback") == "android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK")  # pylint: disable=protected-access
+  # Below API 34 the type checks do not apply (inventory only).
+  found33 = registry._foreground_service_findings({**manifest, "target_sdk": 33})  # pylint: disable=protected-access
+  _check("fgs_api33_no_important", all(f["severity"] == "SUGGESTION" for f in found33), str([f["severity"] for f in found33]))
+  _check("fgs_spec_registered", any(s.policy_id == "foreground_services_policy" for s in registry.manifest_specs()))
+
+
+def _test_triage_ranking() -> None:
+  """A candidate in a file with a labelled sink outranks scanner order."""
+  from typesafe_eval import engine
+  with tempfile.TemporaryDirectory() as d:
+    os.makedirs(os.path.join(d, "app"))
+    # Six files match; only the LAST in scanner order has a network sink.
+    for i in range(6):
+      body = "fun f() {\n  val n = user.name\n"
+      if i == 5:
+        body = "import java.net.Socket\n" + body + "  Socket(h, 1).getOutputStream().write(n.toByteArray())\n"
+      with open(os.path.join(d, f"app/F{i}.kt"), "w", encoding="utf-8") as f:
+        f.write(body + "}\n")
+    scratch = os.path.join(d, ".scratch")
+    _write_scratch(d, scratch, {"NAME": [f"app/F{i}.kt (Pattern: name)" for i in range(6)]})
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    ds = json.load(open(os.path.join(scratch, "worker_data_safety.json"), encoding="utf-8"))
+    files = [(f.get("files_involved") or [""])[0] for f in ds["findings"]]
+    _check("triage_keeps_sink_file", any("F5.kt" in f for f in files), str(files))
+    _check("triage_caps_per_type", triage["counters"]["kept"] == 4, str(triage["counters"].get("kept")))
+    dropped = [x for x in triage["dropped"] if "MAX_FINDINGS_PER_TYPE" in x["reason"]]
+    _check("triage_records_dropped_with_rank", len(dropped) == 2 and all("rank" in x for x in dropped), str(dropped))
+    _check("triage_sink_file_ranked_first",
+           triage["sinks_by_file"].get("app/F5.kt") and not triage["sinks_by_file"].get("app/F0.kt"))
+    _check("triage_declared_caps_key", "dependency_capabilities" in triage)
+
+
+def _test_identifier_lint() -> None:
+  """No vendor / library name may drive evaluator logic (tests and fixtures excluded).
+
+  The list below is illustrative, not exhaustive: it exists to catch the
+  regression of reintroducing a lookup table. Capability *definitions* must
+  describe behaviour; the model supplies the mapping from names to behaviour.
+  """
+  vendor_tokens = (
+      "okhttp", "retrofit", "volley", "ktor", "crashlytics", "firebase", "admob",
+      "sentry", "mixpanel", "amplitude", "appsflyer", "braze", "segment.io",
+      "facebook", "timber", "glide", "picasso", "adjust.sdk", "unity3d", "bugsnag",
+  )
+  pkg_dir = os.path.dirname(os.path.abspath(__file__))
+  excluded = {"selftest.py", "livetest.py"}
+  offenders = []
+  for name in sorted(os.listdir(pkg_dir)):
+    if not name.endswith(".py") or name in excluded:
+      continue
+    with open(os.path.join(pkg_dir, name), "r", encoding="utf-8") as f:
+      text = f.read().lower()
+    for tok in vendor_tokens:
+      if re.search(r"(?<![a-z])" + re.escape(tok) + r"(?![a-z])", text):
+        offenders.append(f"{name}:{tok}")
+  _check("identifier_lint_no_vendor_names", not offenders, ", ".join(offenders))
+
+
+def _test_calibrate() -> None:
+  from typesafe_eval import calibrate
+  cases = [
+      {"file": "a", "data_type": "T", "transfers": True, "p_transmit": 0.92},
+      {"file": "b", "data_type": "T", "transfers": True, "p_transmit": 0.81},
+      {"file": "c", "data_type": "T", "transfers": True, "p_transmit": 0.55},
+      {"file": "d", "data_type": "T", "transfers": False, "p_transmit": 0.60},
+      {"file": "e", "data_type": "T", "transfers": False, "p_transmit": 0.20},
+      {"file": "f", "data_type": "T", "transfers": False, "p_transmit": 0.05},
+  ]
+  report = calibrate.calibrate({"cases": cases, "description": "synthetic"}, min_precision=0.9)
+  band = report["band"]
+  _check("calibrate_low_keeps_recall", band["T_TRANSMIT_LOW"] == 0.55, str(band))
+  _check("calibrate_high_meets_precision", band["T_TRANSMIT_HIGH"] == 0.61, str(band))
+  _check("calibrate_metrics", report["metrics"]["recall_at_high"] == round(2 / 3, 3)
+         and report["metrics"]["abstention_rate"] == round(2 / 6, 3), str(report["metrics"]))
+  _check("calibrate_reliability", report["reliability"]["brier"] is not None and report["reliability"]["ece"] is not None)
+  _check("calibrate_small_set_warns", any("regression check" in w for w in report["warnings"]))
+  _check("calibrate_provenance_block", set(report["provenance"]) >= {"model", "calibrated_on", "calibrated_at", "method", "note"})
+  # Join from worker files.
+  with tempfile.TemporaryDirectory() as d:
+    with open(os.path.join(d, "worker_x.json"), "w", encoding="utf-8") as f:
+      json.dump({"findings": [{"psl_constant": "T", "files_involved": ["app/A.kt"],
+                               "decision_trace": {"scores": {"transmits_offdevice": 0.77}}}]}, f)
+    joined = calibrate.join_probabilities([{"file": "A.kt", "data_type": "T", "transfers": True}], [d])
+    _check("calibrate_joins_worker_probability", joined and joined[0]["p_transmit"] == 0.77, str(joined))
+
+
+def _test_relevance_token_embedded() -> None:
+  b = q.data_safety_battery("AUDIO", "audio files", token="record")
+  _check("relevance_embeds_token", "`record`" in b["signal_relevant"]["instructions"])
+  _check("relevance_no_state_path", "signal.matched_pattern" not in b["signal_relevant"]["instructions"])
+  p = q.permission_battery("audio_recording_policy", "AUDIO", "MediaRecorder")
+  _check("permission_relevance_first", next(iter(p)) == "signal_relevant" and "`MediaRecorder`" in p["signal_relevant"]["instructions"])
+
+
 def main() -> int:
   _test_parse_finding()
   _test_snippet_and_colocation()
@@ -375,6 +754,16 @@ def main() -> int:
   _test_play_declaration()
   _test_engine_offline_and_robustness()
   _test_cache_roundtrip()
+  _test_structure_layer()
+  _test_capabilities_layer()
+  _test_context_anchor()
+  _test_three_way_decision()
+  _test_critic_routing()
+  _test_manifest_fgs()
+  _test_triage_ranking()
+  _test_identifier_lint()
+  _test_calibrate()
+  _test_relevance_token_embedded()
   print()
   if _FAILURES:
     print(f"{len(_FAILURES)} check(s) FAILED: {', '.join(_FAILURES)}")

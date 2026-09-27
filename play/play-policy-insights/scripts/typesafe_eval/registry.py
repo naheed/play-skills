@@ -24,8 +24,8 @@ Each spec declares an **evaluation kind**:
 - ``code_signal`` — triggered by a scanner signal (a data type found in a file);
   evaluated against that file's code snippet. Most policies.
 - ``manifest`` — triggered by an app-level manifest fact (a permission or
-  component); evaluated once per app against ``manifest_details``. (Infra is in
-  place; concrete manifest policies are added during coverage expansion.)
+  component); evaluated once per app against ``manifest_details`` with no model
+  call (e.g. foreground-service type/permission checks).
 - ``deterministic`` — decided in code with no model call (e.g. presence checks,
   numeric SDK thresholds).
 """
@@ -33,9 +33,11 @@ Each spec declares an **evaluation kind**:
 from __future__ import annotations
 
 import dataclasses
+import re
 from typing import Any
 from typing import Callable
 from typing import Dict
+from typing import List
 from typing import Optional
 from typing import Tuple
 
@@ -70,9 +72,11 @@ class PolicySpec:
   kind: str
   goal: str
   applies_data_type: Callable[[str], bool] = lambda dt: False
-  make_battery: Optional[Callable[[str, str], Dict[str, Any]]] = None
+  make_battery: Optional[Callable[..., Dict[str, Any]]] = None
   compose: Optional[Callable[..., Optional[Dict[str, Any]]]] = None
   compose_deterministic: Optional[Callable[..., Optional[Dict[str, Any]]]] = None
+  # (manifest) build zero or more findings from ``manifest_details`` alone.
+  compose_manifest: Optional[Callable[[Dict[str, Any]], List[Dict[str, Any]]]] = None
   # Optional false-positive gate for deterministic policies: a light model check
   # that must pass for the finding to be emitted. Filters generic-pattern FPs
   # (e.g. "deactivate" matching a proxy toggle) without a full battery.
@@ -94,7 +98,7 @@ def _permission_spec(policy_id: str, data_types: Tuple[str, ...]) -> PolicySpec:
       kind=CODE_SIGNAL,
       goal="permissions_and_apis",
       applies_data_type=lambda dt: dt in members,
-      make_battery=lambda dt, desc: q.permission_battery(policy_id, dt),
+      make_battery=lambda dt, desc, token="": q.permission_battery(policy_id, dt, token),
       compose=lambda dt, finding_str, state, answers, client_name: (
           evaluate._compose_permission_finding(  # pylint: disable=protected-access
               dt, policy_id, state, answers, client_name
@@ -110,7 +114,7 @@ def _data_safety_spec() -> PolicySpec:
       kind=CODE_SIGNAL,
       goal="data_safety",
       applies_data_type=lambda dt: dt in evaluate._taxonomy(),  # pylint: disable=protected-access
-      make_battery=lambda dt, desc: q.data_safety_battery(dt, desc),
+      make_battery=lambda dt, desc, token="": q.data_safety_battery(dt, desc, token),
       compose=lambda dt, finding_str, state, answers, client_name: (
           evaluate._compose_data_safety_finding(  # pylint: disable=protected-access
               dt, finding_str, state, answers, client_name
@@ -146,6 +150,106 @@ def _play_declaration_spec() -> PolicySpec:
   )
 
 
+def _fgs_permission_for_type(fgs_type: str) -> str:
+  """``connectedDevice`` -> ``android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE``.
+
+  Purely mechanical: the platform names the per-type permission by upper-snake
+  casing the type token, so no table of types is needed.
+  """
+  snake = re.sub(r"(?<!^)(?=[A-Z])", "_", fgs_type).upper()
+  return f"android.permission.FOREGROUND_SERVICE_{snake}"
+
+
+def _foreground_service_findings(manifest: Dict[str, Any]) -> List[Dict[str, Any]]:
+  """Deterministic foreground-service checks from the manifest alone.
+
+  Android 14 (API 34) requires every foreground service to declare at least one
+  ``foregroundServiceType`` and to hold the matching per-type permission. Both
+  are mechanical facts a parser can check, so no model call is made. Services
+  that pass are emitted as SUGGESTION inventory so a reviewer sees the declared
+  types and can judge the justification (which *is* a judgment call, and is
+  left to the human).
+  """
+  findings: List[Dict[str, Any]] = []
+  try:
+    target_sdk = int(manifest.get("target_sdk") or 0)
+  except (TypeError, ValueError):
+    target_sdk = 0
+  permissions = set(manifest.get("permissions") or [])
+  for svc in manifest.get("foreground_services") or []:
+    name = svc.get("name") or "(unnamed service)"
+    raw_type = (svc.get("type") or "").strip()
+    types = [t for t in re.split(r"[|,\s]+", raw_type) if t]
+    base = {
+        "policy_id": "foreground_services_policy",
+        "files_involved": ["AndroidManifest.xml"],
+        "client": "deterministic",
+        "kind": "manifest",
+        "decision_trace": {
+            "evaluator_version": constants.EVALUATOR_VERSION,
+            "service": name, "types": types, "target_sdk": target_sdk,
+        },
+    }
+    if target_sdk >= 34 and not types:
+      findings.append({
+          **base,
+          "issue_summary": (
+              f"Foreground service {name} declares no foregroundServiceType "
+              f"(required when targeting API {target_sdk})"
+          ),
+          "severity": "IMPORTANT",
+          "evidence": f"<service android:name=\"{name}\"> has no android:foregroundServiceType",
+          "recommendation": (
+              "Declare the specific foregroundServiceType(s) the service needs and "
+              "the matching FOREGROUND_SERVICE_<TYPE> permission, or stop running "
+              "it as a foreground service."
+          ),
+      })
+      continue
+    missing = [
+        t for t in types
+        if target_sdk >= 34 and _fgs_permission_for_type(t) not in permissions
+    ]
+    if missing:
+      findings.append({
+          **base,
+          "issue_summary": (
+              f"Foreground service {name} uses type(s) {', '.join(missing)} without "
+              "the matching FOREGROUND_SERVICE_<TYPE> permission"
+          ),
+          "severity": "IMPORTANT",
+          "evidence": f"types={types}; missing={[_fgs_permission_for_type(t) for t in missing]}",
+          "recommendation": (
+              "Add the per-type FOREGROUND_SERVICE_<TYPE> permission for each "
+              "declared foregroundServiceType."
+          ),
+      })
+    elif types:
+      findings.append({
+          **base,
+          "issue_summary": (
+              f"Foreground service {name} declares type(s) {', '.join(types)}; "
+              "verify the use case matches the type's policy definition"
+          ),
+          "severity": "SUGGESTION",
+          "evidence": f"<service android:name=\"{name}\" android:foregroundServiceType=\"{raw_type}\">",
+          "recommendation": (
+              "Confirm each declared type is used only for the purpose its policy "
+              "allows, and that the Play Console foreground-service declaration matches."
+          ),
+      })
+  return findings
+
+
+def _foreground_service_spec() -> PolicySpec:
+  return PolicySpec(
+      policy_id="foreground_services_policy",
+      kind=MANIFEST,
+      goal="permissions_and_apis",
+      compose_manifest=_foreground_service_findings,
+  )
+
+
 def _account_deletion_spec() -> PolicySpec:
   return PolicySpec(
       policy_id="account_deletion",
@@ -170,6 +274,7 @@ REGISTRY: Tuple[PolicySpec, ...] = (
     _permission_spec("audio_recording_policy", ("AUDIO",)),
     _data_safety_spec(),
     _account_deletion_spec(),
+    _foreground_service_spec(),
     _play_declaration_spec(),
 )
 

@@ -55,6 +55,29 @@ def _severity(subject: str) -> Dict[str, Any]:
   }
 
 
+def _relevance(subject: str, token: str = "") -> Dict[str, Any]:
+  """Semantic match gate: does the snippet really handle this data type?
+
+  Scanner patterns are lexical (``record`` matches a DNS record type, ``audio/*``
+  matches a MIME filter). One generic question per signal lets code drop the
+  clear misfires before any policy question is composed, without per-type rules.
+
+  The matched token is embedded literally when known: in a batched request the
+  state carries a ``signals`` *list*, so a field path like
+  ``signal.matched_pattern`` would not resolve for the model.
+  """
+  token_ref = f"the matched token `{token}`" if token else "the matched token"
+  return _noul(
+      instructions=(
+          f"Does `code_snippet` actually read, hold, or process {subject}, as "
+          f"opposed to an unrelated use of {token_ref} (a different meaning of "
+          "the word, a UI string, a MIME type, a comment, or an unrelated API)?"
+      ),
+      yes="The snippet genuinely handles this data type.",
+      no="The token is a coincidental match; this data type is not handled here.",
+  )
+
+
 def _disclosure_status(subject: str) -> Dict[str, Any]:
   return {
       "type": "choice",
@@ -79,23 +102,31 @@ def _disclosure_status(subject: str) -> Dict[str, Any]:
   }
 
 
-def data_safety_battery(data_type: str, description: str) -> Dict[str, Dict[str, Any]]:
+def data_safety_battery(
+    data_type: str, description: str, token: str = ""
+) -> Dict[str, Dict[str, Any]]:
   """Battery for a single data-safety finding (one detected data type).
 
   Produces the typed inputs the existing ``worker_<goal>.json`` schema expects:
   the four data-safety booleans, a disclosure-status choice, and a severity
-  score. Instructions embed the literal data type so the battery works whether
-  the state holds one signal or a whole file's worth (see request batching).
+  score. Instructions embed the literal data type (and the scanner token that
+  anchored the signal, when given) so the battery works whether the state holds
+  one signal or a whole file's worth (see request batching).
   """
   subject = f"the data type {data_type} ({description})"
   return {
+      "signal_relevant": _relevance(subject, token),
       "transmits_offdevice": _noul(
           instructions=(
-              f"Does `code_snippet` cause {subject} to leave the device — sent "
-              "over the network, to a third-party SDK, or written to a shared "
-              "log? Consider `co_located_signals.network_transmission`."
+              f"Does `code_snippet` cause {subject} to leave the device or the "
+              "app's own sandbox — sent over the network, handed to a third-party "
+              "SDK, or shared with another app via an intent, content provider, "
+              "or the clipboard? `sinks` lists the imported symbols in this file "
+              "and the capabilities they are known to provide; a sink labelled "
+              "UNKNOWN may or may not transmit. Consider "
+              "`co_located_signals.network_transmission`."
           ),
-          yes="The data is transmitted off-device or shared to a third party.",
+          yes="The data is transmitted off-device or shared with another party.",
           no="The data is only used locally on the device.",
       ),
       "user_initiated": _noul(
@@ -110,8 +141,9 @@ def data_safety_battery(data_type: str, description: str) -> Dict[str, Dict[str,
       "is_third_party": _noul(
           instructions=(
               f"Does `code_snippet` send {subject} to a destination outside the "
-              "developer's own control, such as an analytics/ads SDK or the "
-              "Android share sheet?"
+              "developer's own control — a sink whose capabilities in `sinks` "
+              "include THIRD_PARTY_TELEMETRY, ADVERTISING_SDK, or IPC_SHARING, or "
+              "any other party that is not the developer's own backend?"
           ),
           yes="The sink is a third party outside the developer's control.",
           no="The sink is the developer's own backend, or there is no sink.",
@@ -131,15 +163,20 @@ def data_safety_battery(data_type: str, description: str) -> Dict[str, Dict[str,
   }
 
 
-def permission_battery(policy_id: str, data_type: str) -> Dict[str, Dict[str, Any]]:
+def permission_battery(
+    policy_id: str, data_type: str, token: str = ""
+) -> Dict[str, Dict[str, Any]]:
   """Battery for a permission-hygiene finding (location, contacts, audio, ...).
 
   Focuses on whether a restricted permission is justified by core functionality
   and whether a scoped alternative should be used. Severity and disclosure reuse
-  the shared rubrics.
+  the shared rubrics. ``token`` is the scanner pattern that anchored the signal
+  (embedded in the relevance gate; see :func:`_relevance`).
   """
+  del policy_id  # the policy is applied in code (evaluate.py), not in the question
   subject = f"the data type {data_type}"
   return {
+      "signal_relevant": _relevance(subject, token),
       "is_core_functionality": _noul(
           instructions=(
               f"Given the app `app.name` in store category `app.store_category`, "
@@ -151,8 +188,9 @@ def permission_battery(policy_id: str, data_type: str) -> Dict[str, Dict[str, An
       ),
       "transmits_offdevice": _noul(
           instructions=(
-              f"Does `code_snippet` send {subject} off-device? Consider "
-              "`co_located_signals.network_transmission`."
+              f"Does `code_snippet` send {subject} off-device or to another app? "
+              "`sinks` lists imported symbols and their known capabilities. "
+              "Consider `co_located_signals.network_transmission`."
           ),
           yes="The data is transmitted off-device.",
           no="The data is used only locally.",
@@ -212,16 +250,37 @@ def account_deletion_gate(data_type: str, description: str) -> Dict[str, Dict[st
   }
 
 
-def critic_battery() -> Dict[str, Dict[str, Any]]:
-  """One cheap Noul: does the cited evidence support the claim?
+def critic_battery(claim_kind: str = "generic") -> Dict[str, Dict[str, Any]]:
+  """One cheap Noul that verifies only the *atomic* claim a finding rests on.
 
-  With Jev answering atomic questions against the real snippet and severity
-  composed in code, a separate multi-question critic pass is redundant. The
-  aggregate step only routes non-SUGGESTION (IMPORTANT/CRITICAL) findings here,
-  so this single false-positive check runs only where it matters (citation-check
-  pattern). ``evaluate.py`` turns the probability into VERIFIED / MANUAL_REVIEW /
-  PRUNED in code.
+  The aggregate step routes non-SUGGESTION findings here (citation-check
+  pattern) and ``evaluate.py`` turns the probability into VERIFIED /
+  MANUAL_REVIEW / PRUNED in code.
+
+  ``claim_kind == "transfer"`` (data-safety findings): the critic is asked only
+  whether the evidence shows the data reaching an off-device or cross-app sink.
+  It is deliberately *not* asked about disclosure: no single snippet can prove a
+  disclosure is absent elsewhere in the app, so asking that question produced
+  systematic false prunes of true transfers.
+
+  Any other ``claim_kind``: the generic "does the evidence support the summary"
+  question, used for permission-hygiene findings.
   """
+  if claim_kind == "transfer":
+    return {
+        "evidence_shows_transfer": _noul(
+            instructions=(
+                "`finding.claim` states that a data type is sent off-device or "
+                "shared with another app. Does `finding.evidence_snippet` show "
+                "that data (or a value derived from it) reaching one of the sinks "
+                "in `finding.sinks`, or any other network, third-party SDK, or "
+                "cross-app call? Judge only what is visible in the snippet; do "
+                "not require the disclosure to be visible."
+            ),
+            yes="The snippet shows the data reaching an off-device or cross-app sink.",
+            no="The snippet shows only local use, or no flow to a sink is visible.",
+        ),
+    }
   return {
       "evidence_supports_claim": _noul(
           instructions=(
