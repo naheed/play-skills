@@ -138,6 +138,14 @@ class RunContext:
   # Once-per-app ``declared_core_purpose`` answer (WP4); see ``_ask_app_purpose``.
   app_purpose: Dict[str, Any] = dataclasses.field(default_factory=lambda: {
       "purpose": "unknown", "confidence": 0.0, "source": "unavailable"})
+  # One-hop callee resolution (WP6). ``first_party_index`` maps the app's own
+  # class names to files; ``callee_refs`` holds, per surviving candidate file,
+  # the first-party classes referenced inside its candidate scopes; and
+  # ``callee_files`` is the structure of every callee file so its imports can
+  # be classified and its sinks computed exactly like a caller's.
+  first_party_index: Optional[structure.FirstPartyIndex] = None
+  callee_refs: Dict[str, List[structure.CalleeRef]] = dataclasses.field(default_factory=dict)
+  callee_files: Dict[str, structure.FileStructure] = dataclasses.field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -361,20 +369,32 @@ def _drop(ctx: Optional[RunContext], data_type: str, finding_str: str, reason: s
 
 
 def _first_party_packages(
-    manifest: Dict[str, Any], files: Dict[str, structure.FileStructure]
+    manifest: Dict[str, Any],
+    files: Dict[str, structure.FileStructure],
+    profile: Optional[android_manifest.AppProfile] = None,
 ) -> Tuple[str, ...]:
   """Packages that are the app's own code (never classified as a sink).
 
-  Two deterministic sources, both language-level facts rather than guesses:
-  the manifest package (may be wrong when ``init`` picked up a library
-  manifest) and every ``package`` declared by an analysed source file. An
-  import is first-party when it *is* one of these packages, sits directly in
-  one (``package_of(import)`` matches), or lies beneath one (``pkg.``). Sibling
-  first-party libraries under an unrelated namespace are deliberately *not*
-  excluded: whether they transmit is exactly the question the semantic layer
-  should answer.
+  Deterministic sources, all language-level facts rather than guesses: the
+  app's package -- the merged manifest profile's value when available (WP6;
+  it reflects the primary module's ``applicationId``/``namespace`` rather than
+  whichever manifest ``init`` happened to read), else the legacy manifest
+  ``package_name`` -- plus every ``package`` declared by an analysed
+  *candidate* source file (callers and pruned files; not WP6 callee files).
+  An import is first-party when it *is* one of these packages, sits directly
+  in one (``package_of(import)`` matches), or lies beneath one (``pkg.``).
+  Sibling first-party libraries under an unrelated namespace are deliberately
+  *not* excluded (neither the class index nor callee files are used as a
+  package source): whether they transmit is exactly the question the semantic
+  layer should answer, and a vendored or flavour-stubbed SDK copied into the
+  tree must keep being classified as a sink.
   """
-  pkgs = {(manifest.get("package_name") or "").strip()}
+  app_pkg = ""
+  if profile is not None and profile.package_name:
+    app_pkg = profile.package_name.strip()
+  if not app_pkg:
+    app_pkg = (manifest.get("package_name") or "").strip()
+  pkgs = {app_pkg}
   pkgs.update(fs.package for fs in files.values() if fs.package)
   return tuple(sorted(p for p in pkgs if p))
 
@@ -393,6 +413,100 @@ def _analyze_files(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> N
   ctx.counters["files_unreadable"] = sum(1 for fs in ctx.files.values() if not fs.lines)
   log.info("structure: %d files indexed (%d unreadable)",
            len(relpaths), ctx.counters["files_unreadable"])
+  if constants.CALLEE_RESOLUTION_ENABLED and ctx.app_dir:
+    # WP6: the per-app class index is built once here; callee references are
+    # resolved after the lexical pre-gate so hops are only followed from files
+    # that still have a candidate (``_resolve_callees``).
+    excluded = ctx.counters.get("excluded_flavors") or []
+    ctx.first_party_index = structure.build_first_party_index(ctx.app_dir, excluded_flavors=excluded)
+    ctx.counters["first_party_index"] = {
+        "names": len(ctx.first_party_index),
+        "ambiguous": sum(1 for v in ctx.first_party_index.by_name.values() if len(v) > 1),
+        "packages": len(ctx.first_party_index.packages),
+        "excluded_flavors": list(excluded),
+    }
+
+
+def _candidate_scope_lines(fs: structure.FileStructure, patterns: Sequence[str]) -> set:
+  """Union of the enclosing scopes of every occurrence of ``patterns`` in ``fs``.
+
+  This is where an anchor *can* land after triage, computed before triage
+  (which needs the callees' capabilities to rank). Bounded per pattern by
+  ``MAX_OCCURRENCES_RANKED`` like anchor selection itself.
+  """
+  lines: set = set()
+  for pattern in patterns:
+    hits = structure.all_occurrences(fs.lines, pattern, cap=constants.MAX_OCCURRENCES_RANKED,
+                                     prefer_boundary=constants.LEXICAL_PREGATE_ENABLED)
+    for h in hits:
+      lo, hi = structure.enclosing_scope(fs.lines, h, fs.language)
+      lines.update(range(lo, hi))
+  return lines
+
+
+def _resolve_callees(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> None:
+  """Stage 3c (WP6): one-hop first-party callee references for surviving files.
+
+  For every file that still has a candidate after the pre-gate, the
+  first-party classes referenced *inside the enclosing scopes of its candidate
+  hits* are resolved through the class index and each resolved file is
+  structurally analysed once (``ctx.callee_files``). Their imports are then
+  classified alongside the callers' in :func:`_classify_semantics`, so by
+  triage time ``context.file_sinks`` can label the callee's sinks. Everything
+  recorded here is deterministic; the counters and the per-file reference list
+  go into ``typesafe_triage.json`` so a reviewer can see which hops were
+  followed and why (``resolution``).
+
+  Disabled (no-op, counters say so) when ``CALLEE_RESOLUTION_ENABLED`` is
+  False or no index could be built.
+  """
+  if not constants.CALLEE_RESOLUTION_ENABLED or ctx.first_party_index is None:
+    ctx.counters["callee_resolution"] = {"enabled": False}
+    return
+  index = ctx.first_party_index
+  patterns_by_file: Dict[str, List[str]] = {}
+  for cands in candidates.values():
+    for c in cands:
+      pats = patterns_by_file.setdefault(c.relpath, [])
+      if c.pattern and c.pattern not in pats:
+        pats.append(c.pattern)
+  stats = {"enabled": True, "hops": constants.MAX_CALLEE_HOPS, "callers_checked": 0,
+           "callers_with_callees": 0, "references": 0, "callee_files": 0,
+           "callee_files_unreadable": 0, "resolution": {}}
+  for relpath in sorted(patterns_by_file):
+    fs = ctx.files.get(relpath)
+    if fs is None or not fs.lines:
+      continue
+    stats["callers_checked"] += 1
+    within = _candidate_scope_lines(fs, patterns_by_file[relpath])
+    refs = structure.callee_references(fs, index, within=within)
+    if not refs:
+      continue
+    stats["callers_with_callees"] += 1
+    stats["references"] += len(refs)
+    ctx.callee_refs[relpath] = refs
+    for ref in refs:
+      stats["resolution"][ref.resolution] = stats["resolution"].get(ref.resolution, 0) + 1
+      if ref.relpath not in ctx.callee_files:
+        # A callee that is itself a candidate file is already indexed; reuse it
+        # so its structure is computed once.
+        ctx.callee_files[ref.relpath] = (ctx.files.get(ref.relpath)
+                                         or ctx.pruned_files.get(ref.relpath)
+                                         or structure.analyze_file(ctx.app_dir, ref.relpath))
+    log.info("callees for %s: %s", relpath,
+             [(r.symbol, r.relpath, [ln + 1 for ln in r.lines[:5]], r.resolution) for r in refs])
+  stats["callee_files"] = len(ctx.callee_files)
+  stats["callee_files_unreadable"] = sum(1 for fs in ctx.callee_files.values() if not fs.lines)
+  ctx.counters["callee_resolution"] = stats
+  ctx.counters["callee_refs"] = {
+      rp: [{"symbol": r.symbol, "file": r.relpath, "lines": [ln + 1 for ln in r.lines],
+            "resolution": r.resolution} for r in refs]
+      for rp, refs in sorted(ctx.callee_refs.items())
+  }
+  log.info("callee resolution: %d callers checked, %d with first-party callees, %d references, "
+           "%d callee files analysed (%d unreadable); resolution=%s",
+           stats["callers_checked"], stats["callers_with_callees"], stats["references"],
+           stats["callee_files"], stats["callee_files_unreadable"], stats["resolution"])
 
 
 def _lexical_pregate(
@@ -495,20 +609,33 @@ def _classify_semantics(
   capable or UNKNOWN are refined to class level, where the profile actually
   drives sink detection and proximity ranking.
   """
-  first_party = _first_party_packages(ctx.manifest, {**ctx.pruned_files, **ctx.files})
+  # Callee files deliberately do *not* contribute packages here: a resolved
+  # callee may live in a package that mirrors a third-party SDK (a flavour
+  # stub, a vendored copy), and treating that package as first-party would
+  # silence the real SDK import elsewhere (found on a dev app, WP6).
+  first_party = _first_party_packages(
+      ctx.manifest, {**ctx.pruned_files, **ctx.files}, ctx.profile)
   imports: List[str] = []
   skipped_first_party = 0
-  for fs in ctx.files.values():
+  callee_imports = 0
+  # Callee files (WP6) are classified like callers so their sinks can be
+  # labelled; ``imports_from_callees`` counts how many identifiers the hop
+  # added to the classification set (the cost of the WP, visible in triage).
+  for fs in list(ctx.files.values()) + [f for rp, f in ctx.callee_files.items() if rp not in ctx.files]:
+    is_callee = fs.relpath not in ctx.files
     for mod in fs.imports:
       if _is_first_party(mod, first_party):
         skipped_first_party += 1
         continue
       if mod not in imports:
         imports.append(mod)
+        if is_callee:
+          callee_imports += 1
   packages = sorted({structure.package_of(m) for m in imports})
   ctx.counters["first_party_packages"] = list(first_party)
   ctx.counters["imports_first_party_skipped"] = skipped_first_party
   ctx.counters["imports_third_party"] = len(imports)
+  ctx.counters["imports_from_callees"] = callee_imports
   ctx.counters["packages"] = len(packages)
 
   pkg_profiles = caps.classify(
@@ -551,8 +678,9 @@ def _classify_semantics(
   if cache is not None:
     ctx.counters["capability_cache"] = {"hits": cache.hits, "misses": cache.misses,
                                         "entries": len(cache), "path": cache.path}
-  log.info("semantics: %d packages, %d imports refined, %d dependencies; declared caps=%s",
-           len(packages), len(refine), len(deps), declared)
+  log.info("semantics: %d packages, %d imports refined (%d imports came from callee files), "
+           "%d dependencies; declared caps=%s",
+           len(packages), len(refine), callee_imports, len(deps), declared)
 
 
 def _unknown(identifier: str) -> caps.CapabilityProfile:
@@ -577,26 +705,55 @@ def _triage(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> Dict[str
   scope has *no* capability-labelled sink (tier 3): a hit whose function calls
   an egress/IPC/unknown-labelled symbol is exactly what the model is for and is
   kept regardless of how many siblings of the same data type precede it. The
-  number of such exemptions is counted (``cap_exempt_sink_in_scope``) so the
+  number of candidates kept outside the budget is counted
+  (``cap_exempt_sink_in_scope``; ``kept_budgeted`` is the complement) so the
   cost effect is visible in triage.
+
+  Since WP6 a first-party callee referenced inside the scope that itself
+  reaches a sink counts the same way (``Anchor.reach_in_scope``): the call
+  site is in the function, the sink is one hop away. Exemptions granted only
+  because of a callee are counted separately (``cap_exempt_callee_only``).
+
+  Exempt candidates do not consume the per-type budget: ``MAX_FINDINGS_PER_TYPE``
+  bounds the number of *no-reach* (tier 3) candidates asked, and a candidate
+  with a reachable sink is asked in addition. Before WP6 exempt candidates were
+  counted against the budget, so any change that made more anchors exempt
+  (the hop did) silently displaced tier-3 candidates that had been asked
+  before -- three labelled transfers on a dev app. The cap is a cost bound on
+  the uninformative tail, never a reason to drop evidence, so the accounting
+  now matches the docstring above.
   """
   sinks_by_file: Dict[str, List[context.Sink]] = {}
+  callees_by_file: Dict[str, List[context.Callee]] = {}
   for rp, fs in ctx.files.items():
     sinks_by_file[rp] = context.file_sinks(fs, ctx.profiles)
+    callees_by_file[rp] = _file_callees(ctx, rp)
 
   kept: Dict[str, List[Candidate]] = {}
   exempt_total = 0
+  exempt_callee_only = 0
+  anchors_with_callees = 0
+  tier_raised_by_callee = 0
   for data_type, cands in candidates.items():
     for c in cands:
       fs = ctx.files[c.relpath]
-      c.anchor = context.anchor_signal(fs, c.pattern, data_type, sinks_by_file[c.relpath])
+      c.anchor = context.anchor_signal(fs, c.pattern, data_type, sinks_by_file[c.relpath],
+                                       callees_by_file.get(c.relpath, ()))
+      if c.anchor.callees:
+        anchors_with_callees += 1
+        same_file_tier = context.Anchor(
+            data_type, c.pattern, [], None, c.anchor.scope, None, c.anchor.sink_in_scope,
+            c.anchor.scope_capabilities).tier
+        if c.anchor.tier < same_file_tier:
+          tier_raised_by_callee += 1
     ranked = sorted(cands, key=lambda c: context.rank_key(c.anchor, c.order))
     per_file: Dict[str, int] = {}
     out: List[Candidate] = []
+    budgeted = 0   # kept candidates that count against MAX_FINDINGS_PER_TYPE
     for rank, c in enumerate(ranked):
       why = None
-      over_cap = len(out) >= constants.MAX_FINDINGS_PER_TYPE
-      exempt = constants.CAP_EXEMPTS_SINK_IN_SCOPE and c.anchor.sink_in_scope
+      exempt = constants.CAP_EXEMPTS_SINK_IN_SCOPE and c.anchor.reach_in_scope
+      over_cap = budgeted >= constants.MAX_FINDINGS_PER_TYPE
       if over_cap and not exempt:
         why = f"over MAX_FINDINGS_PER_TYPE={constants.MAX_FINDINGS_PER_TYPE}"
       elif per_file.get(c.relpath, 0) >= constants.MAX_PER_FILE_PER_TYPE:
@@ -604,12 +761,19 @@ def _triage(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> Dict[str
       if why:
         _drop(ctx, data_type, c.finding_str, why, rank=rank, tier=c.anchor.tier,
               sink_in_scope=c.anchor.sink_in_scope, proximity=c.anchor.proximity,
-              scope_capabilities=c.anchor.scope_capabilities)
+              scope_capabilities=c.anchor.scope_capabilities,
+              callee_capabilities=c.anchor.callee_capabilities)
         continue
-      if over_cap and exempt:
+      if exempt:
         exempt_total += 1
-        log.info("triage: %s %s kept over MAX_FINDINGS_PER_TYPE (rank %d, tier %d, sink in scope %s)",
-                 data_type, c.finding_str, rank, c.anchor.tier, c.anchor.scope_capabilities)
+        if not c.anchor.sink_in_scope:
+          exempt_callee_only += 1
+        if over_cap:
+          log.info("triage: %s %s kept over MAX_FINDINGS_PER_TYPE (rank %d, tier %d, sink in scope %s, "
+                   "callee capabilities %s)", data_type, c.finding_str, rank, c.anchor.tier,
+                   c.anchor.scope_capabilities, c.anchor.callee_capabilities)
+      else:
+        budgeted += 1
       out.append(c)
       per_file[c.relpath] = per_file.get(c.relpath, 0) + 1
     if out:
@@ -617,11 +781,29 @@ def _triage(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> Dict[str
   ctx.counters["kept_per_type"] = {dt: len(v) for dt, v in sorted(kept.items())}
   ctx.counters["kept"] = sum(len(v) for v in kept.values())
   ctx.counters["cap_exempt_sink_in_scope"] = exempt_total
+  ctx.counters["cap_exempt_callee_only"] = exempt_callee_only
+  ctx.counters["kept_budgeted"] = ctx.counters["kept"] - exempt_total
+  ctx.counters["anchors_with_callees"] = anchors_with_callees
+  ctx.counters["anchors_tier_raised_by_callee"] = tier_raised_by_callee
   ctx.counters["files_with_sinks"] = sum(1 for s in sinks_by_file.values() if s)
-  log.info("triage: kept %d of %d candidates (%d files have labelled sinks)",
-           ctx.counters["kept"], ctx.counters.get("candidates", 0),
-           ctx.counters["files_with_sinks"])
+  log.info("triage: kept %d of %d candidates (%d within the per-type budget, %d outside it with a "
+           "reachable sink, %d of those only through a callee; %d files have labelled sinks; %d anchors "
+           "reach a callee, %d ranked higher because of it)",
+           ctx.counters["kept"], ctx.counters.get("candidates", 0), ctx.counters["kept_budgeted"],
+           exempt_total, exempt_callee_only, ctx.counters["files_with_sinks"], anchors_with_callees,
+           tier_raised_by_callee)
   return kept
+
+
+def _file_callees(ctx: RunContext, relpath: str) -> List[context.Callee]:
+  """The resolved one-hop callees of ``relpath`` with their sinks (WP6), or ``[]``."""
+  refs = ctx.callee_refs.get(relpath)
+  if not refs:
+    return []
+  fs = ctx.files.get(relpath)
+  if fs is None:
+    return []
+  return context.file_callees(fs, refs, ctx.callee_files, ctx.profiles)
 
 
 # ---------------------------------------------------------------------------
@@ -784,7 +966,8 @@ def _run_manifest(ctx: RunContext, findings_by_goal) -> None:
 def _file_state(ctx: RunContext, relpath: str, file_tasks: Sequence[Task]):
   fs = ctx.files.get(relpath) or structure.analyze_file(ctx.app_dir, relpath)
   asks = [(t.data_type, t.pattern) for t in file_tasks]
-  return context.build_file_state(fs, asks, ctx.profiles, ctx.app_facts, ctx.app_dir)
+  return context.build_file_state(fs, asks, ctx.profiles, ctx.app_facts, ctx.app_dir,
+                                  callees=_file_callees(ctx, relpath))
 
 
 def _run_batched(ctx: RunContext, tasks: Sequence[Task], client: JevClient,
@@ -1015,6 +1198,7 @@ def run(
   candidates = _filter_candidates(data_sources, ctx)
   _analyze_files(ctx, candidates)
   candidates = _lexical_pregate(ctx, candidates)
+  _resolve_callees(ctx, candidates)
   _classify_semantics(ctx, client, capability_cache, model)
   kept = _triage(ctx, candidates)
   tasks = _plan_from_candidates(kept)

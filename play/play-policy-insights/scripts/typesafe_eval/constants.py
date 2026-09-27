@@ -125,6 +125,41 @@ LEXICAL_TYPE_ONLY_DROP = False
 MAX_OCCURRENCES_RANKED = 60
 MAX_HIT_LINES_IN_STATE = 5
 
+# ---------------------------------------------------------------------------
+# One-hop first-party callee resolution (WP6, lesson L3). A data-type hit whose
+# function hands the value to the app's *own* helper (``Uploader.send(loc)``)
+# used to be judged from that function alone: the helper's network client was
+# invisible, so the model abstained (UNCERTAIN) or the anchor ranked tier 3 and
+# was capped away. The structure layer now indexes the app's own classes
+# (simple name -> file) and, for every anchor whose enclosing scope references
+# one, appends that file's capability-labelled sinks to the state as
+# ``state["callees"]`` (``hop = 1``). Callee sinks count towards the anchor's
+# rank tier, the cap exemption and the relevance soft gate exactly like a sink
+# in the caller's own scope, because the call site *is* in scope. Rollback:
+# set CALLEE_RESOLUTION_ENABLED = False (states, ranking and evidence revert to
+# the same-file behaviour; the index is not built).
+# ---------------------------------------------------------------------------
+CALLEE_RESOLUTION_ENABLED = True
+# Hops followed from the anchor's scope. Only 1 is implemented: the one-hop
+# case covers the "thin wrapper around a network client" pattern the labelled
+# set showed, and deeper chains need a real call graph, not a name index.
+MAX_CALLEE_HOPS = 1
+# Callees attached to one anchor, strongest reachable capability first, then
+# nearest call site. Bounds the state size and the classification volume.
+MAX_CALLEES_PER_ANCHOR = 3
+# Callee files structurally indexed per *caller* file (their imports are then
+# classified like the caller's own). Bounds the semantic-layer cost of a file
+# that references many helpers inside its candidate scopes.
+MAX_CALLEE_FILES_PER_CALLER = 8
+# Rendered callee source lines appended to a caller's snippet, across all its
+# callees. When the callee's sink scopes would exceed this, only the sink
+# reference lines are rendered (the "sink lines only" fallback in the plan).
+MAX_CALLEE_SNIPPET_LINES = 40
+# Size of the file head read when indexing first-party classes (the ``package``
+# declaration is always near the top; reading whole files for the index would
+# make indexing a large app noticeably slower for no benefit).
+CALLEE_INDEX_HEAD_BYTES = 4096
+
 # Documented System One evaluation endpoint.
 DEFAULT_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
 

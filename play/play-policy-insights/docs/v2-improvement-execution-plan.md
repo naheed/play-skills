@@ -463,6 +463,56 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
   below 0.50 from 0.625; precision-at-high ≥ 0.90. Re-run `calibrate`,
   update `THRESHOLD_PROVENANCE` only if the derived band moves.
 - **Size.** Medium in `structure.py` and `context.py`.
+- **Outcome (done).** Implemented as specified with three refinements that
+  the first live run (WP6a, file-level hops) made necessary:
+  1. **Member-level hops.** A file-level hop attributes every sink in the
+     callee file to every call into it; on App A that raised 134 anchors'
+     tiers, grew the cap exemptions from 2 to 51 and the findings from 77 to
+     122 (LOCAL 33 → 73) for 7 new TRANSMITS. `context.Callee.view()` now
+     narrows the hop to the members actually called (`Symbol.member(` on
+     the reference line → member body located by
+     `structure.member_declaration_lines` / `declaration_scope`) and falls
+     back to the whole file only when a member cannot be located. App A
+     WP6b split: 112 member-level / 101 file-level views across findings;
+     App B 30 / 63.
+  2. **Flavour-aware index.** `build_first_party_index(excluded_flavors=…)`
+     skips `/src/<flavor>/` sources of non-prioritised flavours, and the
+     first-party package set is no longer widened by callee files. Without
+     this the unshipped flavour's stub of a billing SDK package resolved as
+     a first-party callee, the real SDK import stopped being a sink, and a
+     labelled transfer (App A `InAppBillingHandler.kt` / PURCHASE_HISTORY)
+     fell from tier 0 to tier 3 and over the cap.
+  3. **Budget accounting.** Cap-exempt candidates (`reach_in_scope`) no
+     longer consume the per-type `MAX_FINDINGS_PER_TYPE` budget; three App B
+     labelled transfers (`SAFAdapter.java`, `SMBAdapter.java`, `FTP.java`)
+     had been displaced by exempt items. New counters `kept_budgeted`,
+     `cap_exempt_sink_in_scope` (all exempt kept), `cap_exempt_callee_only`.
+  Live results (WP6b vs the WP5 snapshot): App A kept 134 → 211
+  (115 budgeted + 96 exempt, 43 exempt only through a callee), 174 anchors
+  reached a callee, 53 tiers raised, requests 100 → 135, findings 79 → 131
+  (TRANSMITS 15 → 18, UNCERTAIN 21 → 23, LOCAL 33 → 77); App B kept 90 →
+  104 (29 + 75), 62 anchors with callees, 28 raised, requests 39 → 43,
+  findings 63 → 77 (TRANSMITS 8 → 10). New transmission findings surfaced
+  only through the hop include App A `CrashReporter.kt` → error-reporting
+  helper → third-party telemetry (PERFORMANCE_DIAGNOSTICS undeclared) and
+  `GlobalExceptionHandler.kt` / CRASH_LOGS moving from UNCERTAIN to
+  TRANSMITS; App B `SAFEngines.java` / FILES_AND_DOCS UNCERTAIN → TRANSMITS.
+  `calibrate --rejoin`: exit 0, 48/48 matched, 0 labelled transfers decided
+  LOCAL at the derived band; derived band 0.28/0.61 → 0.23/0.67;
+  precision-at-high 0.905 (≥ 0.90 ✓); ECE 0.246 → 0.197, Brier 0.188 →
+  0.179; at the current constants UNCERTAIN true transfers 7 → 6 and
+  recall-at-high 0.652 → 0.696. **Abstention 0.521 at the derived band
+  (0.50 at the current constants) did not fall below the 0.50 target** —
+  the remaining UNCERTAIN cases are network-egress files whose transfer is
+  by the same file's own sink, which the hop cannot sharpen; WP7's
+  `destination_class` targets exactly those, so the abstention criterion is
+  carried to the M2 gate. Two labelled DEVICE_ID transfers on App A
+  (`BillingBackendClient.kt`, `SubscriptionCheckWorker.kt`) moved from
+  TRANSMITS to UNCERTAIN (p 0.80 → 0.61, 0.78 → 0.67) after no-sink helpers
+  (logging, secure storage) were listed as hops; both remain above the
+  derived `T_TRANSMIT_HIGH`, and no labelled transfer was decided LOCAL.
+  Selftest 343 checks. `THRESHOLD_PROVENANCE` refresh and the band change
+  are deferred to M2 with the version bump, as planned.
 
 ### WP7 — `destination_class` and label schema v2 (L2)
 
@@ -735,7 +785,7 @@ touching the rest of the cascade.
 - [x] WP4 `declared_core_purpose` (per-app cache)
 - [x] WP5 wave 1 policies (FGS fixes, package visibility, all files, exact alarm, target API)
 - [x] **M1 gate** (passed; App A model-call count exception recorded)
-- [ ] WP6 one-hop callee resolution
+- [x] WP6 one-hop callee resolution
 - [ ] WP7 `destination_class` + label schema v2 + relabel
 - [ ] **M2 gate**
 - [ ] WP8 consent defaults, string resources, flavor attribution

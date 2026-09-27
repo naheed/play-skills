@@ -166,9 +166,21 @@ def _decision_trace(
           "scope_capabilities": anchor.get("scope_capabilities"),
           "rank_tier": anchor.get("tier"),
           "lexical": anchor.get("lexical"),
+          "callee_in_scope": anchor.get("callee_in_scope"),
+          "callee_capabilities": anchor.get("callee_capabilities"),
       },
       "sinks": [
           {"symbol": s.get("symbol"), "capabilities": s.get("capabilities")} for s in sinks
+      ],
+      # WP6: the one-hop first-party callees the anchor reaches, with the
+      # sinks each contributes. Empty when no hop was followed.
+      "callees": [
+          {"symbol": c.get("symbol"), "file": c.get("file"), "hop": c.get("hop"),
+           "called_at": c.get("called_at"), "members": c.get("members"),
+           "granularity": c.get("granularity"), "capabilities": c.get("capabilities"),
+           "sinks": [{"symbol": s.get("symbol"), "capabilities": s.get("capabilities")}
+                     for s in c.get("sinks") or []]}
+          for c in state.get("callees") or []
       ],
   }
   if decision is not None:
@@ -244,10 +256,41 @@ def file_has_strong_egress(state: Dict[str, Any]) -> bool:
 
   ``state["sinks"]`` lists every transfer-capable identifier the file
   references (lines bounded, symbols not), so this is a file-level fact
-  independent of the anchor's scope.
+  independent of the anchor's scope. Since WP6 the sinks of the anchor's
+  one-hop first-party callees (``state["callees"][*]["sinks"]``) count too:
+  a helper reached from the anchor's function that owns the network client is
+  at least as strong a reason to keep an uncertain relevance answer for review
+  as a network symbol elsewhere in the same file.
   """
   strong = set(constants.RANK_STRONG_EGRESS_CAPABILITIES)
-  return any(set(s.get("capabilities") or []) & strong for s in state.get("sinks") or [])
+  if any(set(s.get("capabilities") or []) & strong for s in state.get("sinks") or []):
+    return True
+  return any(set(s.get("capabilities") or []) & strong
+             for c in state.get("callees") or [] for s in c.get("sinks") or [])
+
+
+def sharing_sinks_in_scope(state: Dict[str, Any]) -> List[str]:
+  """Sharing-capable sink symbols reachable from the anchor's own scope.
+
+  Same-file sinks count when one of their reference lines lies inside the
+  anchor scope. Since WP6 the sinks of a first-party callee called from the
+  scope count as well (the call site is in scope by construction; the
+  symbol is reported as ``Callee.Sink`` so the trace shows the hop). Used to
+  OR the model's ``is_third_party`` answer with the static fact that the data
+  reaches a sharing channel (IPC counts as sharing by policy direction).
+  """
+  sharing = set(constants.SHARING_CAPABILITY_NAMES)
+  scope = (state.get("anchor") or {}).get("scope") or [0, 0]
+  out = {
+      s["symbol"] for s in state.get("sinks") or []
+      if set(s.get("capabilities") or []) & sharing
+      and any(scope[0] <= ln <= scope[1] for ln in s.get("lines") or [])
+  }
+  for callee in state.get("callees") or []:
+    for s in callee.get("sinks") or []:
+      if set(s.get("capabilities") or []) & sharing:
+        out.add(f"{callee.get('symbol')}.{s.get('symbol')}")
+  return sorted(out)
 
 
 def relevance_is_low(verdict: str) -> bool:
@@ -366,12 +409,16 @@ def nearest_sink(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
   """The capability-labelled sink reference closest to the anchor, or None.
 
   Preference order: a sink line inside the anchor's own scope (the transfer
-  happens in the same function), then the smallest line distance to the
-  anchor line. Only sinks with a *transfer* capability count — a
-  ``LOCAL_PERSISTENCE`` or ``USER_DISCLOSURE_UI`` symbol is not a sink for
-  evidence purposes even though it is listed in ``state["sinks"]`` for the
-  model. Returns ``{"symbol", "line", "capabilities", "in_scope", "distance"}``
-  with a 1-based line.
+  happens in the same function), then (WP6) a sink inside a first-party
+  callee called from that scope, then the smallest line distance to the
+  anchor line elsewhere in the file. Only sinks with a *transfer* capability
+  count — a ``LOCAL_PERSISTENCE`` or ``USER_DISCLOSURE_UI`` symbol is not a
+  sink for evidence purposes even though it is listed in ``state["sinks"]``
+  for the model. Returns ``{"symbol", "line", "capabilities", "in_scope",
+  "distance"}`` with a 1-based line; for a callee sink the dict also carries
+  ``"file"`` (the callee), ``"via"`` (the class name as called) and
+  ``"called_at"`` (the 1-based caller line of the call site nearest the
+  anchor), and ``distance`` is measured from the anchor to that call site.
   """
   signal = state.get("signal") or {}
   anchor_line = signal.get("line")
@@ -386,11 +433,30 @@ def nearest_sink(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     for ln in s.get("lines") or []:
       in_scope = bool(scope) and scope[0] <= ln <= scope[1]
       distance = abs(ln - anchor_line) if anchor_line is not None else 1 << 30
-      key = (0 if in_scope else 1, distance, s.get("symbol") or "")
+      key = (0 if in_scope else 2, distance, s.get("symbol") or "")
       if best_key is None or key < best_key:
         best_key = key
         best = {"symbol": s.get("symbol"), "line": ln, "capabilities": caps_,
                 "in_scope": in_scope, "distance": distance}
+  for callee in state.get("callees") or []:
+    called_at = callee.get("called_at") or []
+    if not called_at:
+      continue
+    call_line = min(called_at, key=lambda ln: abs(ln - anchor_line) if anchor_line is not None else ln)
+    distance = abs(call_line - anchor_line) if anchor_line is not None else 1 << 30
+    for s in callee.get("sinks") or []:
+      caps_ = [c for c in (s.get("capabilities") or []) if c in transfer_caps]
+      if not caps_:
+        continue
+      # A file-level callee sink (wildcard import, no located line) still
+      # names the reachable channel; line 0 marks "not located".
+      ln = (s.get("lines") or [0])[0]
+      key = (1, distance, s.get("symbol") or "")
+      if best_key is None or key < best_key:
+        best_key = key
+        best = {"symbol": s.get("symbol"), "line": ln, "capabilities": caps_,
+                "in_scope": True, "distance": distance, "file": callee.get("file"),
+                "via": callee.get("symbol"), "called_at": call_line}
   return best
 
 
@@ -415,6 +481,17 @@ def evidence_flow(state: Dict[str, Any]) -> Dict[str, Any]:
   }
 
 
+def files_involved(state: Dict[str, Any]) -> List[str]:
+  """The anchor file plus, when the evidence sink lives in a first-party
+  callee (WP6), that callee's file, so the report points the reviewer at both
+  halves of the flow. Order: anchor file first."""
+  files = [state["signal"]["file"]]
+  sink = nearest_sink(state)
+  if sink and sink.get("file") and sink["file"] not in files:
+    files.append(sink["file"])
+  return files
+
+
 def _evidence_line(state: Dict[str, Any]) -> str:
   """One-line, human-readable evidence (WP3 structured form).
 
@@ -425,8 +502,13 @@ def _evidence_line(state: Dict[str, Any]) -> str:
   ``L<start>-L<end>`` is the anchor's enclosing scope, so a reviewer sees the
   function that performs the operation, not a single line; the sink is the
   nearest capability-labelled transfer reference (:func:`nearest_sink`),
-  suffixed ``(out of scope)`` when it lies outside that function. Without a
-  transfer sink the previous form is kept unchanged::
+  suffixed ``(out of scope)`` when it lies outside that function. When the
+  sink lives in a first-party callee (WP6) the destination names the callee
+  file and the call site::
+
+    ... -> sink@<callee file>:L<n> <Symbol> [<CAPS>] (via <Class> called at L<k>)
+
+  Without a transfer sink the previous form is kept unchanged::
 
     <file>:L<line> — <matched>
 
@@ -448,9 +530,14 @@ def _evidence_line(state: Dict[str, Any]) -> str:
   caps_ = ", ".join(sink["capabilities"])
   span = f"L{scope[0]}-L{scope[1]}" if scope[0] != scope[1] else f"L{scope[0]}"
   src = f"source@{file}:{span} (L{line}: {matched})" if matched else f"source@{file}:{span} (L{line})"
-  dst = f"sink@L{sink['line']} {sink['symbol']} [{caps_}]"
-  if not sink["in_scope"]:
-    dst += " (out of scope)"
+  if sink.get("file"):
+    where = f"{sink['file']}:L{sink['line']}" if sink["line"] else str(sink["file"])
+    dst = (f"sink@{where} {sink['symbol']} [{caps_}] "
+           f"(via {sink.get('via')} called at L{sink.get('called_at')})")
+  else:
+    dst = f"sink@L{sink['line']} {sink['symbol']} [{caps_}]"
+    if not sink["in_scope"]:
+      dst += " (out of scope)"
   return f"{src} -> {dst}"
 
 
@@ -512,13 +599,7 @@ def _compose_data_safety_finding(
   transmits = decision in (TRANSMITS, UNCERTAIN)
   user_initiated = (answers["user_initiated"].noul or 0.0) >= constants.T_USER_INITIATED
 
-  sinks = state.get("sinks") or []
-  scope = (state.get("anchor") or {}).get("scope") or [0, 0]
-  sharing_in_scope = sorted({
-      s["symbol"] for s in sinks
-      if set(s.get("capabilities") or []) & set(constants.SHARING_CAPABILITY_NAMES)
-      and any(scope[0] <= ln <= scope[1] for ln in s.get("lines") or [])
-  })
+  sharing_in_scope = sharing_sinks_in_scope(state)
   is_third_party = (
       (answers["is_third_party"].noul or 0.0) >= constants.T_THIRD_PARTY
   ) or (transmits and bool(sharing_in_scope))
@@ -564,7 +645,12 @@ def _compose_data_safety_finding(
     if severity == "CRITICAL":
       severity = "IMPORTANT"
 
-  sink_names = ", ".join(s["symbol"] for s in sinks[:5]) or "no labelled sink in file"
+  sinks = state.get("sinks") or []
+  # The critic's claim names the callee-reached sinks too (``Callee.Sink``),
+  # so it can check the hop rather than rediscover it (WP6).
+  callee_sink_names = [f"{c.get('symbol')}.{s.get('symbol')}"
+                       for c in state.get("callees") or [] for s in c.get("sinks") or []]
+  sink_names = ", ".join([s["symbol"] for s in sinks[:5]] + callee_sink_names[:3]) or "no labelled sink in file"
   claim = (
       f"{name} ({data_type}) is sent off-device or shared with another app "
       f"in {state['signal']['file']} (sinks: {sink_names})."
@@ -578,7 +664,7 @@ def _compose_data_safety_finding(
       "policy_id": policy_id,
       "issue_summary": summary,
       "severity": severity,
-      "files_involved": [state["signal"]["file"]],
+      "files_involved": files_involved(state),
       "evidence": _evidence_line(state),
       "evidence_flow": evidence_flow(state),
       "evidence_snippet": state.get("code_snippet", ""),
@@ -658,7 +744,7 @@ def _compose_permission_finding(
       "policy_id": policy_id,
       "issue_summary": summary,
       "severity": severity,
-      "files_involved": [state["signal"]["file"]],
+      "files_involved": files_involved(state),
       "evidence": _evidence_line(state),
       "evidence_flow": evidence_flow(state),
       "evidence_snippet": state.get("code_snippet", ""),

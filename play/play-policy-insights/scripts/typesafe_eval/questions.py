@@ -135,7 +135,10 @@ def data_safety_battery(
               "SDK, or shared with another app via an intent, content provider, "
               "or the clipboard? `sinks` lists the imported symbols in this file "
               "and the capabilities they are known to provide; a sink labelled "
-              "UNKNOWN may or may not transmit. Consider "
+              "UNKNOWN may or may not transmit. `callees`, when present, lists "
+              "the app's own helper files called from `code_snippet` together "
+              "with the sinks those helpers reach (one call away) — data handed "
+              "to such a helper reaches its sinks. Consider "
               "`co_located_signals.network_transmission`."
           ),
           yes="The data is transmitted off-device or shared with another party.",
@@ -201,7 +204,9 @@ def permission_battery(
       "transmits_offdevice": _noul(
           instructions=(
               f"Does `code_snippet` send {subject} off-device or to another app? "
-              "`sinks` lists imported symbols and their known capabilities. "
+              "`sinks` lists imported symbols and their known capabilities; "
+              "`callees`, when present, lists the app's own helper files called "
+              "from `code_snippet` and the sinks they reach one call away. "
               "Consider `co_located_signals.network_transmission`."
           ),
           yes="The data is transmitted off-device.",

@@ -261,6 +261,90 @@ the sink is used inside the hit's own scope) and tier is:
 
 The `Anchor` records `scope_capabilities` so the trace shows *why* a tier was assigned.
 
+**One-hop first-party callee resolution** (`structure.FirstPartyIndex`,
+`structure.callee_references`, `context.Callee`, `engine._resolve_callees`, WP6). The
+labelled set contained transfers where the anchor's function hands the value to the app's
+*own* helper (`Uploader.send(loc)`) and the network client lives in that helper's file. Seen
+from the anchor alone the function reaches no sink: the anchor ranked tier 3, was eligible
+for the per-type cap, and when it did reach the model the answer was UNCERTAIN because the
+snippet showed no transfer. The structure layer now closes that gap deterministically:
+
+- `build_first_party_index(app_dir, excluded_flavors)` walks the shipped `.kt` / `.java` /
+  `.cs` source once per run (build outputs, vendored trees, test source sets **and the
+  non-prioritised product flavours** excluded) into `simple class name → file(s)`, reading
+  each file's `package` from its head. The index is a *name* index: it never says what a
+  class does. Excluding flavours matters: on App A the unshipped `fdroid` flavour carries stub
+  copies of a billing SDK's classes; indexing them made the SDK's package look first-party
+  and silenced the real SDK import in the shipped flavour (a labelled transfer was lost in
+  the first WP6 run). For the same reason callee files never widen the first-party *package*
+  set — only candidate files and the profile's own package do.
+- After the lexical pre-gate, `engine._resolve_callees` looks, for every surviving candidate
+  file, at the capitalised identifiers referenced *inside the enclosing scopes of its
+  candidate hits* (`_candidate_scope_lines`), and resolves each through the index
+  (`FirstPartyIndex.resolve`): the caller's `import <pkg>.<Name>` wins when a first-party file
+  declares `<pkg>` (`resolution: import`); a name the caller imports from a package no
+  first-party file declares is a platform/third-party class that shares a name with an app
+  class (`Log`) and is **not** resolved; then the caller's own package (`same_package`); then
+  a unique match (`unique`); then the file sharing the longest directory prefix with the
+  caller (`nearest`, the two-flavour case). On each reference line the *members* called on
+  the symbol are recorded too (`Uploader.send(x)`, `Uploader(ctx).send(x)`,
+  `Uploader::send`, `Uploader.INSTANCE.send(x)` → `send`). At most
+  `MAX_CALLEE_FILES_PER_CALLER = 8` callee files per caller; each callee file is
+  structurally analysed once and its imports join the classification set, so
+  `context.file_sinks` labels its sinks exactly like a caller's (`imports_from_callees` in
+  the triage counters is the semantic-layer cost of the hop).
+- **Member level, file-level fallback.** `context.file_callees` locates every called member
+  in the callee (`structure.member_declaration_lines`: Kotlin `fun`/`val`, Python `def`,
+  Java/C# `Type name(` headers; `structure.declaration_scope` for the body). For one anchor,
+  `Callee.view(scope)` is *member-level* when every reference inside the scope names a
+  member and every member was located: the hop's sinks are the callee's sinks whose
+  reference lines fall inside those members' bodies. A bare constructor, a type position or
+  an unlocated (inherited, generated, extension) member falls back to the callee's
+  file-level sinks — the recall-safe direction — and says so (`granularity: "file"`). The
+  first WP6 run used file level only: large first-party utility classes then made nearly
+  every caller tier 0 (App A: 186 anchors reached a callee, model calls 100 → 143, +49 LOCAL
+  suggestions for 7 new TRANSMITS). Member level keeps the 7 and drops the dilution.
+- `context.anchor_signal` attaches to each occurrence's scope the callee views referenced in
+  it (`MAX_CALLEES_PER_ANCHOR = 3`, strongest reachable capability first, nearest call site
+  second). The anchor's tier is computed over `scope_capabilities ∪ callee_capabilities`;
+  both lists are kept apart in the trace (`anchor.callee_in_scope`,
+  `anchor.callee_capabilities`, `anchors_tier_raised_by_callee` in the counters) so a
+  reviewer sees whether the tier came from the file or from the hop. `Anchor.reach_in_scope`
+  (direct *or* callee) is what the per-type cap exemption reads (`cap_exempt_callee_only`
+  counts exemptions granted only because of a hop).
+- **Budget accounting.** Exempt candidates no longer consume `MAX_FINDINGS_PER_TYPE`: the
+  cap bounds the *no-reach* (tier 3) tail and reach-in-scope candidates are asked in
+  addition (`kept_budgeted` vs `cap_exempt_sink_in_scope`). Before WP6 exempt candidates
+  counted against the budget, so any change that made more anchors exempt displaced tier-3
+  candidates that had been asked before — three labelled transfers on App B in the first
+  WP6 run. The cap is a cost bound, never a reason to drop evidence, and the accounting now
+  matches that.
+- `context.build_file_state` appends `state["callees"]` — one entry per hop with `file`,
+  `symbol`, `hop: 1`, `called_at` (caller lines), `members`, `granularity`, `capabilities`,
+  the hop's `sinks` and a `code_snippet` of the called members' bodies (file level: the
+  callee's sink-reference scopes) — and renders the same under a
+  `// First-party callees reached from the snippet (one hop):` section of `code_snippet`.
+  When the callee regions together exceed `MAX_CALLEE_SNIPPET_LINES = 40` only the sink
+  reference lines are rendered; a hop that reaches no transfer sink is listed with a one-line
+  note (so the model sees "handed to `Store.save`, which reaches no known transfer sink").
+  Callee sinks are also listed as `Callee.Sink` in `co_located_signals.network_transmission`.
+  A file whose anchors reach no callee produces a state byte-identical to the pre-WP6 form.
+  The `transmits_offdevice` questions of both batteries explain `callees` in one clause.
+- `evaluate` treats a callee sink as reachable from the scope: `nearest_sink` prefers an
+  in-scope same-file sink, then a callee sink, then an out-of-scope same-file sink, and the
+  evidence line becomes
+  `source@Caller.kt:L12-L15 (L13: …) -> sink@net/Uploader.kt:L7 OkHttpClient [NETWORK_EGRESS] (via Uploader called at L14)`;
+  `files_involved` lists the callee file after the anchor file; `sharing_sinks_in_scope`
+  includes callee IPC sinks (`Sharer.Intent`); `file_has_strong_egress` (the WP4 soft-gate
+  condition) counts callee sinks; the decision trace carries `callees` and the critic claim
+  names `Callee.Sink`.
+- Rollback: `CALLEE_RESOLUTION_ENABLED = False` skips the index and every hop (the
+  `callee_resolution` counter says `enabled: false`). `MAX_CALLEE_HOPS = 1` is recorded but
+  deeper chains are not implemented — they need a call graph, not a name index. Known limits:
+  Kotlin top-level functions and Dart/JS helpers (multi-class, snake-case files) are not
+  resolved; a member access on a lower-case receiver (`repo.upload(x)`) is not followed
+  because the receiver's type is not in the scope.
+
 **Triage.** `engine._filter_candidates` drops non-prioritised build flavours, excluded paths
 (`res/values*` string catalogs and `src/test*` source sets, which are not shipped), and
 anything past `MAX_CANDIDATES_PER_TYPE`. `engine._triage` ranks the remaining candidates of a
@@ -412,7 +496,12 @@ Written next to the worker files on every run. Keys: `evaluator_version`, `model
 `counters` (raw signals, candidates, kept, files analysed, imports first-party skipped,
 third-party, packages, refined, dependencies, capability-cache hits/misses,
 `lexical_pregate{checked, kept_*, dropped_*, files_pruned}`, `cap_exempt_sink_in_scope`,
-`app_purpose_requests` / `app_purpose_error`),
+`app_purpose_requests` / `app_purpose_error`, and the WP6 hop counters
+`first_party_index{names, ambiguous, packages}`,
+`callee_resolution{enabled, callers_checked, callers_with_callees, references, callee_files, resolution{import, same_package, unique, nearest}}`,
+`callee_refs` (per caller file: the resolved callees with `symbol`, `file`, `lines`,
+`resolution`), `imports_from_callees`, `anchors_with_callees`,
+`anchors_tier_raised_by_callee`, `cap_exempt_callee_only`),
 `app_profile` (WP1), `app_purpose` (WP4: `purpose`, `confidence`, `source`, `probabilities`,
 `digest`), `usage`
 (requests, tokens), `findings_by_severity`, `transfer_decisions`, `capabilities` (label

@@ -821,11 +821,13 @@ def _test_triage_ranking() -> None:
   from typesafe_eval import constants
   from typesafe_eval import engine
   cap = constants.MAX_FINDINGS_PER_TYPE
-  n = cap + 2
+  # n files match; only the LAST in scanner order has a network sink, the
+  # second-to-last has only an IPC sink, the rest none. The two sink files are
+  # exempt from the per-type budget (WP6 accounting), so ``cap`` tier-3 files
+  # are asked in addition and the last two tier-3 files in scanner order drop.
+  n = cap + 4
   with tempfile.TemporaryDirectory() as d:
     os.makedirs(os.path.join(d, "app"))
-    # n files match; only the LAST in scanner order has a network sink, the
-    # second-to-last has only an IPC sink, the rest none.
     for i in range(n):
       body = "fun f() {\n  val n = user.name\n"
       if i == n - 1:
@@ -841,17 +843,20 @@ def _test_triage_ranking() -> None:
     ds = json.load(open(os.path.join(scratch, "worker_data_safety.json"), encoding="utf-8"))
     files = [(f.get("files_involved") or [""])[0] for f in ds["findings"]]
     _check("triage_keeps_sink_file", any(f"F{n-1}.kt" in f for f in files) and any(f"F{n-2}.kt" in f for f in files), str(files))
-    _check("triage_caps_per_type", triage["counters"]["kept"] == cap, str(triage["counters"].get("kept")))
+    _check("triage_caps_per_type", triage["counters"]["kept"] == cap + 2
+           and triage["counters"].get("kept_budgeted") == cap, str(triage["counters"].get("kept")))
     dropped = [x for x in triage["dropped"] if "MAX_FINDINGS_PER_TYPE" in x["reason"]]
     _check("triage_records_dropped_with_rank",
            len(dropped) == 2 and all("rank" in x and "tier" in x for x in dropped)
            and all(x["tier"] == 3 for x in dropped), str(dropped))
     _check("triage_sink_file_indexed",
            triage["sinks_by_file"].get(f"app/F{n-1}.kt") and not triage["sinks_by_file"].get("app/F0.kt"))
-    # Tier 0 (egress) and tier 1 (IPC) both survive; the two scanner-order
-    # leaders without any sink are the ones dropped (ranks cap, cap+1).
+    # Tier 0 (egress) and tier 1 (IPC) both survive and rank first; the two
+    # scanner-order trailers without any sink are the ones dropped (ranks
+    # cap+2, cap+3: the budget of ``cap`` tier-3 candidates is spent on the
+    # earlier ones).
     _check("triage_egress_ranked_before_ipc",
-           sorted(x["rank"] for x in dropped) == [cap, cap + 1]
+           sorted(x["rank"] for x in dropped) == [cap + 2, cap + 3]
            and all(f"F{n-1}.kt" not in x["finding"] and f"F{n-2}.kt" not in x["finding"] for x in dropped),
            str([(x["finding"], x["rank"]) for x in dropped]))
     kept_findings = [f for f in ds["findings"] if f.get("kind") != "play_declaration"]
@@ -876,7 +881,8 @@ def _test_triage_ranking() -> None:
     engine.run(scratch, HeuristicJevClient(), batched=True)
     triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
     _check("triage_cap_exempts_sink_in_scope",
-           triage["counters"]["kept"] == m and triage["counters"].get("cap_exempt_sink_in_scope") == 1
+           triage["counters"]["kept"] == m and triage["counters"].get("cap_exempt_sink_in_scope") == m
+           and triage["counters"].get("kept_budgeted") == 0
            and not [x for x in triage["dropped"] if "MAX_FINDINGS_PER_TYPE" in x["reason"]],
            str((triage["counters"].get("kept"), triage["counters"].get("cap_exempt_sink_in_scope"))))
     constants.CAP_EXEMPTS_SINK_IN_SCOPE = False
@@ -1100,6 +1106,375 @@ def _test_app_purpose() -> None:
     triage5 = json.load(open(os.path.join(scratch5, engine.TRIAGE_FILENAME), encoding="utf-8"))
     _check("app_purpose_heuristic_unknown", triage5["app_purpose"]["purpose"] == "unknown"
            and triage5["app_purpose"]["source"] == "model", json.dumps(triage5.get("app_purpose")))
+
+
+def _test_callee_resolution() -> None:
+  """WP6: one-hop first-party callee resolution (index, state, ranking, evidence, engine)."""
+  from typesafe_eval import capabilities as capsmod
+  from typesafe_eval import constants
+  from typesafe_eval import context
+  from typesafe_eval import engine
+  from typesafe_eval import structure
+  from typesafe_eval.client import HeuristicJevClient, JevAnswer
+
+  net_profile = capsmod.CapabilityProfile("okhttp3.OkHttpClient", "import", {"NETWORK_EGRESS": 0.95},
+                                          ["NETWORK_EGRESS"], "model", "m")
+  db_profile = capsmod.CapabilityProfile("androidx.room.Room", "import", {"LOCAL_PERSISTENCE": 0.9},
+                                         ["LOCAL_PERSISTENCE"], "model", "m")
+  intent_profile = capsmod.CapabilityProfile("android.content.Intent", "import", {"IPC_SHARING": 0.9},
+                                             ["IPC_SHARING"], "model", "m")
+  log_profile = capsmod.CapabilityProfile("android.util.Log", "import", {}, [], "model", "m")
+  profiles = {"okhttp3.OkHttpClient": net_profile, "androidx.room.Room": db_profile,
+              "android.content.Intent": intent_profile, "android.util.Log": log_profile}
+
+  with tempfile.TemporaryDirectory() as d:
+    def write(rel, text):
+      full = os.path.join(d, rel)
+      os.makedirs(os.path.dirname(full), exist_ok=True)
+      with open(full, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    src = "app/src/main/java/com/w6"
+    # Helper that owns the network client (the "thin wrapper" the labelled set showed).
+    write(f"{src}/net/Uploader.kt",
+          "package com.w6.net\nimport okhttp3.OkHttpClient\nimport android.util.Log\n"
+          "object Uploader {\n  fun send(payload: String) {\n    Log.d(\"u\", payload)\n"
+          "    OkHttpClient().newCall(req(payload)).execute()\n  }\n}\n")
+    # Helper that only persists locally.
+    write(f"{src}/db/Store.kt",
+          "package com.w6.db\nimport androidx.room.Room\nobject Store {\n  fun save(v: String) {\n"
+          "    Room.databaseBuilder(ctx, Db::class.java, \"x\").build().dao().insert(v)\n  }\n}\n")
+    # Helper that shares through IPC.
+    write(f"{src}/share/Sharer.kt",
+          "package com.w6.share\nimport android.content.Intent\nobject Sharer {\n  fun out(v: String) {\n"
+          "    ctx.startActivity(Intent().putExtra(\"v\", v))\n  }\n}\n")
+    # Same simple name in two flavours (ambiguity -> nearest / import resolution).
+    write("app/src/free/java/com/w6/flavor/Flags.kt", "package com.w6.flavor\nobject Flags\n")
+    write("app/src/paid/java/com/w6/flavor/Flags.kt", "package com.w6.flavor\nobject Flags\n")
+    # An app class shadowing a platform name: callers importing android.util.Log must NOT resolve to it.
+    write(f"{src}/util/Log.kt", "package com.w6.util\nobject Log\n")
+    # Test source is never indexed.
+    write("app/src/test/java/com/w6/Uploader.kt", "package com.w6\nobject Uploader\n")
+    # Caller: two functions read the location; only ``sync`` hands it to the uploader.
+    caller_rel = f"{src}/ui/Main.kt"
+    write(caller_rel,
+          "package com.w6.ui\nimport com.w6.net.Uploader\nimport com.w6.db.Store\nimport android.util.Log\n"
+          "// Uploader is documented here; a comment must not count as a call\n"
+          "class Main {\n"
+          "  fun show() {\n    val l = getLastKnownLocation()\n    Store.save(l.toString())\n    Log.d(\"m\", l)\n  }\n"
+          "  fun sync() {\n    val l = getLastKnownLocation()\n    Uploader.send(l.toString())\n  }\n"
+          "  fun flags() { Flags.toString() }\n"
+          "}\n")
+
+    index = structure.build_first_party_index(d)
+    _check("callee_index_names",
+           set(index.by_name) >= {"Uploader", "Store", "Sharer", "Flags", "Log", "Main"}
+           and index.by_name["Uploader"] == [f"{src}/net/Uploader.kt"]
+           and len(index.by_name["Flags"]) == 2, str(index.by_name))
+    _check("callee_index_packages", "com.w6.net" in index.packages and "com.w6" not in index.packages,
+           str(index.packages))
+    fs = structure.analyze_file(d, caller_rel)
+    refs = structure.callee_references(fs, index)
+    by_sym = {r.symbol: r for r in refs}
+    _check("callee_refs_resolved",
+           set(by_sym) == {"Uploader", "Store", "Flags"}, str(sorted(by_sym)))
+    _check("callee_refs_import_resolution",
+           by_sym["Uploader"].resolution == "import" and by_sym["Uploader"].relpath == f"{src}/net/Uploader.kt"
+           and by_sym["Uploader"].lines == [13], str(by_sym["Uploader"]))
+    _check("callee_refs_platform_shadow_skipped", "Log" not in by_sym, str(sorted(by_sym)))
+    _check("callee_refs_ambiguous_nearest",
+           by_sym["Flags"].resolution == "nearest" and by_sym["Flags"].relpath.startswith("app/src/"),
+           str(by_sym["Flags"]))
+    within = structure.callee_references(fs, index, within=range(11, 15))
+    _check("callee_refs_within_scope_filter", [r.symbol for r in within] == ["Uploader"], str(within))
+
+    # Same-package implicit import resolves without an import line.
+    fs_same = structure.FileStructure("app/src/main/java/com/w6/net/Other.kt", "kotlin",
+                                      ["package com.w6.net", "fun f() { Uploader.send(\"x\") }"], [], {}, "com.w6.net")
+    same = index.resolve("Uploader", fs_same)
+    _check("callee_resolve_same_package", same is not None and same.resolution == "same_package", str(same))
+    _check("callee_resolve_self_excluded", index.resolve("Main", fs) is None)
+    # Import from a package no first-party file declares: not a callee.
+    fs_shadow = structure.FileStructure("app/X.kt", "kotlin", ["Log.d(\"a\", 1)"], ["android.util.Log"], {}, "com.w6.ui")
+    _check("callee_resolve_foreign_import_none", index.resolve("Log", fs_shadow) is None)
+
+    # --- member extraction and declaration lookup (member-level hop) ------------
+    _check("callee_called_members",
+           structure.called_members("    Uploader.send(l.toString())", "Uploader") == ["send"]
+           and structure.called_members("Uploader(ctx).send(x); Uploader.INSTANCE.flush()", "Uploader") == ["send", "flush"]
+           and structure.called_members("val u: Uploader = Uploader(ctx)", "Uploader") == []
+           and structure.called_members("map(Uploader::send)", "Uploader") == ["send"]
+           and structure.called_members("Uploader.Companion.make()", "Uploader") == ["make"])
+    up_lines = callee_files_probe = structure.analyze_file(d, f"{src}/net/Uploader.kt").lines
+    _check("callee_member_declaration_kotlin",
+           structure.member_declaration_lines(up_lines, "send") == [4]
+           and structure.declaration_scope(up_lines, 4) == (4, 8), str(structure.member_declaration_lines(up_lines, "send")))
+    java_lines = ["public class Net {", "  private static int count;", "  public static void send(String p) {",
+                  "    Client c = new Client();", "    c.post(p);", "  }", "  int other() { return send(1); }", "}"]
+    _check("callee_member_declaration_java",
+           structure.member_declaration_lines(java_lines, "send") == [2]
+           and structure.declaration_scope(java_lines, 2) == (2, 6), str(structure.member_declaration_lines(java_lines, "send")))
+    expr_lines = ["object K {", "  fun ping() = Client().get()", "  val endpoint = Client().url", "}"]
+    _check("callee_member_declaration_expression_body",
+           structure.member_declaration_lines(expr_lines, "ping") == [1] and structure.declaration_scope(expr_lines, 1) == (1, 2)
+           and structure.member_declaration_lines(expr_lines, "endpoint") == [2])
+    del callee_files_probe
+
+    # --- context: state, anchor tier, snippet -----------------------------------
+    callee_files = {r.relpath: structure.analyze_file(d, r.relpath) for r in refs}
+    callees = context.file_callees(fs, refs, callee_files, profiles)
+    by_callee = {c.symbol: c for c in callees}
+    _check("callee_file_level_capabilities",
+           by_callee["Uploader"].capabilities == ["NETWORK_EGRESS"] and by_callee["Store"].capabilities == []
+           and by_callee["Uploader"].member_scopes.get("send") == [(4, 8)], str(by_callee["Uploader"].member_scopes))
+    asks = [("PRECISE_LOCATION", "getLastKnownLocation")]
+    state, per = context.build_file_state(fs, asks, profiles, {"name": "X"}, callees=callees)
+    anchor = per[0]["anchor"]
+    _check("callee_anchor_prefers_transfer_hop",
+           per[0]["signal"]["line"] == 13 and anchor["tier"] == 0 and anchor["sink_in_scope"] is False
+           and anchor["callee_in_scope"] is True and anchor["callee_capabilities"] == ["NETWORK_EGRESS"],
+           json.dumps(anchor))
+    _check("callee_state_block",
+           len(state.get("callees") or []) == 1 and state["callees"][0]["symbol"] == "Uploader"
+           and state["callees"][0]["hop"] == 1 and state["callees"][0]["called_at"] == [14]
+           and state["callees"][0]["members"] == ["send"] and state["callees"][0]["granularity"] == "member"
+           and state["callees"][0]["sinks"][0]["symbol"] == "OkHttpClient"
+           and "fun send" in state["callees"][0]["code_snippet"], json.dumps(state.get("callees")))
+    # Member granularity: a method that reaches no sink yields an empty hop even
+    # though the callee file has a network client elsewhere.
+    write(f"{src}/net/Mixed.kt",
+          "package com.w6.net\nimport okhttp3.OkHttpClient\nobject Mixed {\n"
+          "  fun format(v: String): String {\n    return v.trim()\n  }\n"
+          "  fun post(v: String) {\n    OkHttpClient().newCall(v).execute()\n  }\n}\n")
+    index_m = structure.build_first_party_index(d)
+    fs_mixed = structure.FileStructure(
+        caller_rel, "kotlin",
+        ["package com.w6.ui", "import com.w6.net.Mixed", "class Main {",
+         "  fun a() {", "    val l = getLastKnownLocation()", "    Mixed.format(l.toString())", "  }",
+         "  fun b() {", "    val l = getLastKnownLocation()", "    Mixed.post(l.toString())", "  }",
+         "  fun c() {", "    val l = getLastKnownLocation()", "    val m = Mixed", "    m.post(l.toString())", "  }", "}"],
+        ["com.w6.net.Mixed"], {}, "com.w6.ui")
+    refs_mixed = structure.callee_references(fs_mixed, index_m)
+    callees_mixed = context.file_callees(fs_mixed, refs_mixed,
+                                         {r.relpath: structure.analyze_file(d, r.relpath) for r in refs_mixed}, profiles)
+    mixed = callees_mixed[0]
+    va, vb, vc = mixed.view((3, 7)), mixed.view((7, 11)), mixed.view((11, 16))
+    _check("callee_member_view_no_sink",
+           va.granularity == "member" and va.members == ["format"] and va.sinks == [] and va.capabilities == [], str(va.members))
+    _check("callee_member_view_with_sink",
+           vb.granularity == "member" and vb.members == ["post"] and [s.symbol for s in vb.sinks] == ["OkHttpClient"]
+           and vb.sinks[0].lines == [7], str(vb.sinks))
+    _check("callee_file_fallback_without_member",
+           vc.granularity == "file" and vc.members == [] and [s.symbol for s in vc.sinks] == ["OkHttpClient"], str(vc.granularity))
+    state_mx, per_mx = context.build_file_state(fs_mixed, asks, profiles, {"name": "X"}, callees=callees_mixed)
+    _check("callee_member_anchor_choice",
+           per_mx[0]["signal"]["line"] == 9 and per_mx[0]["anchor"]["tier"] == 0
+           and per_mx[0]["callees"][0]["members"] == ["post"], json.dumps(per_mx[0]["anchor"]))
+    # An unlocated member (inherited/extension) falls back to file level.
+    fs_unloc = structure.FileStructure(
+        caller_rel, "kotlin", ["package com.w6.ui", "fun z() {", "  val l = getLastKnownLocation()", "  Mixed.inherited(l)", "}"],
+        [], {}, "com.w6.ui")
+    refs_unloc = structure.callee_references(fs_unloc, index_m)
+    cal_unloc = context.file_callees(fs_unloc, refs_unloc,
+                                     {r.relpath: structure.analyze_file(d, r.relpath) for r in refs_unloc}, profiles)[0]
+    vu = cal_unloc.view((1, 5))
+    _check("callee_unlocated_member_file_fallback",
+           cal_unloc.member_scopes.get("inherited") == [] and vu.granularity == "file" and vu.members == ["inherited"]
+           and vu.capabilities == ["NETWORK_EGRESS"], str(vu.granularity))
+    _check("callee_snippet_section",
+           "First-party callees reached from the snippet" in state["code_snippet"]
+           and "OkHttpClient().newCall" in state["code_snippet"]
+           and "First-party callee Uploader" in per[0]["code_snippet"], state["code_snippet"])
+    _check("callee_network_hint", "Uploader.OkHttpClient" in state["co_located_signals"]["network_transmission"],
+           str(state["co_located_signals"]))
+    # Without callees the state is byte-identical to the pre-WP6 form.
+    plain, plain_per = context.build_file_state(fs, asks, profiles, {"name": "X"})
+    _check("callee_absent_state_unchanged",
+           "callees" not in plain and plain_per[0]["callees"] == [] and plain_per[0]["anchor"]["tier"] == 3
+           and "First-party callee" not in plain["code_snippet"], json.dumps(plain_per[0]["anchor"]))
+
+    # Local-DB helper only: callee is shown with no transfer sink; tier stays 3.
+    fs_local = structure.FileStructure(
+        caller_rel, "kotlin",
+        ["package com.w6.ui", "import com.w6.db.Store", "class Main {", "  fun show() {",
+         "    val l = getLastKnownLocation()", "    Store.save(l.toString())", "  }", "}"],
+        ["com.w6.db.Store"], {}, "com.w6.ui")
+    refs_local = structure.callee_references(fs_local, index)
+    callees_local = context.file_callees(fs_local, refs_local, callee_files, profiles)
+    state_l, per_l = context.build_file_state(fs_local, asks, profiles, {"name": "X"}, callees=callees_local)
+    _check("callee_local_helper_no_transfer",
+           [c["symbol"] for c in state_l.get("callees") or []] == ["Store"]
+           and state_l["callees"][0]["capabilities"] == [] and per_l[0]["anchor"]["tier"] == 3
+           and per_l[0]["anchor"]["callee_in_scope"] is False
+           and "no capability-labelled transfer sink" in state_l["code_snippet"], json.dumps(state_l.get("callees")))
+
+    # --- evaluate: evidence, files, sharing, soft gate, composed decisions ------
+    mini = per[0]
+    sink = evaluate.nearest_sink(mini)
+    _check("callee_nearest_sink_via",
+           sink and sink["file"] == f"{src}/net/Uploader.kt" and sink["via"] == "Uploader"
+           and sink["called_at"] == 14 and sink["symbol"] == "OkHttpClient" and sink["in_scope"] is True, str(sink))
+    ev = evaluate._evidence_line(mini)  # pylint: disable=protected-access
+    _check("callee_evidence_line",
+           ev == (f"source@{caller_rel}:L12-L15 (L13: val l = getLastKnownLocation()) -> "
+                  f"sink@{src}/net/Uploader.kt:L7 OkHttpClient [NETWORK_EGRESS] (via Uploader called at L14)"), ev)
+    _check("callee_files_involved", evaluate.files_involved(mini) == [caller_rel, f"{src}/net/Uploader.kt"],
+           str(evaluate.files_involved(mini)))
+    _check("callee_file_egress_for_soft_gate", evaluate.file_has_strong_egress(mini) is True
+           and evaluate.file_has_strong_egress(per_l[0]) is False)
+    # Same-file in-scope sink still wins over a callee sink; out-of-scope same-file loses to callee.
+    with_same = {**mini, "sinks": [{"symbol": "Socket", "capabilities": ["NETWORK_EGRESS"], "lines": [13]}]}
+    with_far = {**mini, "sinks": [{"symbol": "Socket", "capabilities": ["NETWORK_EGRESS"], "lines": [90]}]}
+    _check("callee_sink_preference_order",
+           evaluate.nearest_sink(with_same)["symbol"] == "Socket" and evaluate.nearest_sink(with_far)["via"] == "Uploader")
+    # IPC in the callee counts as sharing in scope.
+    fs_share = structure.FileStructure(
+        caller_rel, "kotlin",
+        ["package com.w6.ui", "import com.w6.share.Sharer", "fun go() {", "  val e = email()",
+         "  Sharer.out(e)", "}"], ["com.w6.share.Sharer"], {}, "com.w6.ui")
+    refs_share = structure.callee_references(fs_share, index)
+    callees_share = context.file_callees(fs_share, refs_share,
+                                         {r.relpath: structure.analyze_file(d, r.relpath) for r in refs_share}, profiles)
+    _, per_s = context.build_file_state(fs_share, [("EMAIL", "email()")], profiles, {"name": "X"}, callees=callees_share)
+    _check("callee_ipc_sharing_in_scope", evaluate.sharing_sinks_in_scope(per_s[0]) == ["Sharer.Intent"]
+           and per_s[0]["anchor"]["tier"] == 1, str(evaluate.sharing_sinks_in_scope(per_s[0])))
+
+    def answers(p_transmit, relevant=0.9, third=0.1):
+      return {
+          "signal_relevant": JevAnswer("noul", noul=relevant),
+          "transmits_offdevice": JevAnswer("noul", noul=p_transmit),
+          "user_initiated": JevAnswer("noul", noul=0.2),
+          "is_third_party": JevAnswer("noul", noul=third),
+          "has_prominent_disclosure": JevAnswer("noul", noul=0.1),
+          "disclosure_status": JevAnswer("choice", choice="MISSING", probabilities={"MISSING": 0.9}),
+          "severity": JevAnswer("score", score=2.0, probabilities={"2": 1.0}),
+      }
+    composed = evaluate._compose_data_safety_finding(  # pylint: disable=protected-access
+        "PRECISE_LOCATION", "x", mini, answers(0.9), "test")
+    _check("callee_composed_transmits",
+           composed["transfer_decision"] == "TRANSMITS" and composed["files_involved"][-1].endswith("Uploader.kt")
+           and composed["decision_trace"]["callees"][0]["symbol"] == "Uploader"
+           and composed["decision_trace"]["anchor"]["callee_capabilities"] == ["NETWORK_EGRESS"]
+           and composed["evidence_flow"]["sink"]["via"] == "Uploader", json.dumps(composed["decision_trace"]))
+    composed_local = evaluate._compose_data_safety_finding(  # pylint: disable=protected-access
+        "PRECISE_LOCATION", "x", per_l[0], answers(0.1), "test")
+    _check("callee_composed_local",
+           composed_local["transfer_decision"] == "LOCAL" and composed_local["files_involved"] == [caller_rel]
+           and composed_local["decision_trace"]["callees"][0]["sinks"] == []
+           and "Uploader" not in composed_local["evidence"], json.dumps(composed_local["decision_trace"]))
+    # Uncertain relevance is kept for review because the hop reaches strong egress.
+    soft = evaluate._compose_data_safety_finding(  # pylint: disable=protected-access
+        "PRECISE_LOCATION", "x", mini, answers(0.9, relevant=constants.T_RELEVANCE - 0.05), "test")
+    _check("callee_soft_gate_keeps", soft is not None and soft["decision_trace"]["relevance"] == "low"
+           and soft.get("needs_manual_review") is True, json.dumps(soft and soft["decision_trace"]))
+
+    # --- caps: callees per anchor and the sink-lines-only fallback -------------
+    many_refs = []
+    for i in range(5):
+      rel = f"{src}/h/Helper{i}.kt"
+      filler = "\n".join(f"    val x{k} = v.length + {k}" for k in range(20))
+      body = f"  fun f0(v: String) {{\n{filler}\n    OkHttpClient().newCall(v).execute()\n  }}"
+      write(rel, f"package com.w6.h\nimport okhttp3.OkHttpClient\nobject Helper{i} {{\n{body}\n}}\n")
+      many_refs.append(rel)
+    index2 = structure.build_first_party_index(d)
+    fs_many = structure.FileStructure(
+        caller_rel, "kotlin",
+        ["package com.w6.ui", "fun go() {", "  val l = getLastKnownLocation()"]
+        + [f"  Helper{i}.f0(l)" for i in range(5)] + ["}"], [], {}, "com.w6.ui")
+    refs_many = structure.callee_references(fs_many, index2)
+    callees_many = context.file_callees(fs_many, refs_many,
+                                        {r.relpath: structure.analyze_file(d, r.relpath) for r in refs_many}, profiles)
+    state_m, per_m = context.build_file_state(fs_many, asks, profiles, {"name": "X"}, callees=callees_many)
+    _check("callee_cap_per_anchor", len(state_m["callees"]) == constants.MAX_CALLEES_PER_ANCHOR
+           and len(per_m[0]["callees"]) == constants.MAX_CALLEES_PER_ANCHOR, str(len(state_m["callees"])))
+    _check("callee_sink_lines_only_fallback",
+           all("// sink:" in c["code_snippet"] and "fun f" not in c["code_snippet"] for c in state_m["callees"]),
+           state_m["callees"][0]["code_snippet"])
+    _check("callee_refs_per_caller_cap",
+           len(structure.callee_references(fs_many, index2, cap=2)) == 2)
+
+    # --- index excludes non-prioritised flavours (SDK stub case) ---------------
+    write("app/src/fdroid/java/com/vendor/billing/BillingClient.kt", "package com.vendor.billing\nclass BillingClient\n")
+    idx_all = structure.build_first_party_index(d)
+    idx_excl = structure.build_first_party_index(d, excluded_flavors=["fdroid", "free"])
+    _check("callee_index_excludes_flavors",
+           "BillingClient" in idx_all.by_name and "BillingClient" not in idx_excl.by_name
+           and len(idx_excl.by_name["Flags"]) == 1 and idx_excl.by_name["Flags"][0].startswith("app/src/paid/"),
+           str(idx_excl.by_name.get("Flags")))
+
+    # --- triage budget: exempt candidates do not displace tier-3 ones ----------
+    ctx_t = engine.RunContext(temp_dir="", app_dir="", app_facts={}, manifest={})
+    cands = {}
+    n_exempt, n_tier3 = 6, constants.MAX_FINDINGS_PER_TYPE + 4
+    for i in range(n_exempt + n_tier3):
+      rel = f"t/F{i}.kt"
+      with_sink = i < n_exempt
+      lines = ["import okhttp3.OkHttpClient" if with_sink else "import java.util.Locale",
+               "fun go() {", "  val e = email()", "  OkHttpClient().post(e)" if with_sink else "  show(e)", "}"]
+      imports = ["okhttp3.OkHttpClient"] if with_sink else ["java.util.Locale"]
+      ctx_t.files[rel] = structure.FileStructure(rel, "kotlin", lines, imports,
+                                                 structure.symbol_references(lines, imports), "t")
+      cands.setdefault("EMAIL", []).append(engine.Candidate("EMAIL", f"{rel} (Pattern: email())", rel, "email()", i))
+    ctx_t.profiles = {"okhttp3.OkHttpClient": net_profile,
+                      "java.util.Locale": capsmod.CapabilityProfile("java.util.Locale", "import", {}, [], "model", "m")}
+    kept_t = engine._triage(ctx_t, cands)  # pylint: disable=protected-access
+    tier3_kept = [c for c in kept_t["EMAIL"] if not c.anchor.reach_in_scope]
+    exempt_kept = [c for c in kept_t["EMAIL"] if c.anchor.reach_in_scope]
+    over = [d for d in ctx_t.dropped if d["reason"].startswith("over MAX_FINDINGS_PER_TYPE")]
+    _check("triage_budget_excludes_exempt",
+           len(exempt_kept) == n_exempt and len(tier3_kept) == constants.MAX_FINDINGS_PER_TYPE
+           and len(over) == n_tier3 - constants.MAX_FINDINGS_PER_TYPE
+           and ctx_t.counters["kept_budgeted"] == constants.MAX_FINDINGS_PER_TYPE
+           and ctx_t.counters["cap_exempt_sink_in_scope"] == n_exempt,
+           f"{len(exempt_kept)} exempt, {len(tier3_kept)} budgeted, {len(over)} over, {ctx_t.counters.get('kept_budgeted')}")
+
+    # --- engine integration (heuristic client, hermetic) -----------------------
+    # The manifest gives the profile package ``com.w6``; helper packages beneath
+    # it are first-party (never classified), so the hop is the only way the
+    # network client in Uploader.kt becomes visible -- the real-app situation.
+    write("app/src/main/AndroidManifest.xml",
+          '<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.w6">'
+          '<uses-sdk android:targetSdkVersion="36"/><application/></manifest>')
+    scratch = os.path.join(d, ".scratch")
+    _write_scratch(d, scratch, {"PRECISE_LOCATION": [f"{caller_rel} (Pattern: getLastKnownLocation)"]})
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    cr = triage["counters"].get("callee_resolution") or {}
+    ds = json.load(open(os.path.join(scratch, "worker_data_safety.json"), encoding="utf-8"))
+    loc = [x for x in ds["findings"] if x.get("psl_constant") == "PRECISE_LOCATION" and x.get("kind") != "play_declaration"]
+    _check("callee_engine_counters",
+           cr.get("enabled") is True and cr.get("callers_with_callees") == 1 and cr.get("callee_files", 0) >= 2
+           and caller_rel in (triage["counters"].get("callee_refs") or {})
+           and triage["counters"].get("imports_from_callees", 0) >= 1
+           and triage["counters"].get("anchors_with_callees") == 1
+           and triage["counters"].get("anchors_tier_raised_by_callee") == 1, json.dumps(cr))
+    _check("callee_engine_finding_transmits",
+           len(loc) == 1 and loc[0]["transfer_decision"] == "TRANSMITS"
+           and "(via Uploader called at" in loc[0]["evidence"]
+           and loc[0]["files_involved"][-1].endswith("Uploader.kt")
+           and loc[0]["decision_trace"]["callees"][0]["members"] == ["send"]
+           and loc[0]["decision_trace"]["callees"][0]["granularity"] == "member",
+           str([(x.get("transfer_decision"), x.get("evidence")) for x in loc]))
+    fp = triage["counters"].get("first_party_packages") or []
+    _check("callee_engine_first_party_from_profile",
+           "com.w6" in fp and "com.w6.net" not in fp and triage["counters"].get("imports_first_party_skipped", 0) >= 2
+           and triage["counters"]["first_party_index"]["excluded_flavors"] == [], str(fp))
+
+    # Rollback flag: no index, no hops, state as before.
+    constants.CALLEE_RESOLUTION_ENABLED = False
+    try:
+      scratch2 = os.path.join(d, ".scratch2")
+      _write_scratch(d, scratch2, {"PRECISE_LOCATION": [f"{caller_rel} (Pattern: getLastKnownLocation)"]})
+      engine.run(scratch2, HeuristicJevClient(), batched=True)
+      triage2 = json.load(open(os.path.join(scratch2, engine.TRIAGE_FILENAME), encoding="utf-8"))
+      ds2 = json.load(open(os.path.join(scratch2, "worker_data_safety.json"), encoding="utf-8"))
+      loc2 = [x for x in ds2["findings"] if x.get("psl_constant") == "PRECISE_LOCATION" and x.get("kind") != "play_declaration"]
+      _check("callee_flag_off",
+             (triage2["counters"].get("callee_resolution") or {}).get("enabled") is False
+             and "first_party_index" not in triage2["counters"]
+             and loc2 and "via Uploader" not in loc2[0]["evidence"], json.dumps(triage2["counters"].get("callee_resolution")))
+    finally:
+      constants.CALLEE_RESOLUTION_ENABLED = True
 
 
 def _test_evidence_line() -> None:
@@ -1769,6 +2144,7 @@ def main() -> int:
   _test_calibrate()
   _test_evidence_line()
   _test_app_purpose()
+  _test_callee_resolution()
   _test_relevance_token_embedded()
   print()
   if _FAILURES:

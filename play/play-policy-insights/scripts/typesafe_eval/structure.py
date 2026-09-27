@@ -32,6 +32,10 @@ parser can answer without judgment:
   depth (or indentation for Python), with a fixed-window fallback.
 - **Sink proximity** — the line distance between a data-type hit and the nearest
   reference to a symbol the semantic layer labelled as a transfer sink.
+- **First-party class index and callee references** (WP6) — which of the app's
+  own class files does a capitalised identifier in a caller refer to, and on
+  which lines is it referenced? Resolution uses the caller's imports and
+  package, never the class's behaviour.
 
 Everything here is pure: it reads files under ``app_dir`` and returns plain
 dicts/lists. No network, no model, no writes. It is intentionally regex-based
@@ -960,6 +964,369 @@ def value_reference_lines(app_dir: str, relpath: str, identifier: str) -> List[i
     if exact.search(line):
       out.append(i + 1)
   return out
+
+
+# ---------------------------------------------------------------------------
+# First-party class index and one-hop callee references (WP6, lesson L3)
+# ---------------------------------------------------------------------------
+#
+# Java requires one public top-level class per file named after the file;
+# Kotlin and C# follow the convention closely enough that "simple class name ==
+# file base name" is a usable, parser-free index of the app's own classes. The
+# index answers one question for the context builder: *which first-party file
+# does the identifier ``Uploader`` on this line most plausibly refer to?* It
+# never says what that file does -- the callee's imports are classified by the
+# semantic layer and its sinks are computed by ``context.file_sinks`` exactly
+# like the caller's.
+
+# A capitalised identifier in value/type position that is not part of a dotted
+# chain (``foo.Bar`` is a member access, ``com.app.Bar`` a qualified name --
+# both rare enough as *first-party constructor/static call* forms to skip, and
+# skipping them keeps the reference regex aligned with ``symbol_references``).
+_CLASS_REF_RE = re.compile(r"(?<![\w.@])([A-Z][A-Za-z0-9_]*)(?![\w])")
+
+# Kotlin/Java/C# source that declares a class per file. Dart and JS/TS files
+# are snake-case and multi-class, so simple-name matching does not apply.
+_INDEXED_EXTENSIONS = (".kt", ".java", ".cs")
+
+
+@dataclasses.dataclass
+class CalleeRef:
+  """One first-party class referenced from a caller file.
+
+  Attributes:
+    symbol: The simple class name as written in the caller (``Uploader``).
+    relpath: The first-party file the name resolved to, relative to the app.
+    lines: 0-based caller lines that reference the symbol (import and
+      comment lines excluded). The context builder intersects these with an
+      anchor's scope to decide whether the callee is reached from it.
+    resolution: How the file was chosen -- ``import`` (the caller imports it
+      from a first-party package), ``same_package`` (implicit import),
+      ``unique`` (only one file declares the name), ``nearest`` (several
+      files; the one sharing the longest directory prefix with the caller).
+      Recorded in the decision trace for auditability.
+    members_by_line: ``caller line -> member names`` called on the symbol on
+      that line (``Uploader.send(x)`` -> ``send``; ``Uploader(ctx).send(x)``
+      -> ``send``; ``Uploader::send`` -> ``send``). Empty for a line that
+      only names the type or constructs it without a chained call; the
+      context layer then falls back to the callee's file-level sinks.
+  """
+
+  symbol: str
+  relpath: str
+  lines: List[int]
+  resolution: str
+  members_by_line: Dict[int, List[str]] = dataclasses.field(default_factory=dict)
+
+
+def _member_call_re(symbol: str) -> re.Pattern:
+  """Members called on ``symbol`` on one line (see :attr:`CalleeRef.members_by_line`).
+
+  Alternatives, in order: ``Symbol.member`` / ``Symbol::member`` (static or
+  singleton access; Java-calling-Kotlin ``Symbol.INSTANCE.member`` and Kotlin
+  ``Symbol.Companion.member`` are collapsed to ``member``), and
+  ``Symbol(args).member`` (construct-then-call, arguments with one level of
+  nested parentheses). A bare ``Symbol(args)`` or a type position yields no
+  member.
+  """
+  sym = re.escape(symbol)
+  return re.compile(
+      rf"(?<![\w.]){sym}\s*(?:\.|::)\s*(?:(?:INSTANCE|Companion)\s*\.\s*)?([A-Za-z_]\w*)"
+      rf"|(?<![\w.]){sym}\s*\((?:[^()]|\([^()]*\))*\)\s*\.\s*([A-Za-z_]\w*)")
+
+
+def called_members(line: str, symbol: str) -> List[str]:
+  """Distinct member names called on ``symbol`` in ``line``, in order."""
+  out: List[str] = []
+  for m in _member_call_re(symbol).finditer(line):
+    name = m.group(1) or m.group(2)
+    if name and name not in out:
+      out.append(name)
+  return out
+
+
+# Declaration of a member named ``X`` inside a callee file. Kotlin/Swift/Scala
+# style (``fun X(``, ``val X``, ``var X``), Python (``def X(``), and Java/C#
+# style (``<modifiers> <Type> X(`` where the text before the name is only
+# modifiers, annotations, generics and array brackets). Property declarations
+# count because a caller reading ``Config.endpoint`` reaches the initializer.
+_KOTLIN_FUN_RE_TMPL = r"\bfun\s+(?:<[^<>]*>\s+)?(?:[\w.]+(?:<[^<>]*>)?\??\.)?{name}\s*\("
+_KOTLIN_PROP_RE_TMPL = r"\b(?:val|var|const\s+val|lateinit\s+var)\s+{name}\b"
+_PY_DEF_RE_TMPL = r"\b(?:async\s+)?def\s+{name}\s*\("
+_JAVA_DECL_BEFORE_RE = re.compile(
+    r"^\s*(?:@\w+(?:\([^)]*\))?\s+)*(?:(?:public|private|protected|static|final|abstract|"
+    r"synchronized|native|default|override|virtual|internal|async|sealed|readonly|extern|"
+    r"unsafe|partial|new)\s+)*(?:[\w.]+(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])*\s+)?$")
+
+
+def member_declaration_lines(lines: Sequence[str], name: str) -> List[int]:
+  """0-based lines that declare a function/method/property named ``name``.
+
+  Language-agnostic by construction (a Kotlin ``fun``, a Python ``def``, a
+  Java/C# ``Type name(`` header, a Kotlin/Swift property). Comment and import
+  lines are skipped. Several lines are returned for overloads. A line where
+  the name is *called* rather than declared (``return name(``, ``x = name(``,
+  ``obj.name(``) never matches because the text before the name is not a
+  declaration prefix.
+  """
+  if not re.match(r"^[A-Za-z_]\w*$", name):
+    return []
+  k_fun = re.compile(_KOTLIN_FUN_RE_TMPL.format(name=re.escape(name)))
+  k_prop = re.compile(_KOTLIN_PROP_RE_TMPL.format(name=re.escape(name)))
+  py_def = re.compile(_PY_DEF_RE_TMPL.format(name=re.escape(name)))
+  java_call = re.compile(r"(?<![\w.])" + re.escape(name) + r"\s*\(")
+  out: List[int] = []
+  for i, line in enumerate(lines):
+    if name not in line:
+      continue
+    stripped = line.lstrip()
+    if stripped.startswith(_COMMENT_PREFIXES) or stripped.startswith(_IMPORT_PREFIXES):
+      continue
+    if k_fun.search(line) or py_def.search(line):
+      out.append(i)
+      continue
+    if k_prop.search(line):
+      out.append(i)
+      continue
+    m = java_call.search(line)
+    if m and _JAVA_DECL_BEFORE_RE.match(line[:m.start()]) and line[:m.start()].strip():
+      # ``Type name(`` -- a Java/C# method header (or constructor when the
+      # prefix is only modifiers and the name is the class name).
+      out.append(i)
+      continue
+    if m and not line[:m.start()].strip() and is_declaration_header(line):
+      out.append(i)
+  return out
+
+
+def declaration_scope(lines: Sequence[str], decl: int, max_lines: int = 120) -> Tuple[int, int]:
+  """``(start, end)`` 0-based end-exclusive body of the declaration on ``decl``.
+
+  Brace languages: from the header forward to the line where the brace depth
+  returns to the header's depth (the header may open its brace on a later
+  line). Expression bodies (``fun f() = g()``) and abstract members are the
+  header line plus any immediately following deeper-indented continuation
+  lines. Bounded by ``max_lines`` from the header.
+  """
+  n = len(lines)
+  if decl < 0 or decl >= n:
+    return 0, 0
+  profile = _depth_profile(lines)
+  base = profile[decl]
+  # Find where the body opens: the header line or one of the next two lines.
+  opener = None
+  for j in range(decl, min(n, decl + 3)):
+    if profile[j + 1] > base:
+      opener = j
+      break
+    if j > decl and lines[j].strip() and not lines[j].strip().startswith("{"):
+      break
+  if opener is None:
+    end = decl + 1
+    indent = len(lines[decl]) - len(lines[decl].lstrip())
+    while end < n and end - decl < 8 and lines[end].strip() and \
+        (len(lines[end]) - len(lines[end].lstrip())) > indent:
+      end += 1
+    return decl, end
+  end = opener + 1
+  while end < n and profile[end] > base and end - decl < max_lines:
+    end += 1
+  return decl, end
+
+
+@dataclasses.dataclass
+class FirstPartyIndex:
+  """Per-app ``simple class name -> source file(s)`` index (WP6).
+
+  Built once per run by :func:`build_first_party_index` from the shipped
+  source under ``app_dir`` (build outputs, vendored trees and test source sets
+  excluded). Deterministic and read-only; nothing here decides what a class
+  *does*.
+
+  Attributes:
+    app_dir: The app root the relative paths are anchored to.
+    by_name: ``simple name -> sorted relpaths`` declaring a file of that name.
+    package_by_file: ``relpath -> declared package`` (``""`` when the head of
+      the file has no ``package``/``namespace`` line).
+  """
+
+  app_dir: str
+  by_name: Dict[str, List[str]] = dataclasses.field(default_factory=dict)
+  package_by_file: Dict[str, str] = dataclasses.field(default_factory=dict)
+
+  def __len__(self) -> int:
+    return len(self.by_name)
+
+  @property
+  def packages(self) -> Tuple[str, ...]:
+    """Distinct declared packages of the indexed files (first-party by construction)."""
+    return tuple(sorted({p for p in self.package_by_file.values() if p}))
+
+  def resolve(self, symbol: str, caller: FileStructure) -> Optional[CalleeRef]:
+    """Picks the file ``symbol`` refers to *from* ``caller``, or None.
+
+    Resolution order, all deterministic:
+
+    1. The caller imports ``<pkg>.<symbol>`` and an indexed file with that
+       simple name declares ``<pkg>`` -> that file (``import``). If the caller
+       imports a ``<symbol>`` from a package *no* indexed file declares, the
+       name is a platform/third-party class that happens to share a name with
+       an app class (``Log``) and is **not** resolved.
+    2. An indexed file with that name in the caller's own package
+       (``same_package``).
+    3. Exactly one indexed file has the name (``unique``).
+    4. Several do (the same helper in two flavours): the one sharing the
+       longest leading directory path with the caller (``nearest``).
+
+    The caller's own file is never a callee. Reference lines are filled in by
+    :func:`callee_references`, not here.
+    """
+    files = [rp for rp in self.by_name.get(symbol, []) if rp != caller.relpath]
+    if not files:
+      return None
+    imported_pkgs = [package_of(m) for m in caller.imports if simple_name(m) == symbol]
+    if imported_pkgs:
+      for rp in files:
+        if self.package_by_file.get(rp, "") in imported_pkgs:
+          return CalleeRef(symbol, rp, [], "import")
+      log.debug("callee %s in %s is imported from %s which no first-party file declares; skipped",
+                symbol, caller.relpath, imported_pkgs)
+      return None
+    if caller.package:
+      same = [rp for rp in files if self.package_by_file.get(rp, "") == caller.package]
+      if len(same) == 1:
+        return CalleeRef(symbol, same[0], [], "same_package")
+      if same:
+        files = same
+    if len(files) == 1:
+      return CalleeRef(symbol, files[0], [], "unique")
+    caller_parts = caller.relpath.split("/")[:-1]
+
+    def _shared_prefix(rp: str) -> int:
+      parts = rp.split("/")[:-1]
+      n = 0
+      for a, b in zip(caller_parts, parts):
+        if a != b:
+          break
+        n += 1
+      return n
+
+    best = max(files, key=lambda rp: (_shared_prefix(rp), -len(rp), rp))
+    log.debug("callee %s in %s is ambiguous across %s; chose nearest %s",
+              symbol, caller.relpath, files, best)
+    return CalleeRef(symbol, best, [], "nearest")
+
+
+def build_first_party_index(app_dir: str, excluded_flavors: Iterable[str] = ()) -> FirstPartyIndex:
+  """Walks the shipped source under ``app_dir`` into a :class:`FirstPartyIndex`.
+
+  Only ``.kt`` / ``.java`` / ``.cs`` files are indexed (see
+  ``_INDEXED_EXTENSIONS``); build outputs, vendored trees and test source sets
+  are skipped, as is every ``/src/<flavor>/`` tree in ``excluded_flavors``
+  (the engine passes the non-prioritised product flavours: a flavour that is
+  not shipped may carry *stub* copies of a third-party SDK's classes -- an
+  ``fdroid`` flavour stubbing a billing client, say -- and indexing them would
+  make the real SDK look first-party in the shipped flavour). The ``package``
+  declaration is read from the first ``constants.CALLEE_INDEX_HEAD_BYTES`` of
+  each file. Never raises: an unreadable file simply has package ``""``.
+  """
+  index = FirstPartyIndex(app_dir=app_dir)
+  if not app_dir or not os.path.isdir(app_dir):
+    log.info("first-party index: no app dir (%r); empty index", app_dir)
+    return index
+  flavor_markers = tuple(f"/src/{fl}/" for fl in excluded_flavors if fl)
+  scanned = 0
+  skipped_flavor = 0
+  for root, dirs, files in os.walk(app_dir):
+    dirs[:] = [d for d in dirs if d not in IGNORED_DIR_NAMES]
+    rel_root = "/" + os.path.relpath(root, app_dir).replace(os.sep, "/") + "/"
+    if any(marker in rel_root for marker in _TEST_DIR_MARKERS):
+      continue
+    if any(marker in rel_root for marker in flavor_markers):
+      skipped_flavor += sum(1 for n in files if os.path.splitext(n)[1] in _INDEXED_EXTENSIONS)
+      continue
+    for name in files:
+      base, ext = os.path.splitext(name)
+      if ext not in _INDEXED_EXTENSIONS or not re.match(r"^[A-Z]\w*$", base):
+        continue
+      full = os.path.join(root, name)
+      relpath = os.path.relpath(full, app_dir).replace(os.sep, "/")
+      scanned += 1
+      try:
+        with open(full, "r", encoding="utf-8", errors="ignore") as f:
+          head = f.read(constants.CALLEE_INDEX_HEAD_BYTES)
+      except OSError:
+        head = ""
+      index.by_name.setdefault(base, []).append(relpath)
+      index.package_by_file[relpath] = declared_package(head)
+  for rps in index.by_name.values():
+    rps.sort()
+  ambiguous = sum(1 for rps in index.by_name.values() if len(rps) > 1)
+  log.info("first-party index: %d class files, %d distinct names (%d ambiguous), %d packages under %s"
+           " (%d files in excluded flavours %s skipped)",
+           scanned, len(index.by_name), ambiguous, len(index.packages), app_dir,
+           skipped_flavor, sorted(excluded_flavors))
+  return index
+
+
+def callee_references(
+    fs: FileStructure,
+    index: FirstPartyIndex,
+    within: Optional[Iterable[int]] = None,
+    cap: Optional[int] = None,
+) -> List[CalleeRef]:
+  """First-party classes referenced from ``fs`` with their reference lines.
+
+  Args:
+    fs: The caller's structure.
+    index: The app's first-party index.
+    within: Optional 0-based line set; when given, only references on those
+      lines count (the engine passes the union of the file's candidate
+      scopes so hops are computed only where an anchor can land).
+    cap: Maximum callees returned (``constants.MAX_CALLEE_FILES_PER_CALLER``
+      when None), most-referenced first, then first reference line.
+
+  Comment-only and import lines are skipped (a class named in a doc comment is
+  not called). Names that resolve to no first-party file -- or that the caller
+  imports from a non-first-party package -- are ignored; see
+  :meth:`FirstPartyIndex.resolve`.
+  """
+  if cap is None:
+    cap = constants.MAX_CALLEE_FILES_PER_CALLER
+  allowed = set(within) if within is not None else None
+  lines_by_symbol: Dict[str, List[int]] = {}
+  members_by_symbol: Dict[str, Dict[int, List[str]]] = {}
+  for i, line in enumerate(fs.lines):
+    if allowed is not None and i not in allowed:
+      continue
+    stripped = line.lstrip()
+    if stripped.startswith(_COMMENT_PREFIXES) or stripped.startswith(_IMPORT_PREFIXES):
+      continue
+    for m in _CLASS_REF_RE.finditer(line):
+      name = m.group(1)
+      if name in index.by_name:
+        hits = lines_by_symbol.setdefault(name, [])
+        if not hits or hits[-1] != i:
+          hits.append(i)
+          members = called_members(line, name)
+          if members:
+            members_by_symbol.setdefault(name, {})[i] = members
+  refs: List[CalleeRef] = []
+  for name, hits in lines_by_symbol.items():
+    ref = index.resolve(name, fs)
+    if ref is None:
+      continue
+    ref.lines = hits
+    ref.members_by_line = members_by_symbol.get(name, {})
+    refs.append(ref)
+  refs.sort(key=lambda r: (-len(r.lines), r.lines[0] if r.lines else 1 << 30, r.symbol))
+  if len(refs) > cap:
+    log.info("callee references in %s: %d first-party classes, keeping the %d most referenced",
+             fs.relpath, len(refs), cap)
+    refs = refs[:cap]
+  log.debug("callee references in %s: %s", fs.relpath,
+            [(r.symbol, r.relpath, len(r.lines), r.resolution) for r in refs])
+  return refs
 
 
 def analyze_file(app_dir: str, relpath: str) -> FileStructure:
