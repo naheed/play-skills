@@ -21,6 +21,7 @@ Usage:
                                         [--verbose]
   python -m typesafe_eval critic <temp_dir> [--client heuristic|http]
   python -m typesafe_eval calibrate <labels.json> [--out PATH]
+  python -m typesafe_eval triage-diff <before_dir> <after_dir> [--json PATH]
   python -m typesafe_eval selftest
 
 ``<temp_dir>`` is the scratch directory produced by ``orchestrator.py init``.
@@ -119,6 +120,13 @@ def main(argv=None) -> int:
   cal_p.add_argument("--out", default=None, help="Write the calibration report JSON here.")
   cal_p.add_argument("--min-precision", type=float, default=0.90)
 
+  diff_p = sub.add_parser(
+      "triage-diff", help="Diff two run directories (findings, drops, counters, usage)."
+  )
+  diff_p.add_argument("before_dir")
+  diff_p.add_argument("after_dir")
+  diff_p.add_argument("--json", default=None, help="Also write the structured diff here.")
+
   sub.add_parser("selftest", help="Run offline unit checks.")
 
   smoke_p = sub.add_parser(
@@ -144,6 +152,10 @@ def main(argv=None) -> int:
   if args.command == "calibrate":
     from typesafe_eval import calibrate
     return calibrate.main(args.labels, out_path=args.out, min_precision=args.min_precision)
+
+  if args.command == "triage-diff":
+    from typesafe_eval import triage_diff
+    return triage_diff.main(args.before_dir, args.after_dir, json_out=args.json)
 
   client = _make_client(args.client, args.model)
 

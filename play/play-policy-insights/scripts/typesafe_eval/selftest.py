@@ -785,7 +785,41 @@ def _test_relevance_token_embedded() -> None:
   _check("permission_relevance_first", next(iter(p)) == "signal_relevant" and "`MediaRecorder`" in p["signal_relevant"]["instructions"])
 
 
+def _test_triage_diff() -> None:
+  from typesafe_eval import triage_diff
+  with tempfile.TemporaryDirectory() as d:
+    a, b = os.path.join(d, "a"), os.path.join(d, "b")
+    os.makedirs(a)
+    os.makedirs(b)
+    base = {"policy_id": "data_safety_section", "files_involved": ["app/A.kt"],
+            "psl_constant": "NAME", "severity": "IMPORTANT", "transfer_decision": "UNCERTAIN"}
+    fgs = {"policy_id": "foreground_services_policy", "files_involved": ["AndroidManifest.xml"],
+           "severity": "SUGGESTION", "decision_trace": {"service": ".Svc"}}
+    for path, findings in ((a, [base, fgs]), (b, [{**base, "severity": "CRITICAL", "transfer_decision": "TRANSMITS"},
+                                                  {**fgs, "decision_trace": {"service": ".Other"}}])):
+      with open(os.path.join(path, "worker_x.json"), "w", encoding="utf-8") as f:
+        json.dump({"findings": findings}, f)
+      with open(os.path.join(path, triage_diff.TRIAGE_FILENAME), "w", encoding="utf-8") as f:
+        json.dump({"counters": {"kept": 3 if path == a else 2},
+                   "dropped": [{"reason": "r1"}] + ([{"reason": "r2"}] if path == b else []),
+                   "usage": {"requests": 5}}, f)
+    same = triage_diff.diff(a, a)
+    _check("triage_diff_self_identical", same["identical"] is True, str(same["summary"]))
+    rep = triage_diff.diff(a, b)
+    _check("triage_diff_changed_decision",
+           rep["summary"]["changed"] == 1
+           and rep["changed"][0]["changes"]["transfer_decision"] == ["UNCERTAIN", "TRANSMITS"],
+           str(rep["changed"]))
+    _check("triage_diff_manifest_keys_by_service",
+           rep["summary"]["added"] == 1 and rep["summary"]["removed"] == 1, str(rep["summary"]))
+    _check("triage_diff_drops_and_counters",
+           rep["dropped_by_reason"].get("r2") == {"before": 0, "after": 1}
+           and rep["counters"]["kept"] == {"before": 3, "after": 2}, str(rep["counters"]))
+    _check("triage_diff_renders", "+1 -1 ~1" in triage_diff.render(rep))
+
+
 def main() -> int:
+  _test_triage_diff()
   _test_parse_finding()
   _test_snippet_and_colocation()
   _test_templates()
