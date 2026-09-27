@@ -297,6 +297,48 @@ Known residual false positive: a Suggestion-level "broad audio-recording access"
 on a MIME-type table passed the relevance gate at 0.60 on App B. It is left as-is rather than
 adding an app-specific rule.
 
+### 5.1 Time to outcome and cost versus the original agent skill
+
+The original skill's Phase 2 was run on the same two trees exactly as `SKILL.md` prescribes for
+Mode A (one general-purpose sub-agent per `prompt_worker_<goal>.md`, at most 3 concurrently,
+then one per critic chunk) with Claude Fable 5.1 at thinking effort `high`, timed between
+batches, and its 25 sub-agent transcripts were metered afterwards. Phase 1 (`init`, ~2 s) and
+report generation (<1 s) are shared and excluded.
+
+| | App A (220 files) | App B (60 files) |
+| --- | --- | --- |
+| Original skill wall clock, 3-way concurrency as prescribed | 18 min 37 s (13 workers + 2 critics; 330 LLM calls) | 8 min 23 s (10 workers; 175 LLM calls) |
+| Original skill theoretical floor, unlimited parallelism | ~7 min | ~2.5 min |
+| Hybrid v2 cold | 34 s (129 requests) | 10 s (35 requests) |
+| Hybrid v2 warm | 7.7 s (0 requests) | ~3 s (0 requests) |
+| Speed-up, v2 cold vs prescribed skill | 33x | 50x |
+
+Public list prices used (checked 2026-09-27): Claude Fable 5.1 $10 / MTok input, $12.50 5-min
+cache write, $0.25 cache read, $50 output; Jev 1.13 $0.042 / MTok input, output free.
+
+| | App A | App B |
+| --- | --- | --- |
+| Original skill, best case (perfect prompt caching, hidden reasoning excluded) | $30.11 | $13.24 |
+| Original skill, worst case (no caching, hidden reasoning excluded) | $254.50 | $91.46 |
+| Hybrid v2 cold (568k / 123k metered Jev input tokens, no output charge) | $0.024 | $0.005 |
+| Hybrid v2 warm | $0 | $0 |
+| Ratio, original / v2 cold | 1,260x to 10,700x | 2,560x to 17,700x |
+
+The original-skill figures are estimates, not invoices: sub-agent transcripts carry no billing
+fields, so tokens were reconstructed from the files each agent read (5.1 MB across 138 files on
+App A), an assumed 1,500 tokens per un-recorded shell/grep result, visible output, one LLM call
+per assistant step with linearly growing context, 3.5 characters per token, and a 6k-token
+system prompt. Hidden reasoning tokens at effort `high` are billed as output and are not in the
+transcript, so both bounds are low. v2's tokens are the `usage` counts Jev returns.
+
+Two runs of the original skill on the same App A tree also disagreed with each other on
+severity for the same three sends (Critical in one run; Important or discrepancy-table-only in
+the other). v2's decisions are reproducible from cache.
+
+The v1 hybrid prototype used ~78k Jev tokens on App A; v2 uses ~7x more because it classifies
+identifiers and shows the model real code. That is the trade that recovered the three missed
+Criticals, and it is still three orders of magnitude below the agent path.
+
 ## 6. Operating the evaluator
 
 ```

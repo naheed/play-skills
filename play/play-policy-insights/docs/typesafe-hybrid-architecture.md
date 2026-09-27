@@ -294,10 +294,15 @@ treated as *sharing* by policy direction.
 On the two applications v2 recovers every Critical the legacy skill found and
 v1 missed (as TRANSMITS findings plus Data Safety discrepancies), surfaces the
 dropped credential send at p=0.90, and has zero false negatives against 48
-hand-adjudicated transfer labels (23 true). Cost rose (78k -> 568k input tokens
-on the larger app, cold) because identifiers are now classified and each
-finding is asked relevance and transfer questions with real code context;
-capability labels and results are cached so a warm re-run makes zero requests.
+hand-adjudicated transfer labels (23 true). Cost rose against v1 (78k -> 568k
+input tokens on the larger app, cold) because identifiers are now classified
+and each finding is asked relevance and transfer questions with real code
+context; capability labels and results are cached so a warm re-run makes zero
+requests. Against the original agent skill run as prescribed with Claude Fable
+5.1, v2 reaches the report 33-50x sooner (34 s vs 18 min 37 s on the larger
+app) at roughly three to four orders of magnitude lower cost at public list
+prices; see the capability-based-evaluation doc §5.1 for the measurement and
+its assumptions.
 
 ## 10. Rollout
 

@@ -153,3 +153,10 @@ labels (23 true transfers) the shipped band has **zero false negatives**;
 TRANSMITS alone has precision 0.944. The label set lives outside the repository;
 the method and numbers are in the capability-based-evaluation doc §4-5 and in
 `constants.THRESHOLD_PROVENANCE`.
+
+Time to outcome and cost, measured against the original skill run as `SKILL.md`
+prescribes (Claude Fable 5.1, effort high, 3 sub-agents at a time) on the same
+trees: Phase 2 took 18 min 37 s / 8 min 23 s on the two apps at an estimated
+$30-$255 / $13-$91 per audit at public list prices; v2 took 34 s / 10 s cold
+(7.7 s / ~3 s warm) at $0.024 / $0.005 in metered Jev input tokens. Details and
+the estimation method are in the capability-based-evaluation doc §5.1.
