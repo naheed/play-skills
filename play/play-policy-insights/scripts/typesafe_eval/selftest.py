@@ -330,9 +330,10 @@ def _test_engine_offline_and_robustness() -> None:
 
 def _test_reduce_noise() -> None:
   from typesafe_eval import engine
-  # Global cap per type (4) and per-file cap (2); Play flavor prioritized.
+  from typesafe_eval import constants
+  # Global cap per type and per-file cap (2); Play flavor prioritized.
   ds = {
-      "NAME": [f"app/src/main/A{i}.kt (Pattern: name)" for i in range(6)],
+      "NAME": [f"app/src/main/A{i}.kt (Pattern: name)" for i in range(constants.MAX_FINDINGS_PER_TYPE + 2)],
       "EMAIL": ["app/src/main/B.kt (Pattern: e)", "app/src/main/B.kt (Pattern: e)",
                 "app/src/main/B.kt (Pattern: e)"],  # same file x3 -> capped to 2
       # A non-prioritized product flavor should be excluded in favor of "play".
@@ -341,7 +342,7 @@ def _test_reduce_noise() -> None:
       "ACCOUNT_DELETION": ["app/src/main/res/values-xx/strings.xml (Pattern: deactivate)"],
   }
   reduced = engine._reduce_noise(ds)
-  _check("reduce_type_cap", len(reduced["NAME"]) == 4, str(len(reduced["NAME"])))
+  _check("reduce_type_cap", len(reduced["NAME"]) == constants.MAX_FINDINGS_PER_TYPE, str(len(reduced["NAME"])))
   _check("reduce_per_file_cap", len(reduced["EMAIL"]) == 2, str(len(reduced["EMAIL"])))
   _check("reduce_flavor_excludes_nonplay",
          reduced["AUDIO"] == ["app/src/play/D.kt (Pattern: MediaRecorder)"],
@@ -434,6 +435,15 @@ def _test_structure_layer() -> None:
   scope = structure.enclosing_scope(lines, 6, "kotlin")
   _check("enclosing_scope_method", scope == (5, 9), str(scope))
   _check("package_of_dotted", structure.package_of("java.net.Socket") == "java.net")
+  _check("wildcard_import_kept", structure.import_inventory("import java.net.*;\n", "java") == ["java.net.*"]
+         and structure.package_of("java.net.*") == "java.net")
+  _check("declared_package", structure.declared_package(kt) == "a.b")
+  from typesafe_eval import engine
+  fp = engine._first_party_packages({"package_name": "wrong.lib"},  # pylint: disable=protected-access
+                                    {"x": structure.FileStructure("x", "kotlin", [], [], {}, "com.app.ui")})
+  _check("first_party_from_declared_package",
+         engine._is_first_party("com.app.ui.Foo", fp) and engine._is_first_party("com.app.ui.sub.Bar", fp)  # pylint: disable=protected-access
+         and not engine._is_first_party("com.other.Foo", fp) and engine._is_first_party("wrong.lib.X", fp))  # pylint: disable=protected-access
   _check("package_of_dart", structure.package_of("package:http/http.dart") == "package:http")
   _check("package_of_npm_scoped", structure.package_of("@scope/pkg/sub") == "@scope/pkg")
   _check("package_of_dart_core", structure.package_of("dart:io") == "dart:io")
@@ -532,12 +542,29 @@ def _test_context_anchor() -> None:
   fs2 = structure.FileStructure("B.kt", "kotlin", ["import java.net.*", "val x = 1"], ["java.net"], {})
   p2 = {"java.net": caps.CapabilityProfile("java.net", "package", {"NETWORK_EGRESS": 0.9}, ["NETWORK_EGRESS"], "model", "m")}
   _check("file_level_sink_without_refs", [s.lines for s in context.file_sinks(fs2, p2)] == [[]])
-  # Ranking: sink-in-scope first, then proximity, then scanner order.
-  a_in = context.Anchor("T", "p", [1], 1, (0, 3), 0, True)
-  a_near = context.Anchor("T", "p", [1], 1, (0, 3), 4, False)
-  a_far = context.Anchor("T", "p", [1], 1, (0, 3), None, False)
-  ranked = sorted([(a_far, 0), (a_near, 1), (a_in, 2)], key=lambda t: context.rank_key(*t))
-  _check("rank_key_order", [r[1] for r in ranked] == [2, 1, 0])
+  # Ranking: sink tier first (explicit egress > IPC > UNKNOWN > none), then
+  # proximity, then scanner order.
+  a_net = context.Anchor("T", "p", [1], 1, (0, 3), 0, True, ["NETWORK_EGRESS"])
+  a_ipc = context.Anchor("T", "p", [1], 1, (0, 3), 0, True, ["IPC_SHARING"])
+  a_unk = context.Anchor("T", "p", [1], 1, (0, 3), 0, True, ["UNKNOWN"])
+  a_near = context.Anchor("T", "p", [1], 1, (0, 3), 4, False, [])
+  a_far = context.Anchor("T", "p", [1], 1, (0, 3), None, False, [])
+  ranked = sorted([(a_far, 0), (a_near, 1), (a_unk, 2), (a_ipc, 3), (a_net, 4)],
+                  key=lambda t: context.rank_key(*t))
+  _check("rank_key_order", [r[1] for r in ranked] == [4, 3, 2, 1, 0], str([r[1] for r in ranked]))
+  _check("anchor_scope_caps_recorded", anchor.scope_capabilities == ["NETWORK_EGRESS"] and anchor.tier == 0)
+  # Within one file, an occurrence next to an explicit egress sink beats one
+  # next to an IPC sink even when both are "in scope".
+  src2 = ("import java.net.Socket\nimport android.content.Intent\n"
+          "fun share() {\n  val e = email()\n  startActivity(Intent().putExtra(\"e\", e))\n}\n"
+          "fun upload() {\n  val e = email()\n  Socket(h, 1).getOutputStream().write(e)\n}\n")
+  fs3 = structure.FileStructure("C.kt", "kotlin", src2.splitlines(),
+                                ["java.net.Socket", "android.content.Intent"],
+                                structure.symbol_references(src2.splitlines(), ["java.net.Socket", "android.content.Intent"]))
+  p3 = dict(profiles)
+  p3["android.content.Intent"] = caps.CapabilityProfile("android.content.Intent", "import", {"IPC_SHARING": 0.9}, ["IPC_SHARING"], "model", "m")
+  a3 = context.anchor_signal(fs3, "email()", "EMAIL", context.file_sinks(fs3, p3))
+  _check("anchor_prefers_egress_tier", a3.chosen == 7 and a3.tier == 0, str(a3))
 
 
 def _test_three_way_decision() -> None:
@@ -653,28 +680,46 @@ def _test_manifest_fgs() -> None:
 
 def _test_triage_ranking() -> None:
   """A candidate in a file with a labelled sink outranks scanner order."""
+  from typesafe_eval import constants
   from typesafe_eval import engine
+  cap = constants.MAX_FINDINGS_PER_TYPE
+  n = cap + 2
   with tempfile.TemporaryDirectory() as d:
     os.makedirs(os.path.join(d, "app"))
-    # Six files match; only the LAST in scanner order has a network sink.
-    for i in range(6):
+    # n files match; only the LAST in scanner order has a network sink, the
+    # second-to-last has only an IPC sink, the rest none.
+    for i in range(n):
       body = "fun f() {\n  val n = user.name\n"
-      if i == 5:
+      if i == n - 1:
         body = "import java.net.Socket\n" + body + "  Socket(h, 1).getOutputStream().write(n.toByteArray())\n"
+      elif i == n - 2:
+        body = "import android.content.Intent\n" + body + "  startActivity(Intent().putExtra(\"n\", n))\n"
       with open(os.path.join(d, f"app/F{i}.kt"), "w", encoding="utf-8") as f:
         f.write(body + "}\n")
     scratch = os.path.join(d, ".scratch")
-    _write_scratch(d, scratch, {"NAME": [f"app/F{i}.kt (Pattern: name)" for i in range(6)]})
+    _write_scratch(d, scratch, {"NAME": [f"app/F{i}.kt (Pattern: name)" for i in range(n)]})
     engine.run(scratch, HeuristicJevClient(), batched=True)
     triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
     ds = json.load(open(os.path.join(scratch, "worker_data_safety.json"), encoding="utf-8"))
     files = [(f.get("files_involved") or [""])[0] for f in ds["findings"]]
-    _check("triage_keeps_sink_file", any("F5.kt" in f for f in files), str(files))
-    _check("triage_caps_per_type", triage["counters"]["kept"] == 4, str(triage["counters"].get("kept")))
+    _check("triage_keeps_sink_file", any(f"F{n-1}.kt" in f for f in files) and any(f"F{n-2}.kt" in f for f in files), str(files))
+    _check("triage_caps_per_type", triage["counters"]["kept"] == cap, str(triage["counters"].get("kept")))
     dropped = [x for x in triage["dropped"] if "MAX_FINDINGS_PER_TYPE" in x["reason"]]
-    _check("triage_records_dropped_with_rank", len(dropped) == 2 and all("rank" in x for x in dropped), str(dropped))
-    _check("triage_sink_file_ranked_first",
-           triage["sinks_by_file"].get("app/F5.kt") and not triage["sinks_by_file"].get("app/F0.kt"))
+    _check("triage_records_dropped_with_rank",
+           len(dropped) == 2 and all("rank" in x and "tier" in x for x in dropped)
+           and all(x["tier"] == 3 for x in dropped), str(dropped))
+    _check("triage_sink_file_indexed",
+           triage["sinks_by_file"].get(f"app/F{n-1}.kt") and not triage["sinks_by_file"].get("app/F0.kt"))
+    # Tier 0 (egress) and tier 1 (IPC) both survive; the two scanner-order
+    # leaders without any sink are the ones dropped (ranks cap, cap+1).
+    _check("triage_egress_ranked_before_ipc",
+           sorted(x["rank"] for x in dropped) == [cap, cap + 1]
+           and all(f"F{n-1}.kt" not in x["finding"] and f"F{n-2}.kt" not in x["finding"] for x in dropped),
+           str([(x["finding"], x["rank"]) for x in dropped]))
+    kept_findings = [f for f in ds["findings"] if f.get("kind") != "play_declaration"]
+    tiers = {(f["files_involved"][0]): f["decision_trace"]["anchor"]["rank_tier"] for f in kept_findings}
+    _check("triage_tiers_in_trace", tiers.get(f"app/F{n-1}.kt") == 0 and tiers.get(f"app/F{n-2}.kt") == 1
+           and tiers.get("app/F0.kt") == 3, str(tiers))
     _check("triage_declared_caps_key", "dependency_capabilities" in triage)
 
 

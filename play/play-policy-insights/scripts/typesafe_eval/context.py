@@ -117,32 +117,67 @@ class Anchor:
   scope: Tuple[int, int]        # (start, end) 0-based end-exclusive
   proximity: Optional[int]      # line distance to nearest sink ref; 0 = inside scope
   sink_in_scope: bool
+  scope_capabilities: List[str] = dataclasses.field(default_factory=list)
+
+  @property
+  def tier(self) -> int:
+    """Ranking tier from the capabilities of sinks inside the anchor's scope.
+
+    0: an explicit egress capability (network, telemetry, advertising) is
+       referenced in the same function — the strongest static transfer signal.
+    1: only IPC-capable symbols are in scope. IPC *is* a transfer/sharing
+       channel by policy, but IPC-capable platform types (intents, activities,
+       content resolvers) appear in nearly every Android file, so as a *ranking*
+       signal they discriminate less than explicit egress. This affects which
+       candidates reach the model first under a cap, never how a finding is
+       judged once evaluated.
+    2: only UNKNOWN-labelled symbols are in scope.
+    3: no sink in scope (ranked by proximity to the nearest sink elsewhere).
+    """
+    scope_caps = set(self.scope_capabilities)
+    if scope_caps & set(constants.RANK_STRONG_EGRESS_CAPABILITIES):
+      return 0
+    if caps.IPC_SHARING in scope_caps:
+      return 1
+    if caps.UNKNOWN in scope_caps:
+      return 2
+    return 3
 
 
 def anchor_signal(
     fs: structure.FileStructure, pattern: str, data_type: str, sinks: Sequence[Sink]
 ) -> Anchor:
-  """Chooses the occurrence whose enclosing scope is nearest a sink reference."""
+  """Chooses the occurrence whose enclosing scope is nearest a sink reference.
+
+  Among occurrences, the one with the strongest sink tier in its own scope
+  wins; ties are broken by proximity to the nearest sink reference.
+  """
   hits = structure.all_occurrences(fs.lines, pattern)
   sink_lines = sorted({ln for s in sinks for ln in s.lines})
+  caps_by_line: Dict[int, set] = {}
+  for s in sinks:
+    for ln in s.lines:
+      caps_by_line.setdefault(ln, set()).update(s.capabilities)
   if not hits:
     return Anchor(data_type, pattern, [], None, (0, min(len(fs.lines), 2 * SHRUNK_WINDOW)),
-                  None, False)
+                  None, False, [])
 
-  best: Optional[Tuple[int, int, Tuple[int, int], Optional[int], bool]] = None
+  best: Optional[Anchor] = None
+  best_key: Optional[Tuple[int, int]] = None
   for h in hits:
     scope = structure.enclosing_scope(fs.lines, h, fs.language)
     inside = [s for s in sink_lines if scope[0] <= s < scope[1]]
+    scope_caps = sorted({c for s in inside for c in caps_by_line.get(s, ())})
     if inside:
       prox: Optional[int] = 0
     else:
       prox = structure.sink_proximity([h], sink_lines)
-    rank = prox if prox is not None else 1 << 30
-    if best is None or rank < best[0]:
-      best = (rank, h, scope, prox, bool(inside))
+    candidate = Anchor(data_type, pattern, hits, h, scope, prox, bool(inside), scope_caps)
+    key = (candidate.tier, prox if prox is not None else 1 << 30)
+    if best_key is None or key < best_key:
+      best, best_key = candidate, key
   assert best is not None
-  _, chosen, scope, prox, inside = best
-  return Anchor(data_type, pattern, hits, chosen, scope, prox, inside)
+  return best
 
 
 def _render_snippet(fs: structure.FileStructure, anchors: Sequence[Anchor], sinks: Sequence[Sink]) -> Tuple[str, List[str]]:
@@ -249,6 +284,8 @@ def build_file_state(
             "scope": [a.scope[0] + 1, a.scope[1]],
             "proximity": a.proximity,
             "sink_in_scope": a.sink_in_scope,
+            "scope_capabilities": a.scope_capabilities,
+            "tier": a.tier,
         },
         "app": app_facts,
         "permission": None,
@@ -259,6 +296,7 @@ def build_file_state(
 
 
 def rank_key(anchor: Anchor, original_index: int) -> Tuple[int, int, int]:
-  """Deterministic triage key: sink-in-scope first, then proximity, then scanner order."""
+  """Deterministic triage key: sink tier (see :attr:`Anchor.tier`), then
+  proximity to the nearest sink, then scanner order."""
   prox = anchor.proximity if anchor.proximity is not None else 1 << 30
-  return (0 if anchor.sink_in_scope else 1, prox, original_index)
+  return (anchor.tier, prox, original_index)

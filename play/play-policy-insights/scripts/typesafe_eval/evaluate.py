@@ -160,6 +160,8 @@ def _decision_trace(
           "scope": anchor.get("scope"),
           "sink_proximity": anchor.get("proximity"),
           "sink_in_scope": anchor.get("sink_in_scope"),
+          "scope_capabilities": anchor.get("scope_capabilities"),
+          "rank_tier": anchor.get("tier"),
       },
       "sinks": [
           {"symbol": s.get("symbol"), "capabilities": s.get("capabilities")} for s in sinks

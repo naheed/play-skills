@@ -223,15 +223,28 @@ def _drop(ctx: Optional[RunContext], data_type: str, finding_str: str, reason: s
 # ---------------------------------------------------------------------------
 
 
-def _first_party_prefixes(manifest: Dict[str, Any]) -> Tuple[str, ...]:
-  """Import prefixes that are the app's own code (never a third-party sink).
+def _first_party_packages(
+    manifest: Dict[str, Any], files: Dict[str, structure.FileStructure]
+) -> Tuple[str, ...]:
+  """Packages that are the app's own code (never classified as a sink).
 
-  Only the manifest package is used. Sibling first-party libraries under a
-  different namespace are deliberately *not* excluded: whether they transmit is
-  exactly the question the semantic layer should answer.
+  Two deterministic sources, both language-level facts rather than guesses:
+  the manifest package (may be wrong when ``init`` picked up a library
+  manifest) and every ``package`` declared by an analysed source file. An
+  import is first-party when it *is* one of these packages, sits directly in
+  one (``package_of(import)`` matches), or lies beneath one (``pkg.``). Sibling
+  first-party libraries under an unrelated namespace are deliberately *not*
+  excluded: whether they transmit is exactly the question the semantic layer
+  should answer.
   """
-  pkg = (manifest.get("package_name") or "").strip()
-  return (pkg,) if pkg else ()
+  pkgs = {(manifest.get("package_name") or "").strip()}
+  pkgs.update(fs.package for fs in files.values() if fs.package)
+  return tuple(sorted(p for p in pkgs if p))
+
+
+def _is_first_party(mod: str, packages: Sequence[str]) -> bool:
+  pkg = structure.package_of(mod)
+  return any(mod == p or pkg == p or mod.startswith(p + ".") for p in packages)
 
 
 def _analyze_files(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> None:
@@ -259,15 +272,19 @@ def _classify_semantics(
   capable or UNKNOWN are refined to class level, where the profile actually
   drives sink detection and proximity ranking.
   """
-  first_party = _first_party_prefixes(ctx.manifest)
+  first_party = _first_party_packages(ctx.manifest, ctx.files)
   imports: List[str] = []
+  skipped_first_party = 0
   for fs in ctx.files.values():
     for mod in fs.imports:
-      if any(mod == p or mod.startswith(p + ".") for p in first_party):
+      if _is_first_party(mod, first_party):
+        skipped_first_party += 1
         continue
       if mod not in imports:
         imports.append(mod)
   packages = sorted({structure.package_of(m) for m in imports})
+  ctx.counters["first_party_packages"] = list(first_party)
+  ctx.counters["imports_first_party_skipped"] = skipped_first_party
   ctx.counters["imports_third_party"] = len(imports)
   ctx.counters["packages"] = len(packages)
 
@@ -351,8 +368,9 @@ def _triage(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> Dict[str
       elif per_file.get(c.relpath, 0) >= constants.MAX_PER_FILE_PER_TYPE:
         why = f"over MAX_PER_FILE_PER_TYPE={constants.MAX_PER_FILE_PER_TYPE}"
       if why:
-        _drop(ctx, data_type, c.finding_str, why, rank=rank,
-              sink_in_scope=c.anchor.sink_in_scope, proximity=c.anchor.proximity)
+        _drop(ctx, data_type, c.finding_str, why, rank=rank, tier=c.anchor.tier,
+              sink_in_scope=c.anchor.sink_in_scope, proximity=c.anchor.proximity,
+              scope_capabilities=c.anchor.scope_capabilities)
         continue
       out.append(c)
       per_file[c.relpath] = per_file.get(c.relpath, 0) + 1

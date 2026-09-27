@@ -247,9 +247,10 @@ def dependency_inventory(app_dir: str) -> List[Dependency]:
 # ---------------------------------------------------------------------------
 
 _IMPORT_PATTERNS: Dict[str, re.Pattern] = {
-    # import a.b.C; / import a.b.C as D / import a.b.*
-    "java": re.compile(r"^\s*import\s+(?:static\s+)?(?P<mod>[\w.]+?)(?:\.\*)?\s*;", re.M),
-    "kotlin": re.compile(r"^\s*import\s+(?P<mod>[\w.]+?)(?:\.\*)?(?:\s+as\s+\w+)?\s*$", re.M),
+    # import a.b.C; / import a.b.C as D / import a.b.*  (the wildcard is kept so
+    # ``package_of`` sees ``a.b.*`` as belonging to package ``a.b``, not ``a``)
+    "java": re.compile(r"^\s*import\s+(?:static\s+)?(?P<mod>[\w.]+?(?:\.\*)?)\s*;", re.M),
+    "kotlin": re.compile(r"^\s*import\s+(?P<mod>[\w.]+?(?:\.\*)?)(?:\s+as\s+\w+)?\s*$", re.M),
     # import 'package:foo/bar.dart'; import 'dart:io';
     "dart": re.compile(r"^\s*import\s+['\"](?P<mod>[^'\"]+)['\"]", re.M),
     # import x from 'mod'; import 'mod'; require('mod')
@@ -311,6 +312,21 @@ def package_of(module_path: str) -> str:
   if "." in mod:
     return mod.rsplit(".", 1)[0]
   return mod
+
+
+_PACKAGE_DECL_RE = re.compile(r"^\s*(?:package|namespace)\s+(?P<pkg>[\w.]+)\s*;?\s*$", re.M)
+
+
+def declared_package(content: str) -> str:
+  """The file's own ``package``/``namespace`` declaration, or ``""``.
+
+  Used to recognise first-party imports without trusting the manifest alone:
+  an import whose package is declared by any analysed source file is the app's
+  own code, whose behaviour the finding battery judges from the snippet rather
+  than from the semantic layer.
+  """
+  m = _PACKAGE_DECL_RE.search(content)
+  return m.group("pkg") if m else ""
 
 
 def simple_name(module_path: str) -> str:
@@ -576,6 +592,7 @@ class FileStructure:
   lines: List[str]
   imports: List[str]
   references: Dict[str, List[int]]
+  package: str = ""
 
   @property
   def line_count(self) -> int:
@@ -589,6 +606,7 @@ def analyze_file(app_dir: str, relpath: str) -> FileStructure:
   lines = content.splitlines()
   imports = import_inventory(content, language)
   refs = symbol_references(lines, imports)
-  log.debug("analyze_file %s: lang=%s lines=%d imports=%d referenced=%d",
-            relpath, language, len(lines), len(imports), len(refs))
-  return FileStructure(relpath, language, lines, imports, refs)
+  package = declared_package(content) if language in ("java", "kotlin", "csharp") else ""
+  log.debug("analyze_file %s: lang=%s lines=%d imports=%d referenced=%d package=%s",
+            relpath, language, len(lines), len(imports), len(refs), package)
+  return FileStructure(relpath, language, lines, imports, refs, package)

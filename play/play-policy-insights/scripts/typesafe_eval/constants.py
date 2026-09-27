@@ -42,17 +42,25 @@ DEFAULT_MODEL = "jev-1.13.0"
 
 PRIORITIZED_FLAVORS = ("main", "play")
 MAX_PER_FILE_PER_TYPE = 2   # at most N findings of one data type from one file
-MAX_FINDINGS_PER_TYPE = 4   # global cap per data type, after ranking (see below)
+MAX_FINDINGS_PER_TYPE = 8   # global cap per data type, after ranking (see below)
 
 # Cascade (two-stage triage). Stage 1 is deterministic and cheap: every raw
-# signal (up to MAX_CANDIDATES_PER_TYPE, a pure cost bound) is ranked by whether
-# its file references a transfer-capable symbol and how close the nearest such
-# reference is to the hit. Stage 2 sends only the top MAX_FINDINGS_PER_TYPE per
-# data type to the full model battery. This replaces the previous "first N in
-# scanner order" cap, which dropped real sinks in favour of log lines.
+# signal (up to MAX_CANDIDATES_PER_TYPE, a pure cost bound) is ranked by the
+# capability tier of the sinks inside the hit's own scope, then by how close the
+# nearest sink reference is. Stage 2 sends only the top MAX_FINDINGS_PER_TYPE
+# per data type to the full model battery. This replaces the previous "first N
+# in scanner order" cap, which dropped real sinks in favour of log lines.
+# MAX_FINDINGS_PER_TYPE was raised from 4 to 8 after live runs measured the
+# whole battery stage at well under a minute per app: recall is the charter's
+# first priority and the cost lever is cheap.
 MAX_CANDIDATES_PER_TYPE = 40
 SINK_SCOPE_BONUS_LINES = 0     # proximity 0 == sink reference inside the hit's own scope
 MAX_ASKS_PER_REQUEST = 6       # batched mode: asks (data types) per file request
+
+# Ranking tier 0 (see context.Anchor.tier): explicit egress capabilities. IPC is
+# still a transfer/sharing capability for *judgment*; it is only ranked below
+# these because IPC-capable platform types appear in nearly every Android file.
+RANK_STRONG_EGRESS_CAPABILITIES = ("NETWORK_EGRESS", "THIRD_PARTY_TELEMETRY", "ADVERTISING_SDK")
 
 # ---------------------------------------------------------------------------
 # Evaluator identity. Recorded on every finding's decision trace so a report can
