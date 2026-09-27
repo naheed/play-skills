@@ -818,8 +818,182 @@ def _test_triage_diff() -> None:
     _check("triage_diff_renders", "+1 -1 ~1" in triage_diff.render(rep))
 
 
+_MANIFEST_MAIN = """\ufeff<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-sdk android:minSdkVersion="24" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="28" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission-sdk-23 android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-feature android:name="android.hardware.telephony" android:required="false" />
+    <queries>
+        <package android:name="com.example.other" />
+        <intent><action android:name="android.intent.action.SEND" /></intent>
+    </queries>
+    <application android:name=".App" android:label="@string/app_name"
+        android:requestLegacyExternalStorage="true">
+        <meta-data android:name="app.meta" android:value="1" />
+        <activity android:name=".Main" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity android:name=".Compose">
+            <intent-filter>
+                <action android:name="android.intent.action.SENDTO" />
+                <data android:scheme="smsto" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+        <service android:name=".Typeless" />
+        <service android:name=".Typed" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="vpn" />
+        </service>
+        <service android:name=".A11y" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice" android:resource="@xml/a11y" />
+        </service>
+        <receiver android:name=".Sms">
+            <intent-filter>
+                <action android:name="android.provider.Telephony.SMS_RECEIVED" />
+            </intent-filter>
+        </receiver>
+        <provider android:name="lib.InitProvider" android:authorities="${applicationId}.init" />
+    </application>
+</manifest>
+"""
+
+_MANIFEST_PLAY = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <application android:name=".AppPlay" tools:replace="android:name">
+        <provider android:name="lib.InitProvider" android:authorities="x" tools:node="remove" />
+        <service android:name=".Typed" android:foregroundServiceType="dataSync" />
+    </application>
+</manifest>
+"""
+
+_MANIFEST_FULL = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <service android:name=".FullOnly" />
+    </application>
+</manifest>
+"""
+
+
+def _test_app_profile() -> None:
+  """WP1: evaluator-owned manifest parsing and source-set merge."""
+  from typesafe_eval import android_manifest as am
+  with tempfile.TemporaryDirectory() as d:
+    def write(rel, text):
+      p = os.path.join(d, rel)
+      os.makedirs(os.path.dirname(p), exist_ok=True)
+      with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+    write("app/src/main/AndroidManifest.xml", _MANIFEST_MAIN)
+    write("app/src/play/AndroidManifest.xml", _MANIFEST_PLAY)
+    write("app/src/full/AndroidManifest.xml", _MANIFEST_FULL)
+    write("app/src/androidTest/AndroidManifest.xml", "<manifest><uses-permission /></manifest>")
+    write("app/src/main/res/values/strings.xml",
+          '<resources><string name="app_name">Demo App</string></resources>')
+    write("app/src/main/res/xml/a11y.xml",
+          '<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android" '
+          'android:isAccessibilityTool="true" />')
+    write("app/build.gradle.kts",
+          'android {\n  namespace = "com.demo"\n  defaultConfig {\n    applicationId = "com.demo"\n'
+          '    minSdk = 24\n    targetSdk = 35\n  }\n  // targetSdk = 99 (comment must not count)\n}\n')
+    # A library module with its own manifest must not be merged.
+    write("lib/src/main/AndroidManifest.xml",
+          '<manifest xmlns:android="http://schemas.android.com/apk/res/android">'
+          '<uses-permission android:name="android.permission.CAMERA" /></manifest>')
+    # A malformed flavor manifest degrades to a warning, not a crash.
+    write("app/src/tv/AndroidManifest.xml", "<manifest><application></manifest>")
+
+    p = am.load_profile(d, {"package_name": "wrong.pkg", "target_sdk": 34,
+                            "permissions": ["android.permission.INTERNET"]})
+    _check("profile_primary_module", p.module_root == "app" and p.other_modules == ["lib"],
+           f"{p.module_root} {p.other_modules}")
+    _check("profile_gradle_package_and_sdk",
+           p.package_name == "com.demo" and p.target_sdk == 35 and p.min_sdk == 24
+           and p.sdk_provenance["target_sdk"].startswith("gradle:"), str(p.sdk_provenance))
+    _check("profile_source_sets_main_first", p.source_sets[0] == "main" and "play" in p.source_sets
+           and "androidTest" not in p.source_sets, str(p.source_sets))
+    _check("profile_library_not_merged", not p.has_permission("CAMERA"))
+    internet = p.permission("INTERNET")
+    _check("profile_duplicate_permission_two_sources",
+           internet is not None and internet.sources == ["main", "play"], str(internet))
+    _check("profile_permission_max_sdk", p.permission("WRITE_EXTERNAL_STORAGE").max_sdk == 28)
+    _check("profile_permission_sdk23", p.permission("POST_NOTIFICATIONS").sdk23_only is True)
+    _check("profile_flavor_only_permission",
+           p.permission("QUERY_ALL_PACKAGES").sources == ["play"])
+    _check("profile_tools_replace_wins",
+           p.application.get("name") == "com.demo.AppPlay" and p.application_sources["name"] == "play",
+           str(p.application))
+    _check("profile_label_resolved", p.application.get("label") == "Demo App"
+           and p.application.get("label_resource") == "@string/app_name", str(p.application))
+    _check("profile_legacy_storage_flag", p.application.get("request_legacy_external_storage") is True)
+    typeless = [s.name for s in p.services_without_fgs_type()]
+    _check("profile_typeless_service_present", "com.demo.Typeless" in typeless, str(typeless))
+    typed = next(s for s in p.services if s.name == "com.demo.Typed")
+    _check("profile_fgs_types_union_and_property",
+           set(typed.fgs_types) == {"specialUse", "dataSync"}
+           and typed.properties.get("android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE") == "vpn",
+           str(typed.to_dict()))
+    removed = next(c for c in p.components if c.name == "lib.InitProvider")
+    _check("profile_tools_node_remove", removed.removed_in == ["play"] and removed.is_active is True
+           and not p.ships_in_play_build(removed), str(removed.to_dict()))
+    _check("profile_authority_placeholder", removed.authorities == ["com.demo.init"], str(removed.authorities))
+    full_only = next(c for c in p.components if c.name == "com.demo.FullOnly")
+    _check("profile_flavor_only_component_not_in_play_build",
+           full_only.is_active and not p.ships_in_play_build(full_only)
+           and "com.demo.FullOnly" in p.summary()["flavor_only_components"])
+    _check("profile_launcher", [c.name for c in p.launcher_activities()] == ["com.demo.Main"])
+    roles = p.default_handler_roles()
+    _check("profile_sms_role_from_smsto", roles.get("sms") == ["com.demo.Compose"], str(roles))
+    _check("profile_sms_receiver", [c.name for c in p.sms_receivers()] == ["com.demo.Sms"])
+    _check("profile_file_handling", [c.name for c in p.file_handling_activities()] == ["com.demo.Compose"])
+    _check("profile_accessibility_tool_flag",
+           len(p.accessibility_services) == 1 and p.accessibility_services[0].is_accessibility_tool is True
+           and p.accessibility_services[0].config_path.endswith("res/xml/a11y.xml"),
+           str([a.to_dict() for a in p.accessibility_services]))
+    _check("profile_queries", p.queries["packages"] == ["com.example.other"]
+           and p.queries["intents"] == ["android.intent.action.SEND"], str(p.queries))
+    _check("profile_features", p.features.get("android.hardware.telephony") is False)
+    _check("profile_meta_data", p.meta_data.get("app.meta") == "1")
+    _check("profile_malformed_manifest_is_warning",
+           any("tv/AndroidManifest.xml" in w and "parse error" in w for w in p.warnings)
+           and "app/src/tv/AndroidManifest.xml" not in p.manifests, str(p.warnings))
+    _check("profile_cross_check_warns_on_package_disagreement",
+           any("package_name disagreement" in w for w in p.warnings), str(p.warnings))
+    digest = p.render_compact()
+    _check("profile_render_compact_stable", digest == p.render_compact()
+           and "QUERY_ALL_PACKAGES (from=play)" in digest and "flavor-only=full" in digest, digest)
+    json.dumps(p.to_dict())  # JSON-safe for the triage record.
+
+    # No manifest at all: fallback-only profile, no crash.
+    os.makedirs(os.path.join(d, "bare"))
+    empty = am.load_profile(os.path.join(d, "bare"), {"package_name": "fb.pkg", "target_sdk": 33,
+                                                      "permissions": ["android.permission.CAMERA"]})
+    _check("profile_fallback_only", empty.manifests == [] and empty.package_name == "fb.pkg"
+           and empty.target_sdk == 33 and empty.has_permission("CAMERA")
+           and empty.sdk_provenance["package_name"] == "manifest_details.json", str(empty.summary()))
+    missing = am.load_profile(os.path.join(d, "nope"), {})
+    _check("profile_missing_app_dir", missing.manifests == [] and missing.warnings)
+
+
 def main() -> int:
   _test_triage_diff()
+  _test_app_profile()
   _test_parse_finding()
   _test_snippet_and_colocation()
   _test_templates()

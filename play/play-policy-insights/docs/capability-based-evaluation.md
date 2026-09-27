@@ -102,6 +102,51 @@ import inventory, the declared `package`/`namespace`, and helpers over the line 
 
 Wildcard imports (`import foo.bar.*`) are preserved so the package can still be classified.
 
+#### 3.1.1 App profile (`android_manifest.py`, `resources.py`) — added in WP1
+
+The orchestrator's `manifest_details.json` records only a handful of facts (package,
+target SDK, permission names, services that *have* a `foregroundServiceType`), and the
+orchestrator is read-only for this work. The evaluator therefore parses the manifests itself,
+once per run, into an `AppProfile` stored on `RunContext.profile`:
+
+- **Module discovery.** Every `AndroidManifest.xml` (skipping `IGNORED_DIR_NAMES` and test
+  source sets) is grouped by module root (the prefix before `/src/`). The primary module is
+  the one whose manifest declares a LAUNCHER activity, then the one with most components;
+  other modules (benchmarks, libraries) are logged in `other_modules` and never merged, so a
+  library manifest cannot inject permissions or components.
+- **Source-set merge with attribution.** `src/main` first, then flavors and build types in
+  sorted order. Every permission and component carries `sources` (the source sets that
+  declared it) and `removed_in` (`tools:node="remove"`). Attribute conflicts follow the
+  Gradle manifest merger: `main` wins unless the flavor's `<application>` lists the
+  attribute in `tools:replace`. `AppProfile.ships_in_play_build(entry)` applies the same
+  flavor rule as candidate filtering (`main` + `play` when a `play` flavor exists), so a
+  component declared only in a non-Play flavor is visible as such rather than silently
+  merged in.
+- **Facts that `manifest_details.json` lacks.** Services *without* a
+  `foregroundServiceType`, `<property>` sub-tags (special-use FGS subtype), `<queries>`,
+  `maxSdkVersion` / `minSdkVersion` / `usesPermissionFlags` on permissions,
+  `requestLegacyExternalStorage` and similar `<application>` flags, exported state,
+  intent filters, app- and component-level `<meta-data>`, `<uses-feature>`, and the
+  `isAccessibilityTool` flag read from the accessibility service's `res/xml` config.
+- **Provenance.** Modern projects keep `namespace`/`applicationId`/`targetSdk` in Gradle,
+  so the module's `build.gradle(.kts)` is scanned for numeric/quoted literals (comments
+  stripped); the manifest's `package` and `<uses-sdk>` come next; `manifest_details.json`
+  is the last fallback. `sdk_provenance` records the source of each value and any
+  disagreement with the orchestrator is logged at WARNING and kept in `warnings`.
+- **Derived platform facts (no policy judgement).** `launcher_activities()`,
+  `default_handler_roles()` (SMS / dialer / assistant / home / telecom roles from
+  framework intent constants), `sms_receivers()`, `file_handling_activities()`,
+  `services_without_fgs_type()`, `exported_components()`.
+- **Observability.** `AppProfile.summary()` is written to
+  `typesafe_triage.json["app_profile"]`; counters `manifests_merged`, `manifest_warnings`,
+  `manifest_other_modules` are recorded. A parse failure in one flavor manifest degrades to
+  a warning and a partial profile; a total failure falls back to `manifest_details.json`
+  and never aborts a run.
+
+`resources.py` indexes the default-locale `res/values/*.xml` strings and `res/xml/` paths so
+`@string/` labels (and, from WP8, disclosure wording referenced as `R.string.x`) resolve to
+text.
+
 ### 3.2 Semantic layer (`capabilities.py`)
 
 The taxonomy (`TAXONOMY_VERSION = "1"`) is behavioural and vendor-free:

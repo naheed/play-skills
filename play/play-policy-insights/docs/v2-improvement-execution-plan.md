@@ -102,6 +102,35 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
   finding changes (this WP only adds facts).
 - **Size.** One new module (~400 lines), small edits to `engine.py`,
   `evaluate.py`, `context.py`.
+- **Outcome (done).** `android_manifest.py` + `resources.py` (the
+  default-locale string/xml index was split out because WP4/WP8 reuse it).
+  Deliberate deviations from the text above:
+  - The profile is **not** placed in `app_facts` yet. Doing so changes every
+    model-facing state (capability-cache misses, answer drift) and would
+    violate this WP's "no finding changes" exit; only a short `purpose` line
+    is added to `app_facts` in WP4. The profile lives on `RunContext.profile`
+    and its `summary()` is written to `typesafe_triage.json["app_profile"]`.
+  - Modern projects keep `namespace` / `applicationId` / `targetSdk` in
+    Gradle, so the module's `build.gradle(.kts)` is scanned for *literals*
+    (comments stripped) before falling back to `manifest_details.json`.
+    Every value carries `sdk_provenance`. On App B this exposed that the
+    orchestrator's `package_name` is a library's namespace; the profile logs
+    the disagreement and keeps the Gradle value. `engine._first_party_packages`
+    still reads the orchestrator value in this WP (switching it changes
+    first-party classification and therefore findings; tracked for WP2's
+    triage-diff).
+  - Added `AppProfile.ships_in_play_build(entry)` mirroring the engine's
+    flavor rule (`main` + `play` when a `play` flavor exists), because App A's
+    accessibility service is declared only in the non-Play `full`/`tv`
+    flavors — exactly the attribution WP12 needs to avoid a false Critical.
+  - Exit re-checked against the dev apps: App A has three services *without*
+    a `foregroundServiceType`, but all are bound services (tile, locale
+    holder, accessibility), not foreground services. A "typeless FGS" cannot
+    be decided from the manifest alone; WP5 pairs the manifest fact with the
+    `startForeground` code signal in the same class before raising Critical.
+    App B's commented-out `maxSdkVersion` is correctly absent; its
+    `MANAGE_EXTERNAL_STORAGE minSdkVersion=30` is captured.
+  - `triage-diff` vs baseline on both dev apps: identical (60 → 60, 45 → 45).
 
 ### WP2 — Identifier-boundary lexical pre-gate (L1)
 
@@ -447,8 +476,8 @@ touching the rest of the cascade.
 
 ## 5. Tracking checklist
 
-- [ ] WP0 baseline + `triage-diff`
-- [ ] WP1 `android_manifest.py` / `AppProfile`
+- [x] WP0 baseline + `triage-diff`
+- [x] WP1 `android_manifest.py` / `AppProfile`
 - [ ] WP2 identifier-boundary pre-gate
 - [ ] WP3 structured evidence
 - [ ] WP4 `declared_core_purpose` (per-app cache)

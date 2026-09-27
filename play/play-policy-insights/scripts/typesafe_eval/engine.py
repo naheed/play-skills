@@ -19,7 +19,10 @@ fixed cascade (see ``docs/capability-based-evaluation.md``):
 
 1. **Load** the *raw* deterministic artifacts ``orchestrator.py init`` produced
    (``data_safety_scan.json``, ``manifest_details.json``,
-   ``play_store_info.json``).
+   ``play_store_info.json``) and build the evaluator-owned
+   :class:`~typesafe_eval.android_manifest.AppProfile` by parsing and merging
+   the app's own ``AndroidManifest.xml`` files (``manifest_details.json`` is
+   the fallback for ``package_name`` / ``target_sdk``).
 2. **Filter candidates** (deterministic, free): prioritize the Play build
    flavor, drop string-catalog resources, bound each data type at
    ``MAX_CANDIDATES_PER_TYPE`` raw signals.
@@ -60,6 +63,7 @@ from typing import Optional
 from typing import Sequence
 from typing import Tuple
 
+from typesafe_eval import android_manifest
 from typesafe_eval import capabilities as caps
 from typesafe_eval import constants
 from typesafe_eval import context
@@ -114,6 +118,11 @@ class RunContext:
   app_dir: str
   app_facts: Dict[str, Any]
   manifest: Dict[str, Any]
+  # Evaluator-owned merged manifest facts (WP1). ``None`` only in unit tests
+  # that construct a context by hand; ``run()`` always builds one. Not part of
+  # the model-facing ``app_facts`` so request states (and the capability cache)
+  # are unchanged by its presence.
+  profile: Optional[android_manifest.AppProfile] = None
   files: Dict[str, structure.FileStructure] = dataclasses.field(default_factory=dict)
   profiles: Dict[str, caps.CapabilityProfile] = dataclasses.field(default_factory=dict)
   dependency_profiles: Dict[str, caps.CapabilityProfile] = dataclasses.field(default_factory=dict)
@@ -150,6 +159,26 @@ def load_artifacts(temp_dir: str):
       "store_category": store.get("category"),
   }
   return data_sources, manifest, app_facts, app_dir
+
+
+def _load_profile(ctx: RunContext) -> android_manifest.AppProfile:
+  """Builds the merged manifest profile; never raises.
+
+  A profile failure must not abort a run (recall first): the fallback profile
+  is built from ``manifest_details.json`` alone and the failure is recorded in
+  the triage counters so a reviewer can see the manifest layer was degraded.
+  """
+  try:
+    profile = android_manifest.load_profile(ctx.app_dir, ctx.manifest)
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    log.exception("manifest profile failed; continuing with manifest_details.json only")
+    profile = android_manifest.AppProfile(app_dir=ctx.app_dir)
+    profile.warnings.append(f"profile build failed: {type(exc).__name__}: {exc}")
+    android_manifest._apply_fallback(profile, ctx.manifest)  # pylint: disable=protected-access
+  ctx.counters["manifests_merged"] = len(profile.manifests)
+  ctx.counters["manifest_warnings"] = len(profile.warnings)
+  ctx.counters["manifest_other_modules"] = list(profile.other_modules)
+  return profile
 
 
 # ---------------------------------------------------------------------------
@@ -717,6 +746,10 @@ def _write_triage(ctx: RunContext, findings_by_goal, client: JevClient) -> str:
                 "input_tokens": client.total_input_tokens,
                 "output_tokens": client.total_output_tokens},
       "dropped": ctx.dropped,
+      # WP1: the merged manifest facts every manifest-kind policy reads from.
+      # Recorded so a reviewer can audit *which* source sets and modules were
+      # merged and what the parser could not resolve.
+      "app_profile": ctx.profile.summary() if ctx.profile is not None else None,
   }
   path = os.path.join(ctx.temp_dir, TRIAGE_FILENAME)
   with open(path, "w", encoding="utf-8") as f:
@@ -755,6 +788,7 @@ def run(
   ctx.counters["model"] = model
   log.info("run: app=%s package=%s app_dir=%s client=%s batched=%s",
            app_facts.get("name"), app_facts.get("package"), app_dir, client.name, batched)
+  ctx.profile = _load_profile(ctx)
 
   candidates = _filter_candidates(data_sources, ctx)
   _analyze_files(ctx, candidates)
