@@ -71,7 +71,9 @@ quality dimensions and bars, and
 for the plan to reach parity across all policies and select models. The
 per-policy expansion plan and the generalisations mined from the legacy-skill
 runs are in
-[`../../docs/legacy-skill-lessons-and-coverage-plan.md`](../../docs/legacy-skill-lessons-and-coverage-plan.md).
+[`../../docs/legacy-skill-lessons-and-coverage-plan.md`](../../docs/legacy-skill-lessons-and-coverage-plan.md);
+the work packages and milestone gates that implement them are in
+[`../../docs/v2-improvement-execution-plan.md`](../../docs/v2-improvement-execution-plan.md).
 
 ## Files
 

@@ -18,7 +18,9 @@ It complements, and does not replace,
 [policy-coverage-evolution.md](policy-coverage-evolution.md) (the porting
 recipe and parity methodology) and the
 [evaluation charter](evaluation-charter.md) (Recall > Precision > Calibration >
-Latency > Cost). Where the two documents overlap, this one is the more specific
+Latency > Cost). The sequenced work packages, milestone gates and
+cross-cutting rules that implement this document are in
+[v2-improvement-execution-plan.md](v2-improvement-execution-plan.md). Where the two documents overlap, this one is the more specific
 and more recent plan.
 
 Naming: the two development apps are referred to as **App A** (a
