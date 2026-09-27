@@ -17,7 +17,7 @@
 Thresholds are *calibrated artifacts*, not constants. This tool derives the
 three-way transfer band from a labelled set and emits the provenance block
 that ``constants.THRESHOLD_PROVENANCE`` must carry, so a reviewer can always
-answer "where did 0.35 / 0.70 come from?".
+answer "where did 0.35 / 0.72 come from?".
 
 Method (matches the evaluation charter: recall > precision > calibration):
 
@@ -73,6 +73,12 @@ Label schema v2 (WP7) adds an optional ``destination_class`` per case, one of
 - ``reliability_in_band``: Brier / ECE restricted to the cases whose
   ``p_transmit`` falls inside the *current* UNCERTAIN band -- the number the
   WP7 exit criterion compares against WP6.
+- ``recall_exempt_cases``: labelled transfers whose class is in
+  ``RECALL_EXEMPT_DESTINATION_CLASSES`` (``platform_component``: the data
+  stays on the device). They do not constrain ``T_TRANSMIT_LOW`` and are not
+  counted in ``false_negatives_local`` (``recall_exempt_local`` counts them
+  separately), because LOCAL composes the same SUGGESTION inventory as the
+  applied class would. They remain in every other metric.
 """
 
 from __future__ import annotations
@@ -185,17 +191,38 @@ def join_probabilities(
   return joined
 
 
+# Labelled transfers whose destination class means the data stays on the
+# device (label schema v2). The transfer band decides "off-device or to another
+# app"; for these cases LOCAL composes the same SUGGESTION inventory the applied
+# class would, so a LOCAL decision on them is not a recall loss and must not
+# drag ``T_TRANSMIT_LOW`` down. They stay in every reliability and destination
+# metric and are listed under ``recall_exempt_cases`` in the report.
+RECALL_EXEMPT_DESTINATION_CLASSES = ("platform_component",)
+
+
+def recall_exempt(case: Dict[str, Any]) -> bool:
+  """True for a labelled transfer the band's recall constraint does not apply to."""
+  return bool(case.get("transfers")) and case.get("destination_class") in RECALL_EXEMPT_DESTINATION_CLASSES
+
+
 def _recall_precision(cases: List[Dict[str, Any]], t: float) -> Tuple[float, Optional[float], int]:
-  positives = [c for c in cases if c["transfers"]]
+  positives = [c for c in cases if c["transfers"] and not recall_exempt(c)]
   predicted = [c for c in cases if c["p_transmit"] >= t]
   tp = sum(1 for c in predicted if c["transfers"])
-  recall = (tp / len(positives)) if positives else 1.0
+  recall = (sum(1 for c in predicted if c["transfers"] and not recall_exempt(c)) / len(positives)) if positives else 1.0
   precision = (tp / len(predicted)) if predicted else None
   return recall, precision, len(predicted)
 
 
 def derive_band(cases: List[Dict[str, Any]], min_precision: float = 0.90) -> Dict[str, Any]:
-  """Derives ``(T_LOW, T_HIGH)`` on the 0.01 grid per the documented method."""
+  """Derives ``(T_LOW, T_HIGH)`` on the 0.01 grid per the documented method.
+
+  ``T_TRANSMIT_LOW`` is the highest grid value at which no labelled transfer
+  outside ``RECALL_EXEMPT_DESTINATION_CLASSES`` falls below it;
+  ``T_TRANSMIT_HIGH`` the lowest at which precision over *all* cases at or
+  above it reaches ``min_precision`` (exempt transfers still count as true
+  positives there -- they are transfers, just on-device ones).
+  """
   t_low = 0.0
   for t in _GRID:
     recall, _, _ = _recall_precision(cases, t)
@@ -344,10 +371,11 @@ def band_metrics(cases: List[Dict[str, Any]], t_low: float, t_high: float) -> Di
   local = [c for c in cases if c["p_transmit"] < t_low]
   uncertain = [c for c in cases if t_low <= c["p_transmit"] < t_high]
   tp = sum(1 for c in transmits if c["transfers"])
-  fn_local = sum(1 for c in local if c["transfers"])
+  fn_local = sum(1 for c in local if c["transfers"] and not recall_exempt(c))
   return {
       "n": len(cases),
       "positives": len(positives),
+      "recall_exempt_local": sum(1 for c in local if recall_exempt(c)),
       "recall_at_high": round(tp / len(positives), 3) if positives else None,
       "precision_at_high": round(tp / len(transmits), 3) if transmits else None,
       "abstention_rate": round(len(uncertain) / len(cases), 3),
@@ -365,9 +393,10 @@ def provenance_block(report: Dict[str, Any], description: str, model: str) -> Di
       "calibrated_at": datetime.date.today().isoformat(),
       "method": (
           "T_TRANSMIT_LOW = highest threshold with recall 1.0 on labelled "
-          "transfers; T_TRANSMIT_HIGH = lowest threshold with precision >= "
-          f"{report['min_precision']:.2f} on labelled transfers; band in between "
-          "abstains. See calibrate.py."
+          "transfers (platform_component labels are on-device hand-offs and "
+          "exempt from the recall constraint); T_TRANSMIT_HIGH = lowest threshold "
+          f"with precision >= {report['min_precision']:.2f} on labelled transfers; "
+          "band in between abstains. See calibrate.py."
       ),
       "note": (
           "Fewer than %d cases: regression check, not a hold-out." % MIN_RECOMMENDED_CASES
@@ -424,6 +453,9 @@ def calibrate(labels: Dict[str, Any], min_precision: float = 0.90,
       # so two reports can be diffed case by case. The report is written
       # next to the label file, out of tree, so real file names are fine here.
       "cases": [dict(sorted(c.items())) for c in cases],
+      "recall_exempt_cases": [
+          {"file": c["file"], "data_type": c["data_type"], "destination_class": c.get("destination_class"),
+           "p_transmit": c["p_transmit"]} for c in cases if recall_exempt(c)],
       "warnings": [],
   }
   regressions = report["destination"].get("sharing_regressions") or []

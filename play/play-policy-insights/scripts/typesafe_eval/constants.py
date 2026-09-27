@@ -88,7 +88,12 @@ RANK_STRONG_EGRESS_CAPABILITIES = ("NETWORK_EGRESS", "THIRD_PARTY_TELEMETRY", "A
 # that produced it. Bump on any change to those inputs.
 # ---------------------------------------------------------------------------
 
-EVALUATOR_VERSION = "2.0.0-capability"
+# 2.1.0 (M2): question wording changed (WP2 relevance MIME clause, WP6
+# ``callees`` clause, WP7 ``destination_class`` Choice replacing the
+# ``is_third_party`` Noul), ``T_TRANSMIT_HIGH`` 0.70 -> 0.72 from the rejoined
+# dev set, label schema v2. Cached answers keyed on the old wording are simply
+# re-asked; the version on a finding says which wording produced it.
+EVALUATOR_VERSION = "2.1.0-capability"
 
 # Path fragments whose files are string catalogs / UI text, not behavior. A
 # generic pattern like "deactivate" or "record" matching a localized
@@ -203,7 +208,7 @@ MAX_SINK_LINES_IN_STATE = 8     # sink-reference lines appended to a file's snip
 # silently downgraded to a local-only suggestion. The old single cliff at 0.55
 # turned 0.52/0.54 answers on real transmissions into "Compliant".
 T_TRANSMIT_LOW = 0.35
-T_TRANSMIT_HIGH = 0.70
+T_TRANSMIT_HIGH = 0.72
 T_TRANSMIT = T_TRANSMIT_HIGH  # backwards-compatible alias used by the eval harness
 
 T_RELEVANCE = 0.30         # drop a signal when P(snippet handles this data type) < this
@@ -320,32 +325,50 @@ THRESHOLD_PROVENANCE = {
     "calibrated_on": (
         "dev set: 48 hand-adjudicated transfer claims (23 true transfers) from "
         "the evaluator's own evidence traces on 2 open-source apps; test source "
-        "sets and ambiguous anchors excluded. IPC hand-offs count as sharing."
+        "sets and ambiguous anchors excluded. Label schema v2: every true "
+        "transfer carries a destination_class (8 developer_backend, 3 "
+        "third_party_sdk, 11 user_chosen_destination, 1 platform_component). "
+        "IPC hand-offs count as sharing unless the user chose the recipient."
     ),
     "calibrated_at": "2026-09-27",
+    "calibrated_with": "typesafe_eval calibrate --rejoin at M2 (after WP6 + WP7)",
     "method": (
         "T_TRANSMIT_LOW = highest threshold with recall 1.0 on labelled "
-        "transfers; T_TRANSMIT_HIGH = lowest threshold with precision >= 0.90 "
+        "transfers (platform_component labels are on-device hand-offs and "
+        "exempt from the recall constraint: LOCAL composes the same inventory "
+        "SUGGESTION); T_TRANSMIT_HIGH = lowest threshold with precision >= 0.90 "
         "on labelled transfers; band in between abstains. See calibrate.py."
     ),
-    # Derived band on the dev set was [0.38, 0.60]. The shipped values are
-    # deliberately wider: 0.35 keeps a 0.03 margin under the lowest-scoring true
-    # transfer (recall first), and the derived upper bound rests on a 4-case
-    # probability bin, too thin to move TRANSMITS (which drives Non-compliant
-    # verdicts) from 0.70. Measured at the shipped values: recall 1.0 for
-    # TRANSMITS+UNCERTAIN, precision 0.944 for TRANSMITS alone, abstention
-    # 0.625, Brier 0.18, ECE 0.26 (the 0.5-0.6 bin is over-confident: 14 cases,
-    # none a real transfer, which is why the band abstains there).
-    "derived_band": {"T_TRANSMIT_LOW": 0.38, "T_TRANSMIT_HIGH": 0.60},
+    # Derived band at M2: [0.41, 0.72]. Shipped T_LOW 0.35 keeps a 0.06 margin
+    # under the lowest-scoring off-device true transfer (a SAF tree hand-off
+    # that has scored 0.38 / 0.40 / 0.41 across three runs); T_HIGH takes the
+    # derived 0.72 because 0.70 leaves one labelled non-transfer at 0.71 in
+    # TRANSMITS (precision 0.895 against the 0.90 target) and TRANSMITS drives
+    # Non-Compliant verdicts. Three true transfers sit at exactly 0.71 and are
+    # therefore UNCERTAIN (surfaced for review, still transferred) -- that is
+    # why abstention (0.562) misses the M2 target of 0.50 on this set; the two
+    # criteria cannot both hold on 48 cases and precision was preferred per the
+    # charter ordering. Previous shipped band (2.0.0): [0.35, 0.70], derived
+    # [0.38, 0.60] on the same labels before WP6/WP7.
+    "derived_band": {"T_TRANSMIT_LOW": 0.41, "T_TRANSMIT_HIGH": 0.72},
     "shipped_band": {"T_TRANSMIT_LOW": T_TRANSMIT_LOW, "T_TRANSMIT_HIGH": T_TRANSMIT_HIGH},
     "metrics_at_shipped": {
-        "n": 48, "positives": 23, "false_negatives_local": 0,
-        "precision_at_high": 0.944, "recall_at_high": 0.739,
-        "abstention_rate": 0.625, "brier": 0.1785, "ece": 0.2552,
+        "n": 48, "positives": 23, "false_negatives_local": 0, "recall_exempt_local": 1,
+        "precision_at_high": 0.933, "recall_at_high": 0.609,
+        "abstention_rate": 0.562, "uncertain_true_transfers": 8,
+        "brier": 0.1797, "ece": 0.2233,
+        # Inside the abstention band only (27 cases): the number the M2 gate
+        # compares with the pre-WP6/WP7 run at the same band (ECE 0.281).
+        "in_band_brier": 0.2387, "in_band_ece": 0.2644,
+    },
+    "destination_at_shipped": {
+        "accuracy": 0.826, "sharing_agreement": 0.783, "sharing_regressions": 0,
+        "applied_downgrades": 7, "applied_downgrades_wrong": 0,
     },
     "note": (
-        "Two-app dev set is a regression check, not a hold-out. Revisit "
-        "T_TRANSMIT_HIGH once the labelled set exceeds ~100 cases."
+        "Two-app dev set is a regression check, not a hold-out. Every band "
+        "edge here is decided by a single case; revisit once the labelled set "
+        "exceeds ~100 cases."
     ),
 }
 

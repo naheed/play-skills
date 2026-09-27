@@ -149,7 +149,7 @@ threshold sweep. The earlier offline-heuristic "0.94" was circular (the
 heuristic is derived from the same signals); the live numbers are the real
 signal. Growth to full policy parity is planned in the coverage-evolution doc.
 
-### Validated on real applications (v2, `2.0.0-capability`)
+### Validated on real applications (v2, `2.0.0-capability`; re-calibrated at M2 as `2.1.0-capability`)
 
 The v2 cascade was run end-to-end with live `jev-1.13.0` on two open-source
 Android applications and compared against the legacy agent skill on the same
@@ -158,9 +158,13 @@ trees. v2 recovers every Critical the legacy skill found and v1 had missed
 Data Safety discrepancies) and surfaces a credential sent over a raw socket
 (p=0.90) that v1 had dropped in triage. Against 48 hand-adjudicated transfer
 labels (23 true transfers) the shipped band has **zero false negatives**;
-TRANSMITS alone has precision 0.944. The label set lives outside the repository;
-the method and numbers are in the capability-based-evaluation doc §4-5 and in
-`constants.THRESHOLD_PROVENANCE`.
+TRANSMITS alone has precision 0.944. At M2 (after one-hop callee resolution and
+`destination_class`, label schema v2) the band was re-derived by `calibrate
+--rejoin`: shipped `[0.35, 0.72]`, zero off-device false negatives, TRANSMITS
+precision 0.933, destination-class accuracy 0.826, seven user-directed transfers
+downgraded to inventory with none wrong. The label set lives outside the
+repository; the method and numbers are in the capability-based-evaluation doc
+§4-5 and in `constants.THRESHOLD_PROVENANCE`.
 
 Time to outcome and cost, measured against the original skill run as `SKILL.md`
 prescribes (Claude Fable 5.1, effort high, 3 sub-agents at a time) on the same

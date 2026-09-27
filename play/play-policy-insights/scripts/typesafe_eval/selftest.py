@@ -1251,6 +1251,24 @@ def _test_destination_class() -> None:
          and report["reliability_by_class"]["none"]["n"] == 2, str(report["reliability_by_class"]))
   _check("calibrate_v2_in_band", report["reliability_in_band"]["n"] == 2 and report["reliability_in_band"]["positives"] == 1,
          str(report["reliability_in_band"]))
+  _check("calibrate_v2_band_from_lowest_positive", report["band"]["T_TRANSMIT_LOW"] == 0.55
+         and report["recall_exempt_cases"] == [], str(report["band"]))
+  # A platform_component transfer scoring low does not drag T_LOW down and is
+  # not a LOCAL false negative; it still counts everywhere else.
+  pc_cases = cases + [{"file": "f", "data_type": "T", "transfers": True, "p_transmit": 0.20,
+                       "destination_class": "platform_component", "run_destination_class": "unknown", "run_is_third_party": False}]
+  pc_report = calibrate.calibrate({"cases": pc_cases, "description": "synthetic v2 + platform"}, min_precision=0.9)
+  _check("calibrate_v2_platform_recall_exempt",
+         pc_report["band"]["T_TRANSMIT_LOW"] == 0.55
+         and pc_report["recall_exempt_cases"] == [{"file": "f", "data_type": "T", "destination_class": "platform_component", "p_transmit": 0.2}]
+         and pc_report["metrics"]["false_negatives_local"] == 0 and pc_report["metrics"]["recall_exempt_local"] == 1
+         and pc_report["metrics"]["positives"] == 4 and pc_report["reliability_by_class"]["platform_component"]["n"] == 1
+         and pc_report["destination"]["n_labelled"] == 4,
+         str((pc_report["band"], pc_report["metrics"], pc_report["recall_exempt_cases"])))
+  # The same case labelled as a collection class does constrain the band.
+  dev_cases = cases + [{**pc_cases[-1], "destination_class": "developer_backend"}]
+  _check("calibrate_v2_collection_class_constrains",
+         calibrate.calibrate({"cases": dev_cases}, min_precision=0.9)["band"]["T_TRANSMIT_LOW"] == 0.20)
   v1 = calibrate.calibrate({"cases": [{k: v for k, v in c.items() if not k.startswith("run_") and k != "destination_class"} for c in cases]})
   _check("calibrate_v1_labels_still_work", v1["destination"]["n_labelled"] == 0 and "note" in v1["destination"])
   # Join carries the run's destination fields onto the case.

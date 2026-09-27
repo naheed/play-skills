@@ -1,6 +1,6 @@
 # Capability-Based Evaluation (hybrid evaluator v2)
 
-Status: Implemented (`EVALUATOR_VERSION = "2.0.0-capability"`)
+Status: Implemented (`EVALUATOR_VERSION = "2.1.0-capability"`; `2.0.0-capability` was the pre-M2 wording and band)
 Owner: play-policy-insights
 Last updated: 2026-09-27
 Supersedes: the single-cliff `T_TRANSMIT` decision and pattern-anchored snippets described
@@ -424,7 +424,7 @@ reconciled.
 
 ```
 p < T_TRANSMIT_LOW  (0.35)            -> LOCAL      is_transferred=False, SUGGESTION, prunable
-T_LOW <= p < T_TRANSMIT_HIGH (0.70)   -> UNCERTAIN  is_transferred=True,  >= IMPORTANT,
+T_LOW <= p < T_TRANSMIT_HIGH (0.72)   -> UNCERTAIN  is_transferred=True,  >= IMPORTANT,
                                                     needs_manual_review=True, never pruned,
                                                     title suffixed "[transfer uncertain: p=..; verify]"
 p >= T_TRANSMIT_HIGH                  -> TRANSMITS  is_transferred=True, severity from booleans
@@ -642,7 +642,35 @@ still work. In `--rejoin` mode the join copies the run's own `destination_class`
 
 48 hand-adjudicated claims (23 true transfers) drawn from the evaluator's own evidence traces
 on two open-source apps; test source sets and ambiguous anchors excluded; IPC hand-offs
-counted as sharing.
+counted as sharing unless the user chose the recipient (label schema v2).
+
+**At M2 (`2.1.0-capability`, after WP6 + WP7, `calibrate --rejoin` on both apps):**
+
+| | derived | shipped |
+| --- | --- | --- |
+| `T_TRANSMIT_LOW` | 0.41 | 0.35 |
+| `T_TRANSMIT_HIGH` | 0.72 | 0.72 |
+| false negatives in LOCAL (off-device transfers) | 0 | 0 |
+| `platform_component` transfers in LOCAL (recall-exempt) | 1 | 1 |
+| precision of TRANSMITS | 0.933 | 0.933 |
+| recall of TRANSMITS alone | 0.609 | 0.609 |
+| abstention (UNCERTAIN) rate | 0.521 | 0.562 |
+| Brier / ECE, all cases | 0.1797 / 0.2233 | same |
+| Brier / ECE inside the band | 0.2472 / 0.2564 | 0.2387 / 0.2644 |
+| destination accuracy / sharing agreement | 0.826 / 0.783 | same |
+
+0.35 keeps a 0.06 margin under the lowest-scoring off-device true transfer (a file handed to
+a SAF document tree, which has scored 0.38 / 0.40 / 0.41 across three runs). `T_TRANSMIT_HIGH`
+moved 0.70 → 0.72 because one labelled non-transfer (locally stored stream-server credentials)
+scores 0.71: at 0.70 precision is 0.895 against the 0.90 target, and TRANSMITS drives
+Non-Compliant verdicts. Three true transfers sit at exactly 0.71 and are therefore UNCERTAIN
+— surfaced for review and still `is_transferred` — which is why abstention (0.562) misses the
+M2 target of 0.50; on 48 cases the two criteria cannot both hold and precision was preferred
+per the charter ordering. In-band ECE at the shipped band improved from 0.281 (WP5 run) to
+0.264. Every band edge is decided by a single case; revisit once the label set exceeds about
+100 cases.
+
+**At `2.0.0-capability` (before WP6 / WP7), for reference:**
 
 | | derived | shipped |
 | --- | --- | --- |
@@ -654,12 +682,9 @@ counted as sharing.
 | abstention (UNCERTAIN) rate | 0.479 | 0.625 |
 | Brier / ECE | 0.1785 / 0.2552 | same |
 
-The shipped band is deliberately wider than the derived one. 0.35 keeps a 0.03 margin under
-the lowest-scoring true transfer (a file handed to another app's document provider at 0.38).
-The derived upper bound rests on a probability bin with four cases, too thin to move the
-threshold that drives Non-Compliant verdicts. The 0.5-0.6 bin is over-confident (14 cases,
-none a real transfer), which is exactly the region the band abstains on. Revisit
-`T_TRANSMIT_HIGH` once the label set exceeds about 100 cases.
+That shipped band was deliberately wider than the derived one: the derived upper bound rested
+on a probability bin with four cases, too thin to move the threshold that drives Non-Compliant
+verdicts, and the 0.5-0.6 bin was over-confident (14 cases, none a real transfer).
 
 ## 5. Results on the development set (regression check, not a hold-out)
 

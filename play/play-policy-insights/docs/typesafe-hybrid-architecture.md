@@ -280,7 +280,8 @@ replaces §4's single threshold and §6's pattern-anchored snippets with:
   evaluator logic, enforced by a selftest lint;
 - a **policy layer** with a relevance gate, a three-way transfer decision
   (LOCAL / UNCERTAIN / TRANSMITS at `T_TRANSMIT_LOW = 0.35`,
-  `T_TRANSMIT_HIGH = 0.70`) in which UNCERTAIN is surfaced as transferred and
+  `T_TRANSMIT_HIGH = 0.70`, re-derived to 0.72 at M2 / `2.1.0-capability`) in
+  which UNCERTAIN is surfaced as transferred and
   routed to manual review rather than pruned, capability-tiered ranking so
   explicit egress out-ranks IPC out-ranks unknown, a critic that verifies only
   the atomic transfer claim, deterministic manifest checks, and a decision

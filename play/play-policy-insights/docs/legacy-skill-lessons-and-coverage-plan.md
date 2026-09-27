@@ -2,7 +2,7 @@
 
 Status: Design / plan
 Last updated: 2026-09-27
-Evaluator version this applies to: `2.0.0-capability` (see
+Evaluator version this applies to: `2.0.0-capability` and its M2 re-calibration `2.1.0-capability` (see
 [capability-based-evaluation.md](capability-based-evaluation.md))
 
 This document does two things:
