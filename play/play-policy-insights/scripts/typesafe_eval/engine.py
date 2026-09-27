@@ -1226,18 +1226,35 @@ def _write_triage(ctx: RunContext, findings_by_goal, client: JevClient) -> str:
   """The observability record: what was evaluated, what was not, and why."""
   severities: Dict[str, int] = {}
   decisions: Dict[str, int] = {}
+  # WP10: how the ``data_type_confirmed`` answers composed (per action) and
+  # every relabel as ``scanner_type -> effective_type`` for the review log.
+  type_actions: Dict[str, int] = {}
+  relabels: List[Dict[str, Any]] = []
   for fs in findings_by_goal.values():
     for f in fs:
       severities[f.get("severity", "?")] = severities.get(f.get("severity", "?"), 0) + 1
       d = f.get("transfer_decision")
       if d:
         decisions[d] = decisions.get(d, 0) + 1
+      tc = (f.get("decision_trace") or {}).get("type_confirmation")
+      if tc and tc.get("read"):
+        type_actions[tc["action"]] = type_actions.get(tc["action"], 0) + 1
+        if tc["action"] != evaluate.TYPE_AS_LABELLED:
+          relabels.append({"file": (f.get("files_involved") or [None])[0],
+                           "scanner_type": tc.get("labelled"), "answer": tc.get("answer"),
+                           "effective_type": tc.get("effective_type"),
+                           "confidence": tc.get("confidence"), "lowered": tc.get("lowered")})
+  if type_actions:
+    ctx.counters["type_confirmations"] = type_actions
+    log.info("data_type_confirmed composed on %d transfer findings: %s (%d relabel/dispute/unknown)",
+             sum(type_actions.values()), type_actions, len(relabels))
   out = {
       "evaluator_version": constants.EVALUATOR_VERSION,
       "client": client.name,
       "counters": ctx.counters,
       "findings_by_severity": severities,
       "transfer_decisions": decisions,
+      "type_confirmations": relabels,
       "capabilities": caps.summarize(ctx.profiles),
       "dependency_capabilities": {
           k: v.labels for k, v in sorted(ctx.dependency_profiles.items())

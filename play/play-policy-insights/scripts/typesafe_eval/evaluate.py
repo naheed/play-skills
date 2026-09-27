@@ -44,6 +44,7 @@ from typesafe_eval import constants
 from typesafe_eval import questions as q
 from typesafe_eval import snippets
 from typesafe_eval import structure
+from typesafe_eval import taxonomy
 from typesafe_eval import templates
 from typesafe_eval.client import JevAnswer
 from typesafe_eval.client import JevClient
@@ -72,18 +73,13 @@ _LINKED_CATEGORIES = {
 
 
 def _repo_root() -> str:
-  return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+  return taxonomy._repo_root()  # pylint: disable=protected-access
 
 
-@functools.lru_cache(maxsize=1)
 def _taxonomy() -> Dict[str, dict]:
-  path = os.path.join(_repo_root(), "resources", "policies.json")
-  try:
-    with open(path, "r", encoding="utf-8") as f:
-      data = json.load(f)
-    return data.get("data_safety_section", {}).get("taxonomy", {})
-  except Exception:  # pylint: disable=broad-exception-caught
-    return {}
+  """The Data Safety taxonomy (see :mod:`typesafe_eval.taxonomy`; kept as the
+  historical name used across the engine, batch and registry modules)."""
+  return taxonomy.load()
 
 
 # Transfer decisions produced by :func:`transfer_decision`.
@@ -162,6 +158,8 @@ def _decision_trace(
           "CONF_CONSENT_ACT": constants.CONF_CONSENT_ACT,
           "CONF_DESTINATION_ACT": constants.CONF_DESTINATION_ACT,
           "DESTINATION_CLASS_ENABLED": constants.DESTINATION_CLASS_ENABLED,
+          "CONF_TYPE_CONFIRM": constants.CONF_TYPE_CONFIRM,
+          "DATA_TYPE_CONFIRMED_ENABLED": constants.DATA_TYPE_CONFIRMED_ENABLED,
           "provenance": constants.THRESHOLD_PROVENANCE,
       },
       "anchor": {
@@ -583,9 +581,13 @@ def _state_guards(state: Dict[str, Any]) -> List[Dict[str, Any]]:
 def compose_consent(
     state: Dict[str, Any], answers: Dict[str, JevAnswer], transmits: bool,
     disclosure_status: str, severity: str, decision: str = TRANSMITS,
-    destination_resolved: bool = True,
+    destination_resolved: bool = True, type_disputed: bool = False,
 ) -> Tuple[Consent, str]:
   """Composes the consent default and returns ``(consent, severity)`` (WP8).
+
+  ``type_disputed`` (WP10): the ``data_type_confirmed`` answer says the value
+  is not personal or the relabel lowered the severity, so a Critical is not
+  supportable until a reviewer settles the type (``capped_by: disputed_type``).
 
   Only an undisclosed transfer (``transmits`` and ``disclosure_status ==
   "MISSING"``) is affected; everything else is traced with ``action: none``.
@@ -635,6 +637,8 @@ def compose_consent(
         consent.capped_by = "uncertain_band"
       elif not destination_resolved:
         consent.capped_by = "unresolved_destination"
+      elif type_disputed:
+        consent.capped_by = "disputed_type"
       elif severity == "IMPORTANT":
         severity = "CRITICAL"
         consent.action = "raise"
@@ -654,6 +658,137 @@ def compose_consent(
             p, consent.guard_defaults, decision, consent.default_on, consent.action, consent.corroboration,
             f", capped_by={consent.capped_by}" if consent.capped_by else "")
   return consent, severity
+
+
+# WP10: outcomes of ``compose_type_confirmation``.
+TYPE_AS_LABELLED = "as_labelled"     # the scanner's label stands (or the answer was too weak to act)
+TYPE_RELABELLED = "relabelled"       # composed on a sibling type
+TYPE_NOT_PERSONAL = "not_personal"   # kept, capped at IMPORTANT, review
+TYPE_UNKNOWN = "unknown"             # kept, review
+
+_SEVERITY_RANK = {"SUGGESTION": 0, "IMPORTANT": 1, "CRITICAL": 2}
+
+
+class TypeConfirmation:
+  """What the ``data_type_confirmed`` Choice said and what the composer did with it (WP10).
+
+  Attributes:
+    labelled: The scanner's taxonomy type.
+    answer: The Choice's argmax option (``as_labelled`` when the battery had no
+      answer); one of the option ids in
+      ``questions.data_type_confirmed_question``.
+    confidence: The Choice's calibrated confidence (0.0 when absent).
+    probabilities: The per-option distribution (trace only).
+    effective_type: The type the finding is composed on -- a sibling type after
+      a confident relabel, otherwise ``labelled``.
+    action: ``as_labelled`` / ``relabelled`` / ``not_personal`` / ``unknown``.
+    read: False when the answer was not consulted (below ``T_TRANSMIT_LOW`` the
+      type is moot; the feature flag off).
+    lowered: True when a relabel lowered the derived severity (one step at most,
+      review-flagged).
+    disputed: True when the type is in question -- ``not_personal`` or a
+      lowering relabel -- so no Critical is asserted on it.
+  """
+
+  def __init__(self, labelled: str, answer: str, confidence: float,
+               probabilities: Dict[str, float]):
+    self.labelled = labelled
+    self.answer = answer
+    self.confidence = confidence
+    self.probabilities = probabilities
+    self.effective_type = labelled
+    self.action = TYPE_AS_LABELLED
+    self.read = False
+    self.lowered = False
+
+  @property
+  def disputed(self) -> bool:
+    return self.action == TYPE_NOT_PERSONAL or (self.action == TYPE_RELABELLED and self.lowered)
+
+  @property
+  def review(self) -> bool:
+    """A judgement changed or questioned the type: a reviewer confirms it."""
+    return self.disputed or self.action == TYPE_UNKNOWN
+
+  def to_trace(self) -> Dict[str, Any]:
+    return {
+        "labelled": self.labelled,
+        "answer": self.answer,
+        "confidence": round(self.confidence, 4),
+        "probabilities": {k: round(v, 4) for k, v in (self.probabilities or {}).items()},
+        "effective_type": self.effective_type,
+        "action": self.action,
+        "read": self.read,
+        "lowered": self.lowered,
+        "CONF_TYPE_CONFIRM": constants.CONF_TYPE_CONFIRM,
+        "enabled": constants.DATA_TYPE_CONFIRMED_ENABLED,
+    }
+
+
+def type_confirmation_from_answers(data_type: str, answers: Dict[str, JevAnswer]) -> TypeConfirmation:
+  """Reads the ``data_type_confirmed`` Choice (or ``as_labelled`` at confidence 0 when absent)."""
+  a = answers.get("data_type_confirmed")
+  if a is None or a.type != "choice" or not a.choice:
+    return TypeConfirmation(data_type, TYPE_AS_LABELLED, 0.0, {})
+  return TypeConfirmation(data_type, str(a.choice), float(a.confidence or 0.0), dict(a.probabilities or {}))
+
+
+def compose_type_confirmation(
+    data_type: str, answers: Dict[str, JevAnswer], transmits: bool,
+    disclosure_status: str, decision: str,
+) -> Tuple[TypeConfirmation, str]:
+  """Composes the confirmed data type and returns ``(confirmation, severity)`` (WP10, L7).
+
+  The severity is derived here (``derive_data_safety_severity``) on the
+  *effective* type so the caller composes on one type throughout. Read only
+  for a transfer at/above ``T_TRANSMIT_LOW`` (``transmits``): below the band
+  the finding is local inventory and the label is moot.
+
+  - A sibling type at/above ``CONF_TYPE_CONFIRM`` **relabels**: the finding is
+    composed on that type (``psl_constant``, summary, sensitivity). A relabel
+    that raises the severity applies in full (a more sensitive type is more,
+    not less, of a finding). A relabel that would lower it is a judgement
+    lowering a severity, so it is allowed one step at most (CRITICAL ->
+    IMPORTANT), flagged for review and reported as disputed; the report keeps
+    the finding.
+  - ``NOT_PERSONAL`` at/above the bar keeps the finding and the labelled type
+    (a model judgement never removes a finding; the inventory stays as the
+    scanner saw it), caps the severity at IMPORTANT and flags review: the
+    reviewer, not the model, decides an app UID is not a user account.
+  - ``unknown`` at/above the bar flags review; ``as_labelled``, an option that
+    is not in the taxonomy, or any answer below the bar composes as labelled
+    and is traced only.
+  """
+  tc = type_confirmation_from_answers(data_type, answers)
+  severity = derive_data_safety_severity(data_type, transmits, disclosure_status, decision)
+  if not constants.DATA_TYPE_CONFIRMED_ENABLED or not transmits:
+    return tc, severity
+  tc.read = True
+  if tc.confidence < constants.CONF_TYPE_CONFIRM or tc.answer == TYPE_AS_LABELLED:
+    return tc, severity
+  if tc.answer == constants.NOT_PERSONAL:
+    tc.action = TYPE_NOT_PERSONAL
+    if _SEVERITY_RANK[severity] > _SEVERITY_RANK["IMPORTANT"]:
+      severity = "IMPORTANT"
+    return tc, severity
+  if tc.answer == q.TYPE_CONFIRMED_UNKNOWN:
+    tc.action = TYPE_UNKNOWN
+    return tc, severity
+  if tc.answer in taxonomy.load() and tc.answer != data_type:
+    tc.action = TYPE_RELABELLED
+    tc.effective_type = tc.answer
+    relabelled = derive_data_safety_severity(tc.answer, transmits, disclosure_status, decision)
+    if _SEVERITY_RANK[relabelled] < _SEVERITY_RANK[severity]:
+      tc.lowered = True
+      # One step at most: a relabel never takes a finding out of the report.
+      severity = "IMPORTANT" if severity == "CRITICAL" else severity
+    else:
+      severity = relabelled
+    return tc, severity
+  # An option the taxonomy does not know (stale cache, edited question): as labelled.
+  log.warning("data_type_confirmed answered %r for %s, not a taxonomy type; composing as labelled",
+              tc.answer, data_type)
+  return tc, severity
 
 
 def relevance_is_low(verdict: str) -> bool:
@@ -1009,8 +1144,24 @@ def _compose_data_safety_finding(
       log.info("disclosure status reconciled for %s in %s: %s", data_type,
                state["signal"]["file"], disclosure_note)
   # Severity is derived in code from the atomic booleans, not read off Jev's
-  # advisory Score (which is logged for comparison only).
-  severity = derive_data_safety_severity(data_type, transmits, disclosure_status, decision)
+  # advisory Score (which is logged for comparison only). WP10: derived on the
+  # *confirmed* type -- a confident sibling relabel changes the type the finding
+  # is composed on; "not personal" caps at IMPORTANT and asks for review.
+  type_conf, severity = compose_type_confirmation(data_type, answers, transmits, disclosure_status, decision)
+  type_note: Optional[str] = None
+  if type_conf.action == TYPE_RELABELLED:
+    tax = _taxonomy().get(type_conf.effective_type, tax)
+    category = tax.get("category", category)
+    name = tax.get("data_type", type_conf.effective_type)
+    type_note = (f"relabelled {data_type} -> {type_conf.effective_type} (conf={type_conf.confidence:.2f})"
+                 + ("; severity lowered one step, kept for review" if type_conf.lowered else ""))
+  elif type_conf.action == TYPE_NOT_PERSONAL:
+    type_note = (f"model says the value is not personal data (conf={type_conf.confidence:.2f}); "
+                 "finding kept as labelled, severity capped at IMPORTANT, review")
+  elif type_conf.action == TYPE_UNKNOWN:
+    type_note = f"model cannot tell what the value is (conf={type_conf.confidence:.2f}); review"
+  if type_note:
+    log.info("data type for %s in %s: %s", data_type, state["signal"]["file"], type_note)
   if destination.applied:
     # A confirmed non-collection destination is inventory even when the
     # transfer probability sits in the UNCERTAIN band (the band would
@@ -1039,7 +1190,7 @@ def _compose_data_safety_finding(
   # the destination itself is still under review.
   consent, severity = compose_consent(
       state, answers, transmits and not destination.applied, disclosure_status, severity, decision,
-      destination_resolved=not destination_review)
+      destination_resolved=not destination_review, type_disputed=type_conf.disputed)
   consent_note: Optional[str] = None
   if consent.action == "raise":
     consent_note = (f"enabled by default (p={consent.p_default_on:.2f}, {consent.corroboration}); "
@@ -1056,6 +1207,9 @@ def _compose_data_safety_finding(
   elif consent.capped_by == "unresolved_destination":
     consent_note = (f"enabled by default (p={consent.p_default_on:.2f}, {consent.corroboration}) but the "
                     f"destination ({destination.cls}) is unresolved; severity unchanged")
+  elif consent.capped_by == "disputed_type":
+    consent_note = (f"enabled by default (p={consent.p_default_on:.2f}, {consent.corroboration}) but the "
+                    "data type is disputed; severity unchanged")
   if consent_note:
     log.info("consent for %s in %s: %s", data_type, state["signal"]["file"], consent_note)
 
@@ -1108,6 +1262,13 @@ def _compose_data_safety_finding(
     summary = f"{summary} [data-type match uncertain: p={p_relevant or 0.0:.2f}; verify]"
     if severity == "CRITICAL":
       severity = "IMPORTANT"
+  if type_conf.action == TYPE_RELABELLED:
+    summary = (f"{summary} [type: {data_type} -> {type_conf.effective_type} "
+               f"conf={type_conf.confidence:.2f}{'; verify' if type_conf.lowered else ''}]")
+  elif type_conf.action == TYPE_NOT_PERSONAL:
+    summary = f"{summary} [type disputed: not personal data per model conf={type_conf.confidence:.2f}; verify]"
+  elif type_conf.action == TYPE_UNKNOWN:
+    summary = f"{summary} [type unclear conf={type_conf.confidence:.2f}; verify]"
 
   sinks = state.get("sinks") or []
   # The critic's claim names the callee-reached sinks too (``Callee.Sink``),
@@ -1115,17 +1276,24 @@ def _compose_data_safety_finding(
   callee_sink_names = [f"{c.get('symbol')}.{s.get('symbol')}"
                        for c in state.get("callees") or [] for s in c.get("sinks") or []]
   sink_names = ", ".join([s["symbol"] for s in sinks[:5]] + callee_sink_names[:3]) or "no labelled sink in file"
+  effective_type = type_conf.effective_type
   claim = (
-      f"{name} ({data_type}) is sent off-device or shared with another app "
+      f"{name} ({effective_type}) is sent off-device or shared with another app "
       f"in {state['signal']['file']} (sinks: {sink_names})."
   )
 
-  log.debug("compose %s in %s: p_transmit=%.2f decision=%s severity=%s third_party=%s destination=%s",
+  log.debug("compose %s in %s: p_transmit=%.2f decision=%s severity=%s third_party=%s destination=%s type=%s",
             data_type, state["signal"]["file"], p_transmit, decision, severity, is_third_party,
-            destination.cls)
+            destination.cls, type_conf.action)
 
   finding = {
-      "psl_constant": data_type,
+      "psl_constant": effective_type,
+      # WP10: the scanner's label and the model's answer, for the calibration
+      # confusion table and for a reviewer of a relabelled finding.
+      "scanner_data_type": data_type,
+      "data_type_confirmed": type_conf.answer if type_conf.read else None,
+      "confirmed_type": (constants.NOT_PERSONAL if type_conf.action == TYPE_NOT_PERSONAL
+                         else effective_type),
       "policy_id": policy_id,
       "issue_summary": summary,
       "severity": severity,
@@ -1157,7 +1325,9 @@ def _compose_data_safety_finding(
            "destination": destination.to_trace(),
            "destination_note": destination_note,
            "consent": consent.to_trace(),
-           "consent_note": consent_note},
+           "consent_note": consent_note,
+           "type_confirmation": type_conf.to_trace(),
+           "type_note": type_note},
       ),
   }
   if consent.guards:
@@ -1167,7 +1337,8 @@ def _compose_data_safety_finding(
          "default_on": g.get("default_on"), "runs_by_default": g.get("runs_by_default"),
          "declaration": g.get("declaration")} for g in consent.guards]
   if (decision == UNCERTAIN or relevance_low or disclosure_note or destination_review
-      or consent.action == "lower" or consent.corroboration == "vetoed_by_guard"):
+      or consent.action == "lower" or consent.corroboration == "vetoed_by_guard"
+      or type_conf.review):
     finding["needs_manual_review"] = True
   return finding
 

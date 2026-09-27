@@ -629,6 +629,12 @@ class HeuristicJevClient(JevClient):
     if qid == "critic_verdict" and probs:
       # The heuristic critic is permissive: verify what the scanner surfaced.
       return _peak(probs, "VERIFIED")
+    if qid == "data_type_confirmed" and probs:
+      # WP10 stand-in: the offline client cannot judge what a value really is,
+      # so it confirms the scanner's label (the recall-safe default; nothing is
+      # relabelled or capped). Tests exercise the other branches with fixed
+      # answers.
+      return _peak(probs, "as_labelled" if "as_labelled" in probs else options[0])
     if qid == "declared_core_purpose" and probs:
       # Offline stand-in for the once-per-app purpose question (WP4): it has
       # no store listing to read, so it answers ``unknown`` with a peaked

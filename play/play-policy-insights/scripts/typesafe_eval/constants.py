@@ -453,6 +453,61 @@ BROAD_MEDIA_PERMISSION_SHORT_NAMES = frozenset({"READ_MEDIA_IMAGES", "READ_MEDIA
 T_DECLARATION_COVERS = 0.50  # play_declaration: declaration covers a detected type
 
 # ---------------------------------------------------------------------------
+# WP10: ``data_type_confirmed`` (lesson L7).
+#
+# The scanner labels a signal with a taxonomy type from a lexical pattern, and
+# the legacy agents corrected that label in a handful of recurring ways: a
+# ``uid`` is an *app* UID (not a user account), a ``country_code`` derived
+# from a remote peer's address is not the *user's* location, a server-assigned
+# device id is a DEVICE_ID even when no hardware id is read. The transfer is
+# real in every one of those cases -- only the type is wrong -- so this is a
+# labelling refinement, not a recall lever, and the answer is read only for
+# decisions at/above ``T_TRANSMIT_LOW`` (below the band the type is moot).
+#
+# One closed Choice per data-safety ask: ``as_labelled`` (default), one option
+# per *sibling type* (the other types of the same taxonomy category plus the
+# cross-category confusions in ``TYPE_CONFUSION_SIBLINGS``, capped at
+# ``MAX_TYPE_SIBLING_OPTIONS``), ``NOT_PERSONAL`` and ``unknown``. The model
+# picks the label; the consequences are composed in code
+# (``evaluate.compose_type_confirmation``):
+#   relabel   a sibling type at/above CONF_TYPE_CONFIRM replaces ``psl_constant``
+#             / the summary and the severity is re-derived for the new type. A
+#             relabel that would *lower* the severity is allowed one step at
+#             most (CRITICAL -> IMPORTANT) and is review-flagged; a relabel that
+#             raises it applies in full (raises are single-gated, as in WP7).
+#   not personal  at/above CONF_TYPE_CONFIRM the finding is *kept* (a model
+#             judgement never removes a finding), its severity is capped at
+#             IMPORTANT, it is review-flagged and the summary says why. The
+#             type stays as labelled so the report's inventory is unchanged.
+#   unknown   at/above CONF_TYPE_CONFIRM on a transfer -> review flag only.
+#   below the confidence bar every answer is traced only.
+# Rollback: DATA_TYPE_CONFIRMED_ENABLED = False keeps the question in the
+# battery (traced) but composes exactly as WP9 did.
+# ---------------------------------------------------------------------------
+DATA_TYPE_CONFIRMED_ENABLED = True
+CONF_TYPE_CONFIRM = 0.75        # confidence at which a relabel / not-personal answer acts
+MAX_TYPE_SIBLING_OPTIONS = 6    # sibling types offered per question (closed list)
+NOT_PERSONAL = "NOT_PERSONAL"   # the "not personal or user data" option / label value
+# Cross-category types the scanner's patterns confuse in practice (same-category
+# siblings come from the taxonomy itself). Symmetric on purpose where both
+# directions occur. Add a pair only with a fixture that exercises it.
+TYPE_CONFUSION_SIBLINGS = {
+    "USER_ACCOUNT": ("DEVICE_ID", "NAME"),
+    "DEVICE_ID": ("USER_ACCOUNT",),
+    "NAME": ("USER_ACCOUNT",),
+    "EMAIL": ("EMAILS",),
+    "EMAILS": ("EMAIL",),
+    "PHONE": ("SMS_CALL_LOG",),
+    "FILES_AND_DOCS": ("PHOTOS", "VIDEOS"),
+    "PHOTOS": ("FILES_AND_DOCS",),
+    "VIDEOS": ("FILES_AND_DOCS",),
+    "AUDIO": ("OTHER_AUDIO",),
+    "PRECISE_LOCATION": ("ADDRESS",),
+    "APPROX_LOCATION": ("ADDRESS",),
+    "CRASH_LOGS": ("DEVICE_ID",),
+}
+
+# ---------------------------------------------------------------------------
 # Confidence gates (Choice/Score answers carry a calibrated confidence in [0, 1]).
 #
 # Mirrors the three-band pattern from the TypeSafe confidence docs: act, review,

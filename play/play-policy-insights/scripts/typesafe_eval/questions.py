@@ -30,6 +30,9 @@ from __future__ import annotations
 
 from typing import Any
 from typing import Dict
+from typing import Optional
+
+from typesafe_eval import taxonomy
 
 
 def _noul(instructions: str, yes: str, no: str) -> Dict[str, Any]:
@@ -222,21 +225,79 @@ def consent_default_question(subject: str) -> Dict[str, Any]:
   )
 
 
+#: Fixed options of the ``data_type_confirmed`` Choice (WP10). The sibling
+#: types are added per data type by :func:`data_type_confirmed_question`.
+TYPE_CONFIRMED_AS_LABELLED = "as_labelled"
+TYPE_CONFIRMED_NOT_PERSONAL = "NOT_PERSONAL"
+TYPE_CONFIRMED_UNKNOWN = "unknown"
+
+
+def data_type_confirmed_question(
+    data_type: str, description: str, siblings: Dict[str, str], token: str = ""
+) -> Dict[str, Any]:
+  """The ``data_type_confirmed`` Choice for one data type (WP10, lesson L7).
+
+  The scanner's type comes from a lexical pattern, and a handful of relabels
+  recur: an app ``uid`` is not a user account, a remote peer's country is not
+  the user's location, a server-assigned installation id is a DEVICE_ID. The
+  model is asked which taxonomy label fits the value the snippet actually
+  handles; ``evaluate.compose_type_confirmation`` decides what that means for
+  the finding (relabel, cap, review) and only for a transfer at/above
+  ``T_TRANSMIT_LOW``. Options are closed: ``as_labelled``, one per sibling type
+  (``taxonomy.siblings``), ``NOT_PERSONAL`` and ``unknown``.
+  """
+  token_ref = f" (matched token `{token}`)" if token else ""
+  criteria: Dict[str, str] = {
+      TYPE_CONFIRMED_AS_LABELLED: (
+          f"The value really is {data_type} — {description} — belonging to the app's user."
+      ),
+  }
+  for sibling, text in siblings.items():
+    criteria[sibling] = f"The value is better described as {sibling} — {text}"
+  criteria[TYPE_CONFIRMED_NOT_PERSONAL] = (
+      "The value is not personal or user data at all: an app or process id "
+      "(Android app UID, pid), a remote peer's or server's address or country, "
+      "an app-internal constant or enum, a resource id, test or placeholder data."
+  )
+  criteria[TYPE_CONFIRMED_UNKNOWN] = "The snippet does not show what the value is."
+  return {
+      "type": "choice",
+      "instructions": (
+          f"`code_snippet` was labelled as handling {data_type}{token_ref}. Looking "
+          "at what the value actually is — where it is read from, what it "
+          "identifies, whose data it is — which Data Safety label fits it? Pick "
+          f"`{TYPE_CONFIRMED_AS_LABELLED}` when the scanner's label is right, the "
+          "sibling type when a different label fits better, "
+          f"`{TYPE_CONFIRMED_NOT_PERSONAL}` when the value is not about the user "
+          f"at all, and `{TYPE_CONFIRMED_UNKNOWN}` when the snippet does not show it."
+      ),
+      "criteria": criteria,
+  }
+
+
 def data_safety_battery(
-    data_type: str, description: str, token: str = ""
+    data_type: str, description: str, token: str = "",
+    siblings: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Dict[str, Any]]:
   """Battery for a single data-safety finding (one detected data type).
 
   Produces the typed inputs the existing ``worker_<goal>.json`` schema expects:
   the data-safety Nouls (relevance, transfer, user-initiated, consent default
   (WP8), disclosure), the ``destination_class`` Choice (WP7; ``is_third_party``
-  is derived from it in code), a disclosure-status choice, and a severity score. Instructions embed the literal data type (and the scanner token that
-  anchored the signal, when given) so the battery works whether the state holds
-  one signal or a whole file's worth (see request batching).
+  is derived from it in code), the ``data_type_confirmed`` Choice (WP10;
+  ``siblings`` is the closed ``{TYPE: description}`` list from
+  ``taxonomy.siblings``, empty when the caller has none), a disclosure-status
+  choice, and a severity score. Instructions embed the literal data type (and
+  the scanner token that anchored the signal, when given) so the battery works
+  whether the state holds one signal or a whole file's worth (see request
+  batching).
   """
   subject = f"the data type {data_type} ({description})"
+  if siblings is None:
+    siblings = taxonomy.siblings(data_type)
   return {
       "signal_relevant": _relevance(subject, token),
+      "data_type_confirmed": data_type_confirmed_question(data_type, description, siblings, token),
       "transmits_offdevice": _noul(
           instructions=(
               f"Does `code_snippet` cause {subject} to leave the device or the "

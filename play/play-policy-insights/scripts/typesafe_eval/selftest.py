@@ -3054,6 +3054,184 @@ def _test_wave2_storage_policies() -> None:
            and context.has_storage_write_hint(fs_ref2) is False)
 
 
+def _test_data_type_confirmed() -> None:
+  """WP10 (L7): the ``data_type_confirmed`` Choice and its composition.
+
+  Covers: sibling lists (confusions first, same category next, capped, only
+  taxonomy types, empty for unknown); the question shape and its place in the
+  battery; the heuristic stand-in; composition -- not read below the band,
+  ``as_labelled`` / low confidence unchanged, a raising relabel applies in
+  full, a lowering relabel is one step + review, ``NOT_PERSONAL`` keeps the
+  finding capped at IMPORTANT + review, ``unknown`` reviews, a non-taxonomy
+  answer is ignored, the consent raise is capped on a disputed type, the
+  feature flag; the engine counters; and the calibrate confusion table with a
+  relabelled finding joining through ``scanner_data_type``.
+  """
+  from typesafe_eval import calibrate
+  from typesafe_eval import constants
+  from typesafe_eval import taxonomy
+  from typesafe_eval.client import HeuristicJevClient
+  from typesafe_eval.client import JevAnswer
+
+  # --- taxonomy siblings ------------------------------------------------------
+  sib = taxonomy.siblings("USER_ACCOUNT")
+  _check("siblings_confusions_first_then_category",
+         list(sib)[:2] == ["DEVICE_ID", "NAME"] and "EMAIL" in sib
+         and len(sib) <= constants.MAX_TYPE_SIBLING_OPTIONS and "USER_ACCOUNT" not in sib, str(list(sib)))
+  _check("siblings_same_category", list(taxonomy.siblings("PHOTOS")) == ["FILES_AND_DOCS", "VIDEOS"],
+         str(list(taxonomy.siblings("PHOTOS"))))
+  _check("siblings_unknown_type_empty", taxonomy.siblings("NOT_A_TYPE") == {})
+  _check("taxonomy_helpers", taxonomy.category_of("PHOTOS") == "Photos and videos"
+         and taxonomy.display_name("CRASH_LOGS") == "Crash logs" and taxonomy.description("NOPE") == ""
+         and evaluate._taxonomy() is taxonomy.load())  # pylint: disable=protected-access
+
+  # --- question and battery -----------------------------------------------------
+  battery = q.data_safety_battery("USER_ACCOUNT", "user ids", token="uid")
+  qd = battery["data_type_confirmed"]
+  _check("type_question_in_battery_after_relevance",
+         list(battery)[:3] == ["signal_relevant", "data_type_confirmed", "transmits_offdevice"])
+  _check("type_question_shape", qd["type"] == "choice"
+         and list(qd["criteria"])[0] == "as_labelled" and list(qd["criteria"])[-2:] == ["NOT_PERSONAL", "unknown"]
+         and "DEVICE_ID" in qd["criteria"] and "`uid`" in qd["instructions"]
+         and "Android app UID" in qd["criteria"]["NOT_PERSONAL"], str(qd)[:300])
+  explicit = q.data_safety_battery("PHOTOS", "photos", siblings={"VIDEOS": "Videos: v"})["data_type_confirmed"]
+  _check("type_question_explicit_siblings", list(explicit["criteria"]) == ["as_labelled", "VIDEOS", "NOT_PERSONAL", "unknown"])
+  heur = HeuristicJevClient()
+  ans = heur.system_one({"signal": {"data_type": "USER_ACCOUNT", "matched_pattern": "uid"}, "co_located_signals": {}, "app": {}},
+                        {"data_type_confirmed": qd})
+  _check("type_heuristic_confirms_label", ans["data_type_confirmed"].choice == "as_labelled"
+         and ans["data_type_confirmed"].confidence > constants.CONF_TYPE_CONFIRM)
+
+  # --- composition --------------------------------------------------------------
+  def answers(p_transmit=0.95, answer="as_labelled", conf=0.9, status="MISSING", p_consent=None, cls="developer_backend"):
+    n = len(q.DESTINATION_CLASS_OPTIONS)
+    dprobs = {o: (0.9 if o == cls else 0.1 / (n - 1)) for o in q.DESTINATION_CLASS_OPTIONS}
+    a = {
+        "signal_relevant": JevAnswer("noul", noul=0.9),
+        "transmits_offdevice": JevAnswer("noul", noul=p_transmit),
+        "user_initiated": JevAnswer("noul", noul=0.2),
+        "destination_class": JevAnswer("choice", choice=cls, probabilities=dprobs, confidence=0.9),
+        "has_prominent_disclosure": JevAnswer("noul", noul=0.1),
+        "disclosure_status": JevAnswer("choice", choice=status),
+        "severity": JevAnswer("score", score=0.6),
+        "data_type_confirmed": JevAnswer("choice", choice=answer, probabilities={answer: conf}, confidence=conf),
+    }
+    if p_consent is not None:
+      a["consent_default_on"] = JevAnswer("noul", noul=p_consent)
+    return a
+
+  def state(dt="USER_ACCOUNT"):
+    return {
+        "signal": {"data_type": dt, "matched_pattern": "uid", "file": "Adapter.kt", "line": 13,
+                   "matched_line": "post(uid)", "all_lines": [13]},
+        "code_snippet": "L13: post(uid)",
+        "sinks": [{"symbol": "URL", "capabilities": ["NETWORK_EGRESS"], "lines": [13]}],
+        "anchor": {"scope": [8, 19], "proximity": 0, "sink_in_scope": True, "tier": 0,
+                   "scope_capabilities": ["NETWORK_EGRESS"], "destination_hints": []},
+        "app": {},
+    }
+
+  compose = evaluate._compose_data_safety_finding  # pylint: disable=protected-access
+  f = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(), "test")
+  tc = f["decision_trace"]["type_confirmation"]
+  _check("type_as_labelled_unchanged", f["severity"] == "IMPORTANT" and f["psl_constant"] == "USER_ACCOUNT"
+         and f["confirmed_type"] == "USER_ACCOUNT" and f["data_type_confirmed"] == "as_labelled"
+         and tc["read"] is True and tc["action"] == "as_labelled" and not f.get("needs_manual_review")
+         and f["decision_trace"]["thresholds"]["CONF_TYPE_CONFIRM"] == constants.CONF_TYPE_CONFIRM, str(tc))
+  f = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(p_transmit=0.1, answer="NOT_PERSONAL"), "test")
+  _check("type_not_read_below_band", f["decision_trace"]["type_confirmation"]["read"] is False
+         and f["data_type_confirmed"] is None and f["severity"] == "SUGGESTION" and not f.get("needs_manual_review"))
+  f = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(answer="NOT_PERSONAL", conf=0.6), "test")
+  _check("type_low_confidence_traced_only", f["decision_trace"]["type_confirmation"]["action"] == "as_labelled"
+         and f["data_type_confirmed"] == "NOT_PERSONAL" and f["severity"] == "IMPORTANT" and not f.get("needs_manual_review"))
+  f = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(answer="NOT_PERSONAL", conf=0.85), "test")
+  _check("type_not_personal_kept_capped_review", f["severity"] == "IMPORTANT" and f["psl_constant"] == "USER_ACCOUNT"
+         and f["confirmed_type"] == "NOT_PERSONAL" and f.get("needs_manual_review") is True
+         and "[type disputed: not personal data per model conf=0.85; verify]" in f["issue_summary"]
+         and f["decision_trace"]["type_confirmation"]["action"] == "not_personal"
+         and "not personal" in f["decision_trace"]["type_note"], str(f["issue_summary"]))
+  # A sensitive type (CRITICAL when undisclosed) answered not personal: capped at IMPORTANT, never dropped.
+  f = compose("PRECISE_LOCATION", "Geo.kt (Pattern: lat)", state("PRECISE_LOCATION"), answers(answer="NOT_PERSONAL", conf=0.9), "test")
+  _check("type_not_personal_caps_critical", f is not None and f["severity"] == "IMPORTANT"
+         and f.get("needs_manual_review") is True and f["psl_constant"] == "PRECISE_LOCATION")
+  # Relabel at the same sensitivity (USER_ACCOUNT -> DEVICE_ID, both IMPORTANT when
+  # undisclosed): type, claim, category and linkage follow the confirmed type.
+  f = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(answer="DEVICE_ID", conf=0.9), "test")
+  _check("type_relabel_same_sensitivity_applies", f["psl_constant"] == "DEVICE_ID" and f["scanner_data_type"] == "USER_ACCOUNT"
+         and f["severity"] == "IMPORTANT" and not f.get("needs_manual_review")
+         and "[type: USER_ACCOUNT -> DEVICE_ID conf=0.90]" in f["issue_summary"]
+         and "Device or other IDs" in f["claim"] and f["confirmed_type"] == "DEVICE_ID"
+         and f["linked_to_user"] is False, str(f["issue_summary"]))
+  # Relabel that raises (EMAIL, not sensitive -> EMAILS, sensitive): applies in full.
+  f = compose("EMAIL", "Mail.kt (Pattern: email)", state("EMAIL"), answers(answer="EMAILS", conf=0.9), "test")
+  _check("type_relabel_raise_applies_in_full", f["psl_constant"] == "EMAILS" and f["severity"] == "CRITICAL"
+         and f["decision_trace"]["type_confirmation"]["lowered"] is False and not f.get("needs_manual_review"),
+         str((f["psl_constant"], f["severity"])))
+  # Relabel that lowers (EMAILS -> EMAIL): one step, review, still in the report.
+  f = compose("EMAILS", "Mail.kt (Pattern: mail)", state("EMAILS"), answers(answer="EMAIL", conf=0.9), "test")
+  _check("type_relabel_lower_one_step_review", f["psl_constant"] == "EMAIL" and f["severity"] == "IMPORTANT"
+         and f["decision_trace"]["type_confirmation"]["lowered"] is True and f.get("needs_manual_review") is True
+         and "; verify]" in f["issue_summary"] and f["linked_to_user"] is True, str(f["issue_summary"]))
+  f = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(answer="unknown", conf=0.9), "test")
+  _check("type_unknown_review", f["severity"] == "IMPORTANT" and f["psl_constant"] == "USER_ACCOUNT"
+         and f.get("needs_manual_review") is True and "[type unclear" in f["issue_summary"])
+  f = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(answer="NOT_A_TYPE", conf=0.9), "test")
+  _check("type_non_taxonomy_answer_ignored", f["psl_constant"] == "USER_ACCOUNT" and f["severity"] == "IMPORTANT"
+         and f["decision_trace"]["type_confirmation"]["action"] == "as_labelled" and not f.get("needs_manual_review"))
+  # Consent raise is capped while the type is disputed; applies when it is confirmed.
+  f = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(answer="NOT_PERSONAL", conf=0.9, p_consent=0.9), "test")
+  _check("type_disputed_caps_consent_raise", f["severity"] == "IMPORTANT"
+         and f["decision_trace"]["consent"]["capped_by"] == "disputed_type"
+         and "data type is disputed" in f["decision_trace"]["consent_note"], str(f["decision_trace"]["consent"]))
+  f = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(answer="as_labelled", conf=0.9, p_consent=0.9), "test")
+  _check("type_confirmed_consent_raise_applies", f["severity"] == "CRITICAL" and f["decision_trace"]["consent"]["action"] == "raise")
+  # Below the band with a disputed answer the type is moot, no review flag from it.
+  _check("type_mode_bands", evaluate.compose_type_confirmation(
+      "USER_ACCOUNT", answers(answer="NOT_PERSONAL", conf=0.9), False, "EXEMPT", evaluate.LOCAL)[0].read is False)
+  # Feature flag.
+  saved = constants.DATA_TYPE_CONFIRMED_ENABLED
+  constants.DATA_TYPE_CONFIRMED_ENABLED = False
+  try:
+    f = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(answer="NOT_PERSONAL", conf=0.9), "test")
+    _check("type_disabled_traced_only", f["severity"] == "IMPORTANT" and not f.get("needs_manual_review")
+           and f["decision_trace"]["type_confirmation"]["enabled"] is False
+           and f["decision_trace"]["type_confirmation"]["read"] is False)
+  finally:
+    constants.DATA_TYPE_CONFIRMED_ENABLED = saved
+
+  # --- calibrate: confusion table and rejoin through scanner_data_type ---------
+  with tempfile.TemporaryDirectory() as d:
+    relabelled = compose("USER_ACCOUNT", "Adapter.kt (Pattern: uid)", state(), answers(answer="DEVICE_ID", conf=0.9), "test")
+    disputed = compose("APPROX_LOCATION", "Geo.kt (Pattern: loc)", state("APPROX_LOCATION"), answers(answer="NOT_PERSONAL", conf=0.9), "test")
+    kept = compose("CRASH_LOGS", "Rep.kt (Pattern: report)", state("CRASH_LOGS"), answers(), "test")
+    local = compose("EMAIL", "Mail.kt (Pattern: email)", state("EMAIL"), answers(p_transmit=0.1), "test")
+    for fnd, file in ((relabelled, "Adapter.kt"), (disputed, "Geo.kt"), (kept, "Rep.kt"), (local, "Mail.kt")):
+      fnd["files_involved"] = [f"src/{file}"]
+    with open(os.path.join(d, "worker_data_safety.json"), "w", encoding="utf-8") as fh:
+      json.dump({"findings": [relabelled, disputed, kept, local]}, fh)
+    labels = {"schema_version": 2, "cases": [
+        {"file": "Adapter.kt", "data_type": "USER_ACCOUNT", "transfers": True, "destination_class": "developer_backend",
+         "confirmed_type": "DEVICE_ID"},
+        {"file": "Geo.kt", "data_type": "APPROX_LOCATION", "transfers": True, "destination_class": "developer_backend"},
+        {"file": "Rep.kt", "data_type": "CRASH_LOGS", "transfers": True, "destination_class": "developer_backend",
+         "confirmed_type": "PERFORMANCE_DIAGNOSTICS"},
+        {"file": "Mail.kt", "data_type": "EMAIL", "transfers": False, "confirmed_type": "NOT_PERSONAL"},
+    ]}
+    rep = calibrate.calibrate(labels, rejoin=True, worker_dirs=[d])
+    t = rep["type_confirmation"]
+    _check("calibrate_relabelled_finding_rejoins", rep["missing_positives"] == [] and rep["unmatched_cases"] == []
+           and any(c["file"] == "Adapter.kt" and c["run_confirmed_type"] == "DEVICE_ID" for c in rep["cases"]), str(rep["unmatched_cases"]))
+    _check("calibrate_type_confusion", t["n_scored"] == 4 and t["n_labelled_confirmed_type"] == 3
+           and t["confusion"]["DEVICE_ID"] == {"DEVICE_ID": 1}
+           and t["confusion"]["APPROX_LOCATION"] == {"NOT_PERSONAL": 1}
+           and t["confusion"]["PERFORMANCE_DIAGNOSTICS"] == {"CRASH_LOGS": 1}
+           and t["not_read"] == 1 and t["accuracy"] == 0.25, str(t))
+    _check("calibrate_missed_and_wrong_relabels",
+           [m["file"] for m in t["missed_relabels"]] == ["Rep.kt"]
+           and [w["file"] for w in t["wrong_relabels"]] == ["Geo.kt"]
+           and any("relabelled or disputed" in w for w in rep["warnings"]), str((t["missed_relabels"], t["wrong_relabels"])))
+
+
 def _test_app_profile() -> None:
   """WP1: evaluator-owned manifest parsing and source-set merge."""
   from typesafe_eval import android_manifest as am
@@ -3331,6 +3509,7 @@ def main() -> int:
   _test_app_profile()
   _test_wave1_manifest_policies()
   _test_wave2_storage_policies()
+  _test_data_type_confirmed()
   _test_lexical_pregate()
   _test_parse_finding()
   _test_snippet_and_colocation()

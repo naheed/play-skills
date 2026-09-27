@@ -79,6 +79,13 @@ Label schema v2 (WP7) adds an optional ``destination_class`` per case, one of
   counted in ``false_negatives_local`` (``recall_exempt_local`` counts them
   separately), because LOCAL composes the same SUGGESTION inventory as the
   applied class would. They remain in every other metric.
+- ``type_confirmation`` (WP10): the label's optional ``confirmed_type`` (the
+  type the value really is, or ``NOT_PERSONAL``; absent = as the scanner
+  labelled it) against the run's ``confirmed_type`` -- confusion table,
+  accuracy, ``missed_relabels`` (label disagrees with the scanner, run kept the
+  scanner's type) and ``wrong_relabels`` (run relabelled or disputed a type the
+  label confirms; a warning). Labels stay keyed by the scanner's type; a
+  relabelled finding joins through its ``scanner_data_type``.
 """
 
 from __future__ import annotations
@@ -116,15 +123,20 @@ def _finding_probability(finding: Dict[str, Any]) -> Optional[float]:
 
 #: Fields copied from the joined finding onto the case (prefixed ``run_``) so
 #: the destination report can compare the run against the label.
-_RUN_FIELDS = ("destination_class", "is_third_party", "transfer_decision", "severity")
+_RUN_FIELDS = ("destination_class", "is_third_party", "transfer_decision", "severity",
+               "confirmed_type", "data_type_confirmed")
 
 
 def _index_findings(worker_dirs: List[str]) -> List[Tuple[str, str, float, Dict[str, Any]]]:
   """``(file, data_type, p_transmit, run_fields)`` for every finding with a probability.
 
+  ``data_type`` is the *scanner's* label (``scanner_data_type`` when the
+  finding was relabelled by ``data_type_confirmed`` (WP10), else
+  ``psl_constant``) so labels keyed by the scanner's type still join.
   ``run_fields`` carries the finding's ``destination_class`` (WP7; falls back
   to the decision trace's ``destination.class``), ``is_third_party``,
-  ``transfer_decision`` and ``severity``.
+  ``transfer_decision``, ``severity`` and the WP10 ``confirmed_type`` /
+  ``data_type_confirmed`` answer.
   """
   out: List[Tuple[str, str, float, Dict[str, Any]]] = []
   for d in worker_dirs:
@@ -136,7 +148,7 @@ def _index_findings(worker_dirs: List[str]) -> List[Tuple[str, str, float, Dict[
         continue
       for f in data.get("findings", []):
         p = _finding_probability(f)
-        dt = f.get("psl_constant")
+        dt = f.get("scanner_data_type") or f.get("psl_constant")
         files = f.get("files_involved") or []
         if p is None or not dt or not files:
           continue
@@ -365,6 +377,62 @@ def destination_report(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
   }
 
 
+def type_confirmation_report(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+  """Labelled ``confirmed_type`` vs the run's confirmed type (WP10, lesson L7).
+
+  A case's ``confirmed_type`` label is the type the value really is
+  (``NOT_PERSONAL`` when it is not user data at all); absent means "as the
+  scanner labelled it" (``data_type``). Only cases whose finding carried a
+  ``run_confirmed_type`` take part -- that is every joined finding since WP10,
+  because the composer always records the effective type. Reports the
+  confusion table ``labelled -> run -> n``, accuracy, the labelled relabels
+  the run missed (``missed_relabels``: the value is not what the scanner said
+  and the run still composed on the scanner's type) and the relabels the run
+  made against a label that says the scanner was right (``wrong_relabels``:
+  the precision risk a relabel introduces). Cases the run did not read the
+  answer for (LOCAL decisions) are counted under ``not_read``.
+  """
+  scored = [c for c in cases if c.get("run_confirmed_type")]
+  if not scored:
+    return {"n_scored": 0, "note": "no finding carried confirmed_type (pre-WP10 run)"}
+  confusion: Dict[str, Dict[str, int]] = {}
+  missed: List[Dict[str, Any]] = []
+  wrong: List[Dict[str, Any]] = []
+  agree = 0
+  not_read = 0
+  n_labelled = 0
+  for c in scored:
+    labelled = c.get("confirmed_type") or c.get("data_type")
+    if c.get("confirmed_type"):
+      n_labelled += 1
+    run = str(c.get("run_confirmed_type"))
+    row = confusion.setdefault(str(labelled), {})
+    row[run] = row.get(run, 0) + 1
+    if labelled == run:
+      agree += 1
+      continue
+    if c.get("run_data_type_confirmed") is None:
+      # LOCAL decision: the answer was not read, the type is moot.
+      not_read += 1
+      continue
+    entry = {"file": c.get("file"), "data_type": c.get("data_type"), "labelled": labelled,
+             "run_confirmed_type": run, "run_answer": c.get("run_data_type_confirmed"),
+             "run_transfer_decision": c.get("run_transfer_decision")}
+    if labelled != c.get("data_type"):
+      missed.append(entry)
+    else:
+      wrong.append(entry)
+  return {
+      "n_scored": len(scored),
+      "n_labelled_confirmed_type": n_labelled,
+      "not_read": not_read,
+      "accuracy": round(agree / len(scored), 3),
+      "confusion": confusion,
+      "missed_relabels": missed,
+      "wrong_relabels": wrong,
+  }
+
+
 def band_metrics(cases: List[Dict[str, Any]], t_low: float, t_high: float) -> Dict[str, Any]:
   positives = [c for c in cases if c["transfers"]]
   transmits = [c for c in cases if c["p_transmit"] >= t_high]
@@ -449,6 +517,8 @@ def calibrate(labels: Dict[str, Any], min_precision: float = 0.90,
       "reliability_in_derived_band": reliability_in_band(
           cases, band["T_TRANSMIT_LOW"], band["T_TRANSMIT_HIGH"]),
       "destination": destination_report(cases),
+      # WP10: labelled vs run-confirmed data type.
+      "type_confirmation": type_confirmation_report(cases),
       # The joined rows themselves (label fields + ``p_transmit`` + ``run_*``),
       # so two reports can be diffed case by case. The report is written
       # next to the label file, out of tree, so real file names are fine here.
@@ -468,6 +538,11 @@ def calibrate(labels: Dict[str, Any], min_precision: float = 0.90,
     report["warnings"].append(
         f"{wrong} confirmed non-collection destination(s) disagree with the label "
         "(a severity was lowered on a wrong class); see destination.applied_downgrades")
+  wrong_types = report["type_confirmation"].get("wrong_relabels") or []
+  if wrong_types:
+    report["warnings"].append(
+        f"{len(wrong_types)} finding(s) relabelled or disputed against a label that confirms "
+        "the scanner's type; see type_confirmation.wrong_relabels")
   if len(cases) < MIN_RECOMMENDED_CASES:
     report["warnings"].append(
         f"only {len(cases)} labelled cases (< {MIN_RECOMMENDED_CASES}); treat as a "
