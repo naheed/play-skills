@@ -672,6 +672,18 @@ def is_type_position(line: str, col: int, length: int) -> bool:
   return False
 
 
+def is_code_line(line: str) -> bool:
+  """True unless ``line`` is a full-line comment or an import / using line.
+
+  The public form of the ``_COMMENT_PREFIXES`` / ``_IMPORT_PREFIXES`` check
+  that every deterministic scan in this module applies before it reads
+  identifiers (WP11 exposes it for the identity-lifecycle scan). Blank lines
+  count as code (nothing to misread).
+  """
+  stripped = line.lstrip()
+  return not (stripped.startswith(_COMMENT_PREFIXES) or stripped.startswith(_IMPORT_PREFIXES))
+
+
 def code_portion(line: str) -> str:
   """``line`` with a trailing ``//`` or ``/*`` comment removed (WP9).
 

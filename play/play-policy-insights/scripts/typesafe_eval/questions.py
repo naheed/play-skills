@@ -430,6 +430,103 @@ def account_deletion_gate(data_type: str, description: str) -> Dict[str, Dict[st
   }
 
 
+def account_deletion_lifecycle_battery() -> Dict[str, Dict[str, Any]]:
+  """Two Nouls on one *deletion candidate* file (WP11).
+
+  Asked only when the deterministic identity-lifecycle scan found both a
+  provisioning site (the app registers an account / customer / device on a
+  server) and a deletion-shaped call somewhere in shipped source. The state
+  is ``{"signal": {"file", "lines", "tokens"}, "code_snippet": ...,
+  "network_indicators": [...], "persistence_indicators": [...],
+  "provisioning": [{file, line, token, evidence}, ...]}``. The two questions
+  are deliberately complementary so the composer can tell "deletes on the
+  server" from "only clears local state" from "cannot tell":
+
+  * ``is_remote_delete`` >= ``T_REMOTE_DELETE`` -> compliant path (traced).
+  * ``clears_local_state_only`` >= ``T_LOCAL_ONLY_DELETE`` -> IMPORTANT, the
+    partial-deletion trap (sign-out or local wipe presented as deletion).
+  * neither -> IMPORTANT + review (the provisioning is real; the deletion is
+    unconfirmed).
+  """
+  return {
+      "is_remote_delete": _noul(
+          instructions=(
+              "Does `code_snippet` (from `signal.file`) delete or unregister the "
+              "user's ACCOUNT or server-side identity ON THE SERVER — an HTTP "
+              "DELETE, a call to a deletion / unregistration / close-account "
+              "endpoint, or a request whose path or method name denotes deleting "
+              "the account, customer, device or installation that `provisioning` "
+              "shows being registered? Cancelling a subscription, deactivating a "
+              "feature, signing out or clearing local data is NOT a remote delete."
+          ),
+          yes="It sends a request that removes the account / identity on the server.",
+          no="It does not remove the identity on the server (local, sign-out, feature, subscription).",
+      ),
+      "clears_local_state_only": _noul(
+          instructions=(
+              "Does `code_snippet` ONLY clear local state — preferences, database "
+              "rows, cached tokens, a sign-out — with no request that removes the "
+              "account or identity on the server? Use `network_indicators` and "
+              "`persistence_indicators` as evidence to weigh, not as the answer."
+          ),
+          yes="Only local state is cleared; nothing is removed on the server.",
+          no="A server-side removal is requested (or the snippet does neither).",
+      ),
+  }
+
+
+LOGIN_GATE_OPTIONS = {
+    "app_account": (
+        "Users sign in to an account the DEVELOPER operates (email / phone /"
+        " username + password, own backend session, paid tier login) and features"
+        " are gated behind it."
+    ),
+    "user_remote_server_credentials": (
+        "Users enter credentials for THEIR OWN server or service (FTP / SFTP / SMB /"
+        " WebDAV / IMAP / self-hosted) which the app stores on the device; the"
+        " developer runs no account system."
+    ),
+    "third_party_sign_in_bridge": (
+        "Users sign in through an identity provider (federated / OAuth / platform"
+        " sign-in) that establishes an account with the developer's app or backend."
+    ),
+    "none": (
+        "No feature is gated behind a login; the login-shaped tokens are incidental"
+        " (a password field for encryption, a 'credentials' helper, test code)."
+    ),
+    "unknown": "The evidence does not show which kind of login gate, if any, exists.",
+}
+
+
+def login_gate_battery() -> Dict[str, Dict[str, Any]]:
+  """One closed Choice, asked once per app when login-shaped evidence exists (WP11).
+
+  The state is ``{"app": {...}, "login_files": [{file, hits, tokens,
+  remote_server_tokens}], "semantic_files": [...], "snippets": {file: text},
+  "declared_capabilities": [...]}``. Composition (``engine._ask_login_gate``):
+  ``app_account`` / ``third_party_sign_in_bridge`` at/above
+  ``CONF_LOGIN_GATE`` -> IMPORTANT ``login_credentials`` (reviewer credentials +
+  deletion link); ``user_remote_server_credentials`` -> no finding, recorded;
+  ``none`` -> nothing; below the bar -> SUGGESTION + review.
+  """
+  return {
+      "login_gate_type": {
+          "type": "choice",
+          "instructions": (
+              "From `login_files` (shipped source files with login / sign-in / "
+              "credential tokens, their `remote_server_tokens` counts), the "
+              "`snippets`, `semantic_files` (layouts or classes named like a "
+              "login screen) and `app`, what kind of login gate does this app "
+              "have? Pick the single best option; `user_remote_server_credentials` "
+              "when the credentials are for the user's own server (host / port / "
+              "protocol fields), `none` when nothing is gated, `unknown` only when "
+              "the evidence does not show it."
+          ),
+          "criteria": dict(LOGIN_GATE_OPTIONS),
+      }
+  }
+
+
 def photo_video_battery(data_type: str, token: str = "") -> Dict[str, Dict[str, Any]]:
   """Battery for one media code site under ``photo_video_access_policy`` (WP9).
 

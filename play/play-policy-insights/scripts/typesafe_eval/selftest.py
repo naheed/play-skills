@@ -3232,6 +3232,283 @@ def _test_data_type_confirmed() -> None:
            and any("relabelled or disputed" in w for w in rep["warnings"]), str((t["missed_relabels"], t["wrong_relabels"])))
 
 
+_KT_PROVISION_API = """package com.x.net
+import java.net.HttpURLConnection
+interface AccountApi {
+  // registerDevice is documented here; the comment must not count
+  @POST("/d/reg")
+  suspend fun registerDevice(accountId: String?, deviceId: String?): Response
+  @GET("/d/status")
+  suspend fun status(accountId: String): Response
+}
+"""
+
+_KT_PROVISION_CALLER = """package com.x.iab
+import com.x.net.AccountApi
+import android.content.SharedPreferences
+class Identity(val api: AccountApi, val prefs: SharedPreferences) {
+  suspend fun ensure(): String {
+    val existing = prefs.getString("cid", null)
+    val response = api.registerDevice(existing, null)
+    val accountId = response.body().get("cid").asString
+    prefs.edit().putString("cid", accountId).apply()
+    return accountId
+  }
+}
+"""
+
+_KT_REMOTE_DELETE = """package com.x.iab
+import com.x.net.AccountApi
+class AccountRemover(val api: AccountApi) {
+  @DELETE("/d/acc")
+  suspend fun deleteAccount(accountId: String): Boolean {
+    val ok = api.status(accountId)
+    return ok != null
+  }
+}
+"""
+
+_KT_LOCAL_DELETE = """package com.x.ui
+import android.content.SharedPreferences
+class SignOut(val prefs: SharedPreferences) {
+  fun removeUser() {
+    prefs.edit().clear().apply()
+  }
+}
+"""
+
+_KT_LOGIN_SCREEN = """package com.x.ui
+class LoginActivity {
+  fun signIn(user: String, password: String) {
+    val host = "example.invalid"
+    val port = 22
+    authenticate(user, password)
+  }
+  fun authenticate(u: String, p: String) {}
+}
+"""
+
+_KT_RECEIVER_ONLY = """package com.x.ui
+import android.content.Context
+class Plain(val ctx: Context) {
+  fun start() { ctx.registerReceiver(null, null) }  // registerDevice in a trailing comment
+  fun stop() { ctx.unregisterReceiver(null) }
+}
+"""
+
+
+def _test_identity_lifecycle() -> None:
+  """WP11: deterministic identity-lifecycle scan, sites/candidates, and the two app-level policies."""
+  from typesafe_eval import capabilities as capsmod
+  from typesafe_eval import constants
+  from typesafe_eval import engine
+  from typesafe_eval import identity
+  from typesafe_eval import templates
+  from typesafe_eval.client import HeuristicJevClient, JevAnswer, JevClient
+
+  # --- scan_lines: verbs bound to nouns, comments skipped, shapes recorded.
+  fl = identity.scan_lines("Api.kt", _KT_PROVISION_API.splitlines())
+  _check("identity_scan_provision_verbs", fl.tokens_of(identity.PROVISION) == ["registerDevice"]
+         and fl.lines_of(identity.PROVISION) == [5], str(fl.to_dict()))
+  _check("identity_scan_network_shape", fl.has(identity.NETWORK) and "@POST(" in fl.tokens_of(identity.NETWORK)
+         and "HttpURLConnection" not in fl.tokens_of(identity.NETWORK), str(fl.tokens_of(identity.NETWORK)))
+  _check("identity_scan_identity_tokens", "accountId" in fl.tokens_of(identity.IDENTITY)
+         and "deviceId" in fl.tokens_of(identity.IDENTITY), str(fl.tokens_of(identity.IDENTITY)))
+  plain = identity.scan_lines("Plain.kt", _KT_RECEIVER_ONLY.splitlines())
+  _check("identity_scan_receiver_not_provisioning", not plain.has(identity.PROVISION) and not plain.has(identity.DELETE),
+         str(plain.to_dict()))
+  rem = identity.scan_lines("Rem.kt", _KT_REMOTE_DELETE.splitlines())
+  _check("identity_scan_delete_verbs", set(rem.tokens_of(identity.DELETE)) >= {"deleteAccount", "@DELETE("},
+         str(rem.tokens_of(identity.DELETE)))
+  caller = identity.scan_lines("Identity.kt", _KT_PROVISION_CALLER.splitlines())
+  _check("identity_scan_persist_shape", caller.has(identity.PERSIST) and "putString(" in caller.tokens_of(identity.PERSIST)
+         and not caller.has(identity.NETWORK), str(caller.to_dict()))
+  login = identity.scan_lines("Login.kt", _KT_LOGIN_SCREEN.splitlines())
+  _check("identity_scan_login_shapes", {"signIn", "password", "authenticate"} <= set(login.tokens_of(identity.LOGIN))
+         and len(login.of(identity.USER_SERVER)) == 2, str(login.to_dict()))
+  _check("identity_hits_capped", len(identity.scan_lines("X.kt", ["val password = 1"] * 40).of(identity.LOGIN))
+         == constants.MAX_LIFECYCLE_HITS_PER_FILE)
+
+  class _Lifecycle(JevClient):
+    name = "fixed-lifecycle"
+    def __init__(self, remote=0.1, local=0.1, gate=None, gate_conf=0.9, fail=False):
+      super().__init__(); self.remote = remote; self.local = local; self.gate = gate
+      self.gate_conf = gate_conf; self.fail = fail; self.lifecycle_states = []; self.gate_states = []
+    def system_one(self, state, questions, model=None):
+      if "is_remote_delete" in questions:
+        self.lifecycle_states.append(state)
+        if self.fail:
+          raise RuntimeError("boom")
+        return {"is_remote_delete": JevAnswer("noul", noul=self.remote),
+                "clears_local_state_only": JevAnswer("noul", noul=self.local)}
+      if "login_gate_type" in questions:
+        self.gate_states.append(state)
+        opts = list(questions["login_gate_type"]["criteria"])
+        g = self.gate or "unknown"
+        probs = {o: (self.gate_conf if o == g else (1 - self.gate_conf) / (len(opts) - 1)) for o in opts}
+        return {"login_gate_type": JevAnswer("choice", choice=g, probabilities=probs, confidence=self.gate_conf)}
+      return HeuristicJevClient().system_one(state, questions, model)
+
+  def _app(d, files):
+    for rel, text in files.items():
+      os.makedirs(os.path.dirname(os.path.join(d, rel)), exist_ok=True)
+      with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
+        f.write(text)
+
+  def _run(d, client, semantic=None):
+    scratch = os.path.join(d, ".scratch")
+    _write_scratch(d, scratch, {})
+    if semantic is not None:
+      p = os.path.join(scratch, "data_safety_scan.json")
+      doc = json.load(open(p, encoding="utf-8")); doc["semantic_files"] = {"USER_ACCOUNT": semantic}
+      json.dump(doc, open(p, "w", encoding="utf-8"))
+    engine.run(scratch, client, batched=True, capability_cache=capsmod.CapabilityCache(os.path.join(d, "caps.json")))
+    worker = json.load(open(os.path.join(scratch, "worker_user_account.json"), encoding="utf-8"))["findings"]
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    return worker, triage
+
+  base = "app/src/main/java/com/x/"
+  prov_files = {base + "net/AccountApi.kt": _KT_PROVISION_API, base + "iab/Identity.kt": _KT_PROVISION_CALLER,
+                base + "ui/Plain.kt": _KT_RECEIVER_ONLY}
+
+  # (a) provisioning (network one hop away, persisted in the caller), no deletion -> IMPORTANT no_deletion_path.
+  with tempfile.TemporaryDirectory() as d:
+    _app(d, prov_files)
+    worker, triage = _run(d, _Lifecycle())
+    ad = [f for f in worker if f["policy_id"] == "account_deletion" and f.get("kind") == "identity_lifecycle"]
+    _check("lifecycle_no_deletion_path_important", len(ad) == 1 and ad[0]["severity"] == "IMPORTANT"
+           and ad[0]["lifecycle_mode"] == "no_deletion_path" and not ad[0].get("needs_manual_review"),
+           json.dumps([(f.get("lifecycle_mode"), f["severity"]) for f in ad]))
+    il = triage["identity_lifecycle"]
+    sites = il["assessment"]["provisioning"]
+    _check("lifecycle_site_reach_traced", il["outcome"] == "no_deletion_path" and len(sites) == 2
+           and any(s["file"].endswith("Identity.kt") and s["network"]["source"] == "hop" and s["persisted"] for s in sites)
+           and any(s["file"].endswith("AccountApi.kt") and s["network"]["source"] == "file" for s in sites),
+           json.dumps(sites)[:400])
+    _check("lifecycle_counters", triage["counters"]["identity_lifecycle"]["provisioning_sites"] == 2
+           and triage["counters"]["identity_lifecycle"]["deletion_candidates"] == 0
+           and triage["counters"]["identity_lifecycle"]["scanned"] == 3, json.dumps(triage["counters"]["identity_lifecycle"]))
+    _check("lifecycle_login_not_asked", triage["login_gate"]["source"] == "not_asked"
+           and not [f for f in worker if f["policy_id"] == "login_credentials"], json.dumps(triage["login_gate"]))
+
+  # (b) provisioning without any persistence shape -> SUGGESTION + review.
+  with tempfile.TemporaryDirectory() as d:
+    _app(d, {base + "net/AccountApi.kt": _KT_PROVISION_API})
+    worker, triage = _run(d, _Lifecycle())
+    ad = [f for f in worker if f.get("kind") == "identity_lifecycle"]
+    _check("lifecycle_persistence_unconfirmed_suggestion", len(ad) == 1 and ad[0]["severity"] == "SUGGESTION"
+           and ad[0]["lifecycle_mode"] == "persistence_unconfirmed" and ad[0].get("needs_manual_review") is True,
+           json.dumps(ad)[:300])
+
+  # (c) remote delete confirmed -> compliant, traced, no finding.
+  with tempfile.TemporaryDirectory() as d:
+    _app(d, {**prov_files, base + "iab/AccountRemover.kt": _KT_REMOTE_DELETE, base + "ui/SignOut.kt": _KT_LOCAL_DELETE})
+    client = _Lifecycle(remote=0.9, local=0.1)
+    worker, triage = _run(d, client)
+    il = triage["identity_lifecycle"]
+    _check("lifecycle_remote_delete_confirmed", il["outcome"] == "remote_delete_confirmed"
+           and not [f for f in worker if f.get("kind") == "identity_lifecycle"]
+           and il["confirmed"]["file"].endswith("AccountRemover.kt") and il["confirmed"]["remote_shaped"],
+           json.dumps(il.get("asked")))
+    cands = il["assessment"]["deletion_candidates"]
+    _check("lifecycle_candidates_ranked_remote_first", [c["file"].split("/")[-1] for c in cands] == ["AccountRemover.kt", "SignOut.kt"]
+           and cands[0]["remote_shaped"] and not cands[1]["remote_shaped"], json.dumps(cands)[:300])
+    st = client.lifecycle_states[0]
+    _check("lifecycle_state_shape", set(st) == {"app", "signal", "code_snippet", "network_indicators", "persistence_indicators", "provisioning"}
+           and st["signal"]["file"].endswith("AccountRemover.kt") and "deleteAccount" in st["code_snippet"]
+           and len(st["provisioning"]) == 2 and st["network_indicators"], str(sorted(st)))
+    _check("lifecycle_asked_once_when_confirmed", len(client.lifecycle_states) == 1
+           and triage["counters"]["identity_lifecycle"]["requests"] == 1)
+
+  # (d) local-only deletion -> IMPORTANT local_only (no review); (e) neither -> IMPORTANT unconfirmed + review;
+  # (f) client failure -> IMPORTANT + review with the error traced.
+  with tempfile.TemporaryDirectory() as d:
+    _app(d, {**prov_files, base + "ui/SignOut.kt": _KT_LOCAL_DELETE})
+    worker, triage = _run(d, _Lifecycle(remote=0.1, local=0.9))
+    ad = [f for f in worker if f.get("kind") == "identity_lifecycle"]
+    _check("lifecycle_local_only_important", len(ad) == 1 and ad[0]["severity"] == "IMPORTANT"
+           and ad[0]["lifecycle_mode"] == "local_only" and not ad[0].get("needs_manual_review")
+           and any(p.endswith("SignOut.kt") for p in ad[0]["files_involved"]), json.dumps(ad)[:300])
+  with tempfile.TemporaryDirectory() as d:
+    _app(d, {**prov_files, base + "ui/SignOut.kt": _KT_LOCAL_DELETE})
+    worker, triage = _run(d, _Lifecycle(remote=0.3, local=0.3))
+    ad = [f for f in worker if f.get("kind") == "identity_lifecycle"]
+    _check("lifecycle_unconfirmed_review", len(ad) == 1 and ad[0]["severity"] == "IMPORTANT"
+           and ad[0]["lifecycle_mode"] == "unconfirmed" and ad[0].get("needs_manual_review") is True, json.dumps(ad)[:300])
+  with tempfile.TemporaryDirectory() as d:
+    _app(d, {**prov_files, base + "ui/SignOut.kt": _KT_LOCAL_DELETE})
+    worker, triage = _run(d, _Lifecycle(fail=True))
+    ad = [f for f in worker if f.get("kind") == "identity_lifecycle"]
+    _check("lifecycle_failure_keeps_finding", len(ad) == 1 and ad[0]["severity"] == "IMPORTANT"
+           and ad[0].get("needs_manual_review") is True and "error" in triage["identity_lifecycle"]["asked"][0],
+           json.dumps(triage["identity_lifecycle"].get("asked")))
+
+  # (g) no provisioning -> nothing, even with a deletion-shaped call and a login screen.
+  with tempfile.TemporaryDirectory() as d:
+    _app(d, {base + "ui/SignOut.kt": _KT_LOCAL_DELETE, base + "ui/LoginActivity.kt": _KT_LOGIN_SCREEN})
+    client = _Lifecycle(gate="user_remote_server_credentials", gate_conf=0.93)
+    worker, triage = _run(d, client, semantic=["login.xml"])
+    _check("lifecycle_no_provisioning_no_finding", triage["identity_lifecycle"]["outcome"] == "no_provisioning"
+           and not [f for f in worker if f.get("kind") == "identity_lifecycle"] and not client.lifecycle_states)
+    lg = triage["login_gate"]
+    _check("login_gate_user_server_recorded_no_finding", lg["gate_type"] == "user_remote_server_credentials"
+           and lg["source"] == "model" and not [f for f in worker if f["policy_id"] == "login_credentials"]
+           and triage["counters"]["login_gate_outcome"] == "user_remote_server_credentials", json.dumps(lg)[:300])
+    st = client.gate_states[0]
+    _check("login_gate_state_shape", set(st) == {"app", "login_files", "semantic_files", "snippets", "declared_capabilities"}
+           and st["semantic_files"] == ["login.xml"] and st["login_files"][0]["file"].endswith("LoginActivity.kt")
+           and st["login_files"][0]["remote_server_tokens"] == 2 and "signIn" in next(iter(st["snippets"].values())),
+           json.dumps(st)[:400])
+    # Same evidence again -> cache hit, no second model call.
+    client2 = _Lifecycle(gate="app_account", gate_conf=0.95)
+    scratch = os.path.join(d, ".scratch")
+    engine.run(scratch, client2, batched=True, capability_cache=capsmod.CapabilityCache(os.path.join(d, "caps.json")))
+    triage2 = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    _check("login_gate_cached", triage2["login_gate"]["source"] == "cache"
+           and triage2["login_gate"]["gate_type"] == "user_remote_server_credentials" and not client2.gate_states,
+           json.dumps(triage2["login_gate"])[:200])
+
+  # (h) app account -> IMPORTANT login_credentials; (i) unknown / low confidence -> SUGGESTION + review;
+  # (j) none -> nothing.
+  for gate, conf, expect in (("app_account", 0.9, ("IMPORTANT", False)),
+                             ("third_party_sign_in_bridge", 0.9, ("IMPORTANT", False)),
+                             ("app_account", constants.CONF_LOGIN_GATE - 0.05, ("SUGGESTION", True)),
+                             ("unknown", 0.9, ("SUGGESTION", True)),
+                             ("none", 0.9, None)):
+    with tempfile.TemporaryDirectory() as d:
+      _app(d, {base + "ui/LoginActivity.kt": _KT_LOGIN_SCREEN})
+      worker, triage = _run(d, _Lifecycle(gate=gate, gate_conf=conf))
+      lc = [f for f in worker if f["policy_id"] == "login_credentials"]
+      if expect is None:
+        _check(f"login_gate_{gate}_no_finding", not lc, json.dumps(lc)[:200])
+      else:
+        _check(f"login_gate_{gate}_{conf:.2f}", len(lc) == 1 and lc[0]["severity"] == expect[0]
+               and bool(lc[0].get("needs_manual_review")) == expect[1] and lc[0]["login_gate_type"] == gate
+               and lc[0]["kind"] == "login_gate" and lc[0]["files_involved"][0].endswith("LoginActivity.kt"),
+               json.dumps(lc)[:300])
+
+  # Templates and rollback flags.
+  _check("lifecycle_templates", templates.lifecycle_summary("local_only") != templates.lifecycle_summary("no_deletion_path")
+         and templates.lifecycle_summary("bogus") == templates.lifecycle_summary("unconfirmed")
+         and "reviewer" in templates.recommendation("login_credentials", "IMPORTANT")
+         and "in-app" in templates.recommendation("account_deletion", "IMPORTANT")
+         and "login" in templates.login_gate_summary("app_account"))
+  _check("lifecycle_batteries_closed", set(q.account_deletion_lifecycle_battery()) == {"is_remote_delete", "clears_local_state_only"}
+         and set(q.login_gate_battery()["login_gate_type"]["criteria"]) == set(q.LOGIN_GATE_OPTIONS)
+         and {"unknown", "none", "user_remote_server_credentials"} <= set(q.LOGIN_GATE_OPTIONS))
+  old = constants.IDENTITY_LIFECYCLE_ENABLED, constants.LOGIN_GATE_ENABLED
+  try:
+    constants.IDENTITY_LIFECYCLE_ENABLED = False
+    constants.LOGIN_GATE_ENABLED = False
+    with tempfile.TemporaryDirectory() as d:
+      _app(d, {**prov_files, base + "ui/LoginActivity.kt": _KT_LOGIN_SCREEN})
+      worker, triage = _run(d, _Lifecycle(gate="app_account"))
+      _check("lifecycle_rollback_flags", not [f for f in worker if f.get("kind") in ("identity_lifecycle", "login_gate")]
+             and triage["identity_lifecycle"] == {} and triage["login_gate"]["source"] == "not_asked", json.dumps(worker)[:200])
+  finally:
+    constants.IDENTITY_LIFECYCLE_ENABLED, constants.LOGIN_GATE_ENABLED = old
+
+
 def _test_app_profile() -> None:
   """WP1: evaluator-owned manifest parsing and source-set merge."""
   from typesafe_eval import android_manifest as am
@@ -3510,6 +3787,7 @@ def main() -> int:
   _test_wave1_manifest_policies()
   _test_wave2_storage_policies()
   _test_data_type_confirmed()
+  _test_identity_lifecycle()
   _test_lexical_pregate()
   _test_parse_finding()
   _test_snippet_and_colocation()

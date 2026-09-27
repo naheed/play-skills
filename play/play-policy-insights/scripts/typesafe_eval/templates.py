@@ -91,10 +91,35 @@ _RECOMMENDATIONS: Dict[str, object] = {
         "Update the Play Console Data Safety form so the declared collection"
         " matches the behavior detected in code."
     ),
-    "account_deletion": (
-        "Publish a web-based account deletion path and declare it in the Play"
-        " Console Data Safety form to satisfy the account-deletion policy."
-    ),
+    "account_deletion": {
+        # IMPORTANT: the WP11 lifecycle findings (identity provisioned without a
+        # deletion path / deletion clears local state only).
+        "IMPORTANT": (
+            "Implement a discoverable in-app account deletion path (e.g. under"
+            " Account settings) that removes the server-side account and every"
+            " identifier the app registered (account, customer, device), then"
+            " clears local state; publish the matching web deletion link and"
+            " declare it in the Play Console Data Safety form."
+        ),
+        # SUGGESTION: the per-token presence spec and an unconfirmed lifecycle.
+        "SUGGESTION": (
+            "Publish a web-based account deletion path and declare it in the Play"
+            " Console Data Safety form to satisfy the account-deletion policy."
+        ),
+    },
+    # WP11: login_credentials (Play Console reviewer requirements).
+    "login_credentials": {
+        "IMPORTANT": (
+            "Because the app gates features behind a login, complete the Play"
+            " Console app-access setup: submit active, non-expiring reviewer"
+            " credentials and provide the public account-deletion link."
+        ),
+        "SUGGESTION": (
+            "Confirm whether the app gates any feature behind a login; if it does,"
+            " submit reviewer credentials and the account-deletion link in the Play"
+            " Console app-access section."
+        ),
+    },
     # WP5 wave-1 manifest policies. Wording mirrors the goal matrices.
     "all_files_access_policy": {
         "CRITICAL": (
@@ -256,6 +281,10 @@ def issue_summary(
   if policy_id == "account_deletion":
     return "Verify a web-based account deletion path is published"
 
+  if policy_id == "login_credentials":
+    return ("App gates features behind a login; Play Console reviewer credentials"
+            " and an account-deletion link are required")
+
   # Generic fallback keeps output well-formed for policies without a template.
   subject = f"{data_type} " if data_type else ""
   return f"{subject}may violate {name}".strip()
@@ -290,3 +319,52 @@ def root_folder_summary(mode: str, justified: bool) -> str:
   tail = (" (file-management purpose: scoped alternative suggested)" if justified
           else " (scoped storage mandate)")
   return f"App {what}{tail}"
+
+
+# WP11: per-mode wording for the app-level ``account_deletion`` lifecycle
+# finding. ``mode`` values are the ones ``engine._run_identity_lifecycle``
+# derives (see ``constants`` WP11 block).
+_LIFECYCLE_SUMMARY = {
+    "no_deletion_path": (
+        "App registers a server-side identity (account / customer / device) but no code"
+        " path deletes or unregisters it"
+    ),
+    "persistence_unconfirmed": (
+        "App appears to register a server-side identity with no deletion path (local"
+        " persistence of the identity not confirmed)"
+    ),
+    "local_only": (
+        "App registers a server-side identity; the deletion path found only clears local"
+        " state and does not remove the identity on the server"
+    ),
+    "unconfirmed": (
+        "App registers a server-side identity; the deletion path found could not be"
+        " confirmed to delete the identity on the server"
+    ),
+}
+
+
+def lifecycle_summary(mode: str) -> str:
+  """Summary for the app-level ``account_deletion`` lifecycle finding (WP11)."""
+  return _LIFECYCLE_SUMMARY.get(mode, _LIFECYCLE_SUMMARY["unconfirmed"])
+
+
+_LOGIN_GATE_SUMMARY = {
+    "app_account": (
+        "App gates features behind a login to a developer-operated account; Play Console"
+        " reviewer credentials and an account-deletion link are required"
+    ),
+    "third_party_sign_in_bridge": (
+        "App gates features behind a third-party sign-in into a developer account; Play"
+        " Console reviewer credentials and an account-deletion link are required"
+    ),
+    "unknown": (
+        "Login-shaped code found but the kind of login gate is unclear; confirm whether"
+        " reviewer credentials are required"
+    ),
+}
+
+
+def login_gate_summary(gate_type: str) -> str:
+  """Summary for a ``login_credentials`` finding (WP11)."""
+  return _LOGIN_GATE_SUMMARY.get(gate_type, _LOGIN_GATE_SUMMARY["unknown"])

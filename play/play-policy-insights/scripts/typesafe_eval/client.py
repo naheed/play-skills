@@ -335,6 +335,10 @@ class HeuristicJevClient(JevClient):
 
     data_type = signal.get("data_type", "")
     has_network = bool(co.get("network_transmission"))
+    # WP11 lifecycle states carry the deterministic network reach instead of
+    # co-located scanner signals.
+    if isinstance(state, dict) and state.get("network_indicators"):
+      has_network = True
     # Critic states carry the finding instead of a signal; treat labelled sinks
     # (or a snippet that mentions related data-flow lines) as network evidence.
     finding = state.get("finding", {}) if isinstance(state, dict) else {}
@@ -601,6 +605,14 @@ class HeuristicJevClient(JevClient):
       strong = ("deleteaccount", "purgeuserdata", "closeaccount", "removeuser",
                 "requestdelete", "destroy_account", "delete_profile")
       return 0.9 if any(s in pattern for s in strong) else 0.15
+    if qid == "is_remote_delete":
+      # WP11 stand-in: a deletion candidate that the deterministic scan found
+      # to reach the network (``network_indicators`` non-empty) is read as a
+      # remote delete; one that does not is not. The live model reads the code.
+      return 0.85 if has_network else 0.15
+    if qid == "clears_local_state_only":
+      # WP11 stand-in: the complement of the above.
+      return 0.15 if has_network else 0.85
     if qid == "declaration_covers":
       return 0.5
     return 0.5
@@ -635,6 +647,12 @@ class HeuristicJevClient(JevClient):
       # relabelled or capped). Tests exercise the other branches with fixed
       # answers.
       return _peak(probs, "as_labelled" if "as_labelled" in probs else options[0])
+    if qid == "login_gate_type" and probs:
+      # WP11 stand-in for the once-per-app login-gate Choice: it cannot read
+      # the snippets, so it answers ``unknown`` (peaked), which the engine
+      # composes as SUGGESTION + review -- the recall-safe default. Tests
+      # that need a specific gate type use a fixed client.
+      return _peak(probs, "unknown" if "unknown" in probs else options[-1])
     if qid == "declared_core_purpose" and probs:
       # Offline stand-in for the once-per-app purpose question (WP4): it has
       # no store listing to read, so it answers ``unknown`` with a peaked

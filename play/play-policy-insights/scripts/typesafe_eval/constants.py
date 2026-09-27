@@ -508,6 +508,110 @@ TYPE_CONFUSION_SIBLINGS = {
 }
 
 # ---------------------------------------------------------------------------
+# WP11: wave-3 user-account policies (``account_deletion`` heuristics,
+# ``login_credentials``).
+#
+# account_deletion -- "server-side identity provisioned without a deletion
+# path". The scanner's per-token spec (``ACCOUNT_DELETION`` patterns + the
+# ``is_account_deletion`` gate) can only confirm a deletion that is *named*
+# like one; it cannot see the absence of a deletion path, which is the policy's
+# actual failure mode. ``identity.scan_app`` walks every shipped first-party
+# source file once (no model call) and records, at identifier boundaries and
+# outside comments:
+#   provisioning  a call that registers / creates an account, customer, device
+#                 or installation on a server (``IDENTITY_PROVISION_RE``);
+#   deletion      a call that deletes / removes / closes / unregisters one
+#                 (``IDENTITY_DELETE_RE``) or an HTTP DELETE route;
+#   identity      an account / customer / device / session identifier token
+#                 (``IDENTITY_TOKEN_RE``);
+#   network       an in-file HTTP shape (``NETWORK_SHAPE_RE``) or an import the
+#                 capability layer already labelled NETWORK_EGRESS;
+#   persistence   a write to preferences / a database / a key store
+#                 (``PERSIST_SHAPE_RE``) or a LOCAL_PERSISTENCE import.
+# A *provisioning site* is a file with provisioning + identity + network (in the
+# file or one first-party hop away); it is *persisted* when the file or a hop
+# also writes locally. A *deletion candidate* is a file with a deletion verb;
+# it is *remote-shaped* when it also reaches the network. Composition
+# (``engine._run_identity_lifecycle``):
+#   provisioning, no deletion candidate      -> IMPORTANT (SUGGESTION + review
+#                                               when persistence is not seen)
+#   provisioning + candidate(s)              -> ask the two Nouls on each
+#                                               candidate (at most
+#                                               MAX_DELETION_CANDIDATES):
+#     is_remote_delete >= T_REMOTE_DELETE           -> compliant path, traced
+#     clears_local_state_only >= T_LOCAL_ONLY_DELETE -> IMPORTANT "clears local
+#                                                       state only"
+#     neither                                       -> IMPORTANT + review
+#   no provisioning                          -> nothing (App B: the user's own
+#                                               server credentials are stored
+#                                               locally; nothing is provisioned)
+# A client failure keeps the finding (recall-safe). The verb lists are closed
+# and generic (no product names); add a verb only with a fixture.
+#
+# login_credentials -- one closed Choice per app, ``login_gate_type``, asked
+# only when the deterministic scan finds login-shaped evidence (a login /
+# sign-in / credential token in shipped source, or a semantic USER_ACCOUNT
+# file), cached by digest like ``declared_core_purpose``:
+#   app_account / third_party_sign_in_bridge >= CONF_LOGIN_GATE -> IMPORTANT
+#     (Play Console reviewer credentials + account-deletion link)
+#   user_remote_server_credentials >= CONF_LOGIN_GATE -> no finding; recorded
+#   none >= CONF_LOGIN_GATE -> nothing
+#   below the bar / unknown -> SUGGESTION + review (evidence was found)
+# Rollback: IDENTITY_LIFECYCLE_ENABLED / LOGIN_GATE_ENABLED = False skip the
+# stage; the per-token ``account_deletion`` spec is unchanged either way.
+# ---------------------------------------------------------------------------
+IDENTITY_LIFECYCLE_ENABLED = True
+LOGIN_GATE_ENABLED = True
+T_REMOTE_DELETE = 0.60          # Noul: the deletion candidate deletes the account on the server
+T_LOCAL_ONLY_DELETE = 0.60      # Noul: the candidate only clears local state / signs out
+CONF_LOGIN_GATE = 0.70          # Choice confidence at which login_gate_type acts
+MAX_LIFECYCLE_FILES = 6000      # shipped source files scanned per app (cost bound, not evidence)
+MAX_LIFECYCLE_HITS_PER_FILE = 12
+MAX_DELETION_CANDIDATES = 3     # deletion candidates asked per app (strongest first)
+MAX_PROVISIONING_IN_STATE = 6   # provisioning sites listed in the question state
+LIFECYCLE_SNIPPET_LINES = 40    # lines of a deletion candidate shown to the model
+MAX_LOGIN_FILES = 5             # login-evidence files listed in the login_gate_type state
+LOGIN_SNIPPET_LINES = 30        # lines of the two densest login files shown to the model
+# Verbs that provision a server-side identity. ``register`` alone is far too
+# broad (``registerReceiver``), so every verb is bound to an identity noun.
+IDENTITY_PROVISION_RE = (
+    r"\b(?:register|create|provision|enrol|enroll|onboard)(?:Or[A-Z]\w*?)?"
+    r"(?:Customer|Device|User|Account|Installation|Identity|Cid|Did)\b"
+    r"|\bsign[_]?[Uu]p\b|\bcreate_account\b|\bregister_(?:user|device|account|customer)\b"
+)
+IDENTITY_DELETE_RE = (
+    r"\b(?:delete|remove|close|deactivate|purge|destroy|erase|unregister|deregister|forget|revoke|wipe)"
+    r"(?:My|Own|Or[A-Z]\w*?)?(?:Customer|Device|User|Account|Installation|Identity|Cid|Did)(?:Data)?\b"
+    r"|\baccount[_]?[Dd]eletion\b|\brequest[_]?[Dd]elet(?:e|ion)\b|\bdelete_(?:profile|account|user)\b"
+    r"|\bdestroy_account\b|\bpurge[_]?[Uu]ser[_]?[Dd]ata\b|@DELETE\s*\("
+)
+IDENTITY_TOKEN_RE = (
+    r"\b(?:account|customer|device|user|client|install(?:ation)?|registration|session|subscriber|member)"
+    r"[_]?(?:id|Id|ID|token|Token|key|Key)\b|\"(?:cid|did|uid|accountId|deviceId|userId)\""
+)
+NETWORK_SHAPE_RE = (
+    r"@(?:GET|POST|PUT|DELETE|PATCH)\s*\(|\bHttpURLConnection\b|\bHttpsURLConnection\b|\bopenConnection\s*\("
+    r"|\bURL\s*\(\s*\"https?://|\bWebSocket\b|\bHttpClient\b|\bhttps?://[\w.-]+/"
+)
+PERSIST_SHAPE_RE = (
+    r"\bput(?:String|Long|Int|Boolean)\s*\(|\.edit\s*\(\s*\)|\bpersist\w*\b|\b(?:save|store|write)"
+    r"(?:Identity|Account|Device|Cid|Did|Token|Credentials?|Id|Ids|Session)\w*\b|\binsert\w*\s*\(|\bupsert\w*\s*\("
+    r"|\bDao\b|\bdataStore\b|\bDataStore\b|\bKeyStore\b|\bEncryptedFile\b|\bwriteText\s*\(|\bFileOutputStream\s*\("
+)
+# Login-shaped evidence for ``login_gate_type`` (identifier boundaries, code only).
+LOGIN_SHAPE_RE = (
+    r"\b(?:login|logIn|Login|signIn|sign_in|SignIn|signUp|sign_up|SignUp|authenticate|Authenticate"
+    r"|loginWall|LoginActivity|LoginScreen|LoginFragment|LoginDialog|isLoggedIn|isAuthenticated"
+    r"|credentials?|Credentials?|password|Password|oauth|OAuth|idToken|accessToken|refreshToken)\b"
+)
+# Remote-server shapes counted per login file (host / port / protocol fields
+# point at the user's own server rather than a developer account system).
+USER_SERVER_SHAPE_RE = (
+    r"\b(?:host|hostname|Host|Hostname|port|Port|ftp|sftp|smb|ssh|webdav|imap|smtp|nfs"
+    r"|FTP|SFTP|SMB|SSH|WebDAV|IMAP|SMTP|NFS)\b"
+)
+
+# ---------------------------------------------------------------------------
 # Confidence gates (Choice/Score answers carry a calibrated confidence in [0, 1]).
 #
 # Mirrors the three-band pattern from the TypeSafe confidence docs: act, review,

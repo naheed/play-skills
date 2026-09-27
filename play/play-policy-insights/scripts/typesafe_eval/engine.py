@@ -69,6 +69,7 @@ from typesafe_eval import capabilities as caps
 from typesafe_eval import constants
 from typesafe_eval import context
 from typesafe_eval import evaluate
+from typesafe_eval import identity
 from typesafe_eval import questions as q
 from typesafe_eval import registry
 from typesafe_eval import snippets
@@ -146,6 +147,12 @@ class RunContext:
   first_party_index: Optional[structure.FirstPartyIndex] = None
   callee_refs: Dict[str, List[structure.CalleeRef]] = dataclasses.field(default_factory=dict)
   callee_files: Dict[str, structure.FileStructure] = dataclasses.field(default_factory=dict)
+  # WP11: the whole-app identity-lifecycle assessment (``account_deletion``)
+  # and the once-per-app ``login_gate_type`` answer, both written to the
+  # triage file so a reviewer can reproduce the app-level findings.
+  identity_trace: Dict[str, Any] = dataclasses.field(default_factory=dict)
+  login_gate: Dict[str, Any] = dataclasses.field(default_factory=lambda: {
+      "gate_type": "unknown", "confidence": 0.0, "source": "not_asked"})
 
 
 # ---------------------------------------------------------------------------
@@ -1028,6 +1035,313 @@ def _run_manifest(ctx: RunContext, findings_by_goal) -> None:
     ctx.counters.setdefault("manifest_findings", {})[spec.policy_id] = len(found)
 
 
+# ---------------------------------------------------------------------------
+# Stage 6b: identity lifecycle + login gate (WP11, wave 3)
+# ---------------------------------------------------------------------------
+
+LOGIN_GATE_QID = "login_gate_type"
+
+
+def _lifecycle_lookups(ctx: RunContext, cache: Optional[caps.CapabilityCache], model: Optional[str]):
+  """The two read-only lookups :func:`identity.assess` needs.
+
+  ``structure_of`` reuses the structures the run already built (candidate,
+  callee and pruned files) and analyses any other shipped file on demand,
+  memoised. ``labels_of`` returns the capability labels of an import as the
+  run (``ctx.profiles``) or the persistent cache already classified them --
+  never a new model call; an unclassified import has no labels, so the
+  in-file HTTP / persistence shapes carry those files.
+  """
+  memo: Dict[str, Optional[structure.FileStructure]] = {}
+
+  def structure_of(relpath: str) -> Optional[structure.FileStructure]:
+    fs = ctx.files.get(relpath) or ctx.callee_files.get(relpath) or ctx.pruned_files.get(relpath)
+    if fs is not None:
+      return fs
+    if relpath not in memo:
+      try:
+        memo[relpath] = structure.analyze_file(ctx.app_dir, relpath)
+      except Exception as exc:  # pylint: disable=broad-exception-caught
+        log.debug("identity: cannot analyse %s: %s", relpath, exc)
+        memo[relpath] = None
+    return memo[relpath]
+
+  def labels_of(module: str) -> set:
+    profile = ctx.profiles.get(module)
+    if profile is None and cache is not None:
+      hits, misses = cache.hits, cache.misses
+      profile = cache.get(module, model)
+      # A lookup on behalf of this stage is not a classification miss.
+      cache.hits, cache.misses = hits, misses
+    return set(profile.labels) if profile is not None else set()
+
+  return structure_of, labels_of
+
+
+def _semantic_files(ctx: RunContext, category: str) -> List[str]:
+  """The scanner's ``semantic_files[<category>]`` (file names matched by name pattern)."""
+  scan = _load_json(os.path.join(ctx.temp_dir, "data_safety_scan.json"))
+  return [str(x) for x in ((scan.get("semantic_files") or {}).get(category) or [])]
+
+
+def _identity_assessment(ctx: RunContext, cache: Optional[caps.CapabilityCache],
+                         model: Optional[str]) -> Optional[identity.Assessment]:
+  """Runs the deterministic identity-lifecycle scan over the shipped source (WP11).
+
+  Uses the WP6 first-party index as the file list (building it when callee
+  resolution is off). Returns None -- and records why -- when there is no app
+  directory to scan. Never raises.
+  """
+  if not ctx.app_dir:
+    ctx.counters["identity_lifecycle"] = {"skipped": "no app dir"}
+    return None
+  try:
+    if ctx.first_party_index is None:
+      excluded = ctx.counters.get("excluded_flavors") or []
+      ctx.first_party_index = structure.build_first_party_index(ctx.app_dir, excluded_flavors=excluded)
+    scan = identity.scan_app(ctx.app_dir, ctx.first_party_index.package_by_file.keys())
+    structure_of, labels_of = _lifecycle_lookups(ctx, cache, model)
+    assessment = identity.assess(scan, structure_of, labels_of, ctx.first_party_index,
+                                 _semantic_files(ctx, "USER_ACCOUNT"))
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    log.warning("identity lifecycle scan failed (%s: %s); stage skipped", type(exc).__name__, exc)
+    ctx.counters["identity_lifecycle"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    return None
+  ctx.counters["identity_lifecycle"] = {
+      **assessment.scan,
+      "provisioning_sites": len(assessment.provisioning),
+      "deletion_candidates": len(assessment.deletions),
+      "remote_shaped_candidates": sum(1 for d in assessment.deletions if d.remote_shaped),
+      "login_files": len(assessment.login.files),
+  }
+  return assessment
+
+
+def _lifecycle_finding(mode: str, severity: str, assessment: identity.Assessment,
+                       evidence: str, trace: Dict[str, Any], review: bool,
+                       client_name: str) -> Dict[str, Any]:
+  """The app-level ``account_deletion`` finding in the report's shape."""
+  files = {p.relpath for p in assessment.provisioning}
+  if trace.get("candidate_file"):
+    files.add(str(trace["candidate_file"]))
+  files = sorted(files)
+  finding = {
+      "policy_id": "account_deletion",
+      "issue_summary": templates.lifecycle_summary(mode).replace("|", "¦"),
+      "severity": severity,
+      "files_involved": files,
+      "evidence": evidence.replace("|", "¦").replace("\n", " "),
+      "recommendation": templates.recommendation("account_deletion", severity),
+      "client": client_name,
+      "kind": "identity_lifecycle",
+      "lifecycle_mode": mode,
+      "decision_trace": {"evaluator_version": constants.EVALUATOR_VERSION, "mode": mode,
+                         "thresholds": {"T_REMOTE_DELETE": constants.T_REMOTE_DELETE,
+                                        "T_LOCAL_ONLY_DELETE": constants.T_LOCAL_ONLY_DELETE},
+                         **trace},
+  }
+  if review:
+    finding["needs_manual_review"] = True
+  return finding
+
+
+def _run_identity_lifecycle(ctx: RunContext, assessment: Optional[identity.Assessment],
+                            client: JevClient, model: Optional[str], findings_by_goal) -> None:
+  """``account_deletion`` from the whole-app lifecycle facts (WP11).
+
+  Composition (see the WP11 block in :mod:`constants`):
+
+  * no provisioning site -> nothing (the user's own server credentials
+    stored locally, or no account system at all).
+  * provisioning, no deletion candidate -> IMPORTANT ``no_deletion_path``
+    (SUGGESTION + review ``persistence_unconfirmed`` when no site is seen to
+    persist the identity: the evaluator does not assert an Important it
+    cannot support).
+  * provisioning + candidates -> the two Nouls on up to
+    ``MAX_DELETION_CANDIDATES`` candidates, strongest first. Any candidate
+    with ``is_remote_delete >= T_REMOTE_DELETE`` is the compliant path:
+    nothing is composed, the confirmation is traced. Otherwise the best
+    candidate decides: ``clears_local_state_only >= T_LOCAL_ONLY_DELETE`` ->
+    IMPORTANT ``local_only``; else IMPORTANT + review ``unconfirmed``. A
+    client failure keeps the finding (recall-safe) and is traced.
+  The whole assessment goes to ``typesafe_triage.json["identity_lifecycle"]``.
+  """
+  if not constants.IDENTITY_LIFECYCLE_ENABLED or assessment is None:
+    return
+  trace: Dict[str, Any] = {"assessment": assessment.to_dict(), "asked": []}
+  ctx.counters.setdefault("identity_lifecycle", {})["enabled"] = True
+  if not assessment.provisioning:
+    log.info("account_deletion lifecycle: no provisioning site -> no finding")
+    trace["outcome"] = "no_provisioning"
+    ctx.counters["identity_lifecycle"]["outcome"] = "no_provisioning"
+    ctx.identity_trace = trace
+    return
+  prov_evidence = "; ".join(p.evidence for p in assessment.provisioning[:constants.MAX_PROVISIONING_IN_STATE])
+  persisted = any(p.persisted for p in assessment.provisioning)
+  if not assessment.deletions:
+    mode = "no_deletion_path" if persisted else "persistence_unconfirmed"
+    severity = "IMPORTANT" if persisted else "SUGGESTION"
+    log.info("account_deletion lifecycle: %d provisioning site(s), no deletion candidate -> %s %s",
+             len(assessment.provisioning), severity, mode)
+    trace["outcome"] = mode
+    finding = _lifecycle_finding(mode, severity, assessment,
+                                 f"provisioning: {prov_evidence}; no deletion-shaped call in shipped source",
+                                 trace, review=not persisted, client_name="deterministic")
+    findings_by_goal["user_account"].append(finding)
+    ctx.counters["identity_lifecycle"]["outcome"] = mode
+    ctx.identity_trace = trace
+    return
+  structure_of, _ = _lifecycle_lookups(ctx, None, model)
+  battery = q.account_deletion_lifecycle_battery()
+  best: Optional[Dict[str, Any]] = None
+  confirmed: Optional[Dict[str, Any]] = None
+  failed = False
+  for cand in assessment.deletions[:constants.MAX_DELETION_CANDIDATES]:
+    state = identity.deletion_state(cand, structure_of(cand.relpath), assessment.provisioning, ctx.app_facts)
+    row: Dict[str, Any] = {"file": cand.relpath, "lines": [l + 1 for l in cand.lines],
+                           "remote_shaped": cand.remote_shaped}
+    try:
+      answers = client.system_one(state, battery, model=model)
+      ctx.counters["identity_lifecycle"]["requests"] = ctx.counters["identity_lifecycle"].get("requests", 0) + 1
+      row["p_remote_delete"] = round(float(answers["is_remote_delete"].noul or 0.0), 3)
+      row["p_local_only"] = round(float(answers["clears_local_state_only"].noul or 0.0), 3)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      log.warning("account_deletion lifecycle: question failed on %s (%s); keeping the finding", cand.relpath, exc)
+      row["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+      failed = True
+    trace["asked"].append(row)
+    if row.get("p_remote_delete", 0.0) >= constants.T_REMOTE_DELETE:
+      confirmed = row
+      break
+    if best is None or row.get("p_local_only", 0.0) > best.get("p_local_only", 0.0):
+      best = row
+  if confirmed is not None:
+    log.info("account_deletion lifecycle: remote delete confirmed in %s (p=%.2f) -> compliant",
+             confirmed["file"], confirmed["p_remote_delete"])
+    trace["outcome"] = "remote_delete_confirmed"
+    trace["confirmed"] = confirmed
+    ctx.counters["identity_lifecycle"]["outcome"] = "remote_delete_confirmed"
+    ctx.identity_trace = trace
+    return
+  best = best or trace["asked"][0]
+  if best.get("p_local_only", 0.0) >= constants.T_LOCAL_ONLY_DELETE:
+    mode, review = "local_only", False
+  else:
+    mode, review = "unconfirmed", True
+  if failed:
+    review = True
+  log.info("account_deletion lifecycle: %d candidate(s) asked, none confirms a remote delete -> IMPORTANT %s%s",
+           len(trace["asked"]), mode, " (review)" if review else "")
+  trace["outcome"] = mode
+  trace["candidate_file"] = best["file"]
+  trace["candidate"] = best
+  evidence = (f"provisioning: {prov_evidence}; deletion candidate {best['file']}:L{best['lines'][0] if best['lines'] else '?'} "
+              f"p_remote_delete={best.get('p_remote_delete', 'n/a')} p_local_only={best.get('p_local_only', 'n/a')}")
+  finding = _lifecycle_finding(mode, "IMPORTANT", assessment, evidence, trace, review, client_name=client.name)
+  findings_by_goal["user_account"].append(finding)
+  ctx.counters["identity_lifecycle"]["outcome"] = mode
+  ctx.identity_trace = trace
+
+
+def _ask_login_gate(ctx: RunContext, assessment: Optional[identity.Assessment], client: JevClient,
+                    cache: Optional[caps.CapabilityCache], model: Optional[str], findings_by_goal) -> Dict[str, Any]:
+  """``login_credentials`` from one closed Choice per app (WP11).
+
+  Asked only when the deterministic scan found login-shaped evidence (login
+  files or semantic USER_ACCOUNT files); cached by the digest of the state
+  and question text like ``declared_core_purpose``. Result (also on
+  ``ctx.login_gate`` and in the triage file)::
+
+    {"gate_type": "user_remote_server_credentials", "confidence": 0.93,
+     "source": "model"|"cache"|"human"|"unavailable"|"not_asked", "probabilities": {...}}
+
+  Composition: ``app_account`` / ``third_party_sign_in_bridge`` at/above
+  ``CONF_LOGIN_GATE`` -> IMPORTANT; ``user_remote_server_credentials`` /
+  ``none`` at/above the bar -> no finding (recorded); anything else,
+  including a client failure -> SUGGESTION + review (evidence was found; the
+  reviewer decides). The option label is copied to ``app_facts["login_gate"]``
+  so later requests see it.
+  """
+  result: Dict[str, Any] = {"gate_type": "unknown", "confidence": 0.0, "source": "not_asked",
+                            "probabilities": None, "evidence": None}
+  if not constants.LOGIN_GATE_ENABLED or assessment is None or not assessment.login.found:
+    log.info("login gate: %s", "disabled" if not constants.LOGIN_GATE_ENABLED else "no login-shaped evidence; not asked")
+    ctx.login_gate = result
+    return result
+  battery = q.login_gate_battery()
+  state = identity.login_state(assessment.login, ctx.app_facts, ctx.app_facts.get("declared_capabilities") or [])
+  digest_src = json.dumps(state, sort_keys=True, ensure_ascii=False) + "\n" + json.dumps(battery, sort_keys=True)
+  digest = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
+  result["digest"] = digest
+  result["evidence"] = assessment.login.to_dict()
+  cached = cache.get_app_answer(LOGIN_GATE_QID, digest, model) if cache is not None else None
+  if cached is not None:
+    result.update({k: cached.get(k, result.get(k)) for k in ("gate_type", "confidence", "probabilities")})
+    result["source"] = "human" if cached.get("source") == "human" else "cache"
+    log.info("login gate (from %s): %s (confidence %.2f)", result["source"], result["gate_type"], result["confidence"])
+  else:
+    try:
+      answers = client.system_one(state, battery, model=model)
+      a = answers.get(LOGIN_GATE_QID)
+      if a is None or a.type != "choice" or not a.choice:
+        raise ValueError(f"no choice answer for {LOGIN_GATE_QID}: {a}")
+      gate = a.choice if a.choice in q.LOGIN_GATE_OPTIONS else "unknown"
+      if gate != a.choice:
+        log.warning("login gate answer %r not in the closed option set; recorded as unknown", a.choice)
+      result.update({"gate_type": gate, "confidence": float(a.confidence or 0.0),
+                     "probabilities": a.probabilities, "source": "model"})
+      ctx.counters["login_gate_requests"] = ctx.counters.get("login_gate_requests", 0) + 1
+      if cache is not None:
+        cache.put_app_answer(LOGIN_GATE_QID, digest, model, {
+            "gate_type": gate, "confidence": result["confidence"],
+            "probabilities": result["probabilities"], "source": "model", "model": model})
+        cache.save()
+      log.info("login gate (model): %s (confidence %.2f) top=%s", gate, result["confidence"],
+               sorted((a.probabilities or {}).items(), key=lambda kv: -kv[1])[:3])
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      log.warning("login gate question failed (%s: %s); recorded as unknown/unavailable", type(exc).__name__, exc)
+      result["source"] = "unavailable"
+      ctx.counters["login_gate_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+  ctx.login_gate = result
+  ctx.app_facts["login_gate"] = result["gate_type"]
+  gate, conf = result["gate_type"], result["confidence"]
+  established = conf >= constants.CONF_LOGIN_GATE
+  files = [f["file"] for f in assessment.login.files] or list(assessment.login.semantic_files)
+  ev = "; ".join(f"{f['file']} ({f['hits']} login tokens, {f['remote_server_tokens']} remote-server tokens)"
+                 for f in assessment.login.files[:3])
+  if assessment.login.semantic_files:
+    ev = f"{ev}; semantic files: {', '.join(assessment.login.semantic_files[:4])}" if ev else \
+         f"semantic files: {', '.join(assessment.login.semantic_files[:4])}"
+  trace = {"evaluator_version": constants.EVALUATOR_VERSION, "login_gate": {k: v for k, v in result.items() if k != "evidence"},
+           "evidence": result["evidence"], "thresholds": {"CONF_LOGIN_GATE": constants.CONF_LOGIN_GATE}}
+  if established and gate in ("app_account", "third_party_sign_in_bridge"):
+    severity, review, summary = "IMPORTANT", False, templates.login_gate_summary(gate)
+  elif established and gate in ("user_remote_server_credentials", "none"):
+    log.info("login gate: %s (p=%.2f) -> no login_credentials finding", gate, conf)
+    ctx.counters["login_gate_outcome"] = gate
+    return result
+  else:
+    severity, review, summary = "SUGGESTION", True, templates.login_gate_summary("unknown")
+  finding = {
+      "policy_id": "login_credentials",
+      "issue_summary": summary.replace("|", "¦"),
+      "severity": severity,
+      "files_involved": files[:6],
+      "evidence": f"login_gate_type={gate} (p={conf:.2f}, {result['source']}); {ev}".replace("|", "¦"),
+      "recommendation": templates.recommendation("login_credentials", severity),
+      "client": client.name if result["source"] in ("model", "unavailable") else result["source"],
+      "kind": "login_gate",
+      "login_gate_type": gate,
+      "decision_trace": trace,
+  }
+  if review:
+    finding["needs_manual_review"] = True
+  findings_by_goal["user_account"].append(finding)
+  ctx.counters["login_gate_outcome"] = f"{gate}:{severity}"
+  log.info("login gate: %s (p=%.2f) -> %s login_credentials%s", gate, conf, severity, " (review)" if review else "")
+  return result
+
+
 def _file_state(ctx: RunContext, relpath: str, file_tasks: Sequence[Task]):
   fs = ctx.files.get(relpath) or structure.analyze_file(ctx.app_dir, relpath)
   asks = [(t.data_type, t.pattern) for t in file_tasks]
@@ -1255,6 +1569,8 @@ def _write_triage(ctx: RunContext, findings_by_goal, client: JevClient) -> str:
       "findings_by_severity": severities,
       "transfer_decisions": decisions,
       "type_confirmations": relabels,
+      "identity_lifecycle": ctx.identity_trace,
+      "login_gate": ctx.login_gate,
       "capabilities": caps.summarize(ctx.profiles),
       "dependency_capabilities": {
           k: v.labels for k, v in sorted(ctx.dependency_profiles.items())
@@ -1338,6 +1654,11 @@ def run(
 
   _run_deterministic(ctx, det_tasks, client, model, findings_by_goal)
   _run_manifest(ctx, findings_by_goal)
+  # WP11: whole-app facts (provisioning vs deletion paths; login gate).
+  assessment = _identity_assessment(ctx, capability_cache, model) if (
+      constants.IDENTITY_LIFECYCLE_ENABLED or constants.LOGIN_GATE_ENABLED) else None
+  _run_identity_lifecycle(ctx, assessment, client, model, findings_by_goal)
+  _ask_login_gate(ctx, assessment, client, capability_cache, model, findings_by_goal)
   if batched:
     _run_batched(ctx, code_tasks, client, model, findings_by_goal)
   else:
