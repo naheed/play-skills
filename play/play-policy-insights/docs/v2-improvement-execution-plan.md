@@ -622,6 +622,78 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
   evidence and `consent_default_on=true`; the background-location disclosure
   Choice is asked against real text. Recall unchanged.
 - **Size.** One new module, medium edits to `structure.py`, `context.py`.
+- **Outcome (done).** Implemented as planned (the `resources.py` index already
+  existed from WP1 and is reused unchanged) with one deviation and six
+  refinements, all found in three live rounds:
+  1. *Deviation — the composition is asymmetric and double-capped.* The plan
+     said "default-on + no prior disclosure → Critical". The charter caps an
+     UNCERTAIN decision at IMPORTANT and WP7 leaves an unresolved destination
+     as a review item, so a default-on answer *raises* IMPORTANT → CRITICAL
+     only for a TRANSMITS with a resolved destination class when
+     `p >= T_CONSENT_DEFAULT_ON` (0.60) and no located guard is off by
+     default; otherwise it is recorded (`consent_default_on: true`,
+     `decision_trace.consent.capped_by = uncertain_band |
+     unresolved_destination`) without changing severity. The first live run
+     raised 17 UNCERTAIN findings on App A and the second raised two
+     unconfirmed `user_chosen_destination` findings on App B before the two
+     caps. *Lower* to SUGGESTION + review needs the double gate (`p <= 1 -
+     CONF_CONSENT_ACT` **and** a guard with `runs_by_default == False`); an
+     off-by-default guard against a default-on answer *vetoes* the raise
+     (`vetoed_by_guard`, review flag) rather than lowering.
+  2. *Refinement — guard sense is folded with early exits.* App A's crash
+     reporter is guarded by `if (!enabled) { …; return }`: the transfer runs
+     when the flag is **true**, so `structure._is_early_exit` flips the
+     parsed `negated` and every composition decision reads
+     `GuardState.runs_by_default` (declared default folded with sense), never
+     the raw literal.
+  3. *Refinement — a computed default stays unknown.* The same flag's
+     declaration is `booleanPref(…).withDefault<Boolean>(isPlayStoreFlavour())`;
+     no literal, so `default_on` is None deterministically and the evidence
+     quotes the initialiser for the reviewer (`default=unknown init="…"`). The
+     model then answered default-on 0.71 and the finding raised as
+     `model_only` — exactly the Exit criterion, with the honest provenance.
+  4. *Refinement — local variables never corroborate.* `boolean x = false;`
+     inside the anchor scope vetoed a raise on App B; a same-file declaration
+     inside the scope is rewritten to `resolution = local` and excluded from
+     `guard_defaults`, vetoes and lowers (it still appears in `state.guards`
+     so the model can read it).
+  5. *Refinement — stdlib predicates and `when` subjects are not settings.*
+     `token.isEmpty()`, `file.exists()`, `when (file.name)` crowded the
+     `MAX_GUARDS_IN_STATE` cap on App A; `_NON_SETTING_MEMBERS` drops the
+     language/platform predicates and `when` is no longer a condition head.
+  6. *Refinement — dialog text lives on the next line.* `R.string.<name>`
+     was read only on the disclosure-symbol line, missing every
+     `.setMessage(R.string.x)` builder chain; disclosure lines are widened
+     forward by `DISCLOSURE_STRING_WINDOW = 4` (App A: strings resolved in
+     56 files / 251 names, App B 24 files).
+  7. *Refinement — flavour attribution is exercised by selftest only.* Both
+     dev apps declare every permission in `main`, so `manifest_sources` is
+     empty on both — the correct answer, covered by `partial_sources_*` /
+     `attribute_sources_*` checks. The *lower* (opt-in) path likewise did not
+     occur live and is covered by `consent_lower_*`.
+  Live results (WP8 vs the M2 snapshot; the new Noul was asked on in-band
+  anchors — App A 29 requests / 155k input tokens on the final round): App A
+  findings 125 → 128, CRITICAL 0 → 8 (all TRANSMITS with a resolved
+  destination: seven purchase-history / device-id transfers to the billing
+  backend and SDK, plus the crash-log transfer with `[enabled by default]` and
+  the guard evidence above), IMPORTANT 43 → 33, SUGGESTION 85 → 91, decisions
+  LOCAL/UNCERTAIN/TRANSMITS 73/28/16 → 80/24/16; 19 UNCERTAIN and two
+  unresolved-destination default-on answers capped; 75 guards on findings, 23
+  with a located declaration, 8 with a known `runs_by_default`;
+  `consent_default_on = true` on 29 findings. App B 79 → 79, CRITICAL 1 → 1,
+  IMPORTANT 30 → 32, SUGGESTION 49 → 47, LOCAL/UNCERTAIN/TRANSMITS 34/30/8 →
+  32/30/10; 23 UNCERTAIN and three unresolved-destination answers capped; no
+  raise, lower or veto; 50 guards, 28 located, 3 known. `calibrate --rejoin`:
+  exit 0, 48/48, LOCAL false negatives 0, no labelled `p_transmit` moved by
+  ≥ 0.10 (the extra `guards` / `strings` blocks in the state re-ask the
+  battery), `applied_downgrades_wrong` 0, `sharing_regressions` none,
+  `sharing_agreement` 0.783 unchanged; abstention 0.562 → 0.521,
+  recall-at-high 0.609 unchanged, precision-at-high 0.933 → 0.875, UNCERTAIN
+  true transfers 8, destination accuracy 0.826 → 0.783 (one device-id file
+  answered `unknown` instead of `developer_backend`); overall ECE 0.223
+  unchanged, Brier 0.180 → 0.182, in-band ECE 0.264 → 0.311 on 25 cases
+  (bin-edge movement, not a per-case shift). Selftest 396 → 480 checks.
+  Version bump for the question change deferred to M3 as M2 did for WP6/WP7.
 
 ### WP9 — Wave 2 policies (`photo_video_access_policy`, `files_and_docs_policy`)
 
@@ -891,7 +963,7 @@ touching the rest of the cascade.
 - [x] WP6 one-hop callee resolution
 - [x] WP7 `destination_class` + label schema v2 + relabel
 - [x] **M2 gate** (passed; abstention 0.562 vs < 0.50 recorded as the exception)
-- [ ] WP8 consent defaults, string resources, flavor attribution
+- [x] WP8 consent defaults, string resources, flavor attribution
 - [ ] WP9 wave 2 policies
 - [ ] WP10 `data_type_confirmed`
 - [ ] WP11 wave 3 policies

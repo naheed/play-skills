@@ -582,8 +582,13 @@ questions also saw `R.string.crash_consent_body` instead of the sentence the use
   model's booleans and the finding is undisclosed). An UNCERTAIN decision is capped at
   IMPORTANT by `derive_data_safety_severity` ("the evaluator does not assert a Critical it
   cannot support"), so the default-on answer is recorded (`consent_default_on: true`,
-  `band_capped: true`, note "severity stays capped at IMPORTANT") and the severity stands — the
-  first live run raised 17 UNCERTAIN findings on App A before this cap was enforced. A guard
+  `capped_by: uncertain_band`, note "severity stays capped at IMPORTANT") and the severity
+  stands — the first live run raised 17 UNCERTAIN findings on App A before this cap was
+  enforced. The same holds for a TRANSMITS whose destination class is still unresolved
+  (`capped_by: unresolved_destination`, note "severity unchanged"): "collection enabled by
+  default" is only a Critical once the evaluator knows the data leaves for a destination it can
+  name — the second live run raised two unconfirmed `user_chosen_destination` findings on App B
+  before this cap was added. A guard
   with `runs_by_default == False` *vetoes* the model's default-on claim: severity unchanged,
   `corroboration: vetoed_by_guard`, review flag, summary suffix `[consent default unclear: model
   default-on vs guard default-off; verify]`. *Lower* to SUGGESTION (either band) only through
@@ -601,10 +606,12 @@ questions also saw `R.string.crash_consent_body` instead of the sentence the use
   them all with `runs_when`, `default_on` and `runs_by_default`. The finding gains
   `consent_default_on` (True/False/None); `decision_trace.consent` records `p_default_on`,
   `guards` (with `declaration` as `file:Ln`), `guard_defaults`, `default_on`, `action`,
-  `corroboration`, `band_capped` and `enabled`; `consent_note` explains any change in one
+  `corroboration`, `capped_by` and `enabled`; `consent_note` explains any change in one
   sentence; `thresholds` gains `T_CONSENT_DEFAULT_ON` and `CONF_CONSENT_ACT`.
 - **String resources reach the disclosure questions.** `context.resolved_strings` resolves
   every `R.string.<name>` on the anchor scope's lines and on the file's disclosure-symbol lines
+  — each widened forward by `DISCLOSURE_STRING_WINDOW = 4` lines so a builder chain's
+  `.setMessage(R.string.x)` on the line after `AlertDialog.Builder(...)` is read too —
   through the profile's default-locale `resources.ResourceIndex` into `state["strings"]`
   (`name -> text`, `None` when the name is not in the default locale; capped at
   `MAX_STRINGS_IN_STATE = 8`; present only when non-empty). `has_prominent_disclosure` and

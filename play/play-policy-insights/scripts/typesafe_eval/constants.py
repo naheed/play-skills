@@ -327,7 +327,9 @@ DESTINATION_HINTS_ENABLED = True
 #          at/above T_CONSENT_DEFAULT_ON *and* no guard keeps the transfer off
 #          by default (such a guard vetoes the model's claim). An UNCERTAIN
 #          decision is never raised: it is capped at IMPORTANT by design and
-#          the default-on answer is only recorded (``band_capped``);
+#          the default-on answer is only recorded (``capped_by:
+#          uncertain_band``); likewise a TRANSMITS whose destination class is
+#          unresolved (``capped_by: unresolved_destination``);
 #   lower  to SUGGESTION + review for an undisclosed transfer only behind the
 #          double gate: the Noul is confidently *negative* (<= 1 -
 #          CONF_CONSENT_ACT) *and* a guard with ``runs_by_default == False``
