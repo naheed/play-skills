@@ -2636,6 +2636,412 @@ def _test_wave1_manifest_policies() -> None:
            afa and afa[0]["severity"] == "CRITICAL" and afa[0].get("needs_manual_review") is True, str(afa))
 
 
+_WP9_MANIFEST = """<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.w9">
+  <uses-sdk android:minSdkVersion="{min_sdk}" android:targetSdkVersion="{target}"/>
+  {permissions}
+  <application android:label="W9"{application_attrs}>
+    <activity android:name=".Main"/>
+  </application>
+</manifest>
+"""
+
+_JAVA_ROOT_FOLDER = """package com.w9;
+import android.os.Environment;
+import java.io.File;
+import java.io.FileOutputStream;
+public class Store {
+  // Environment.getExternalStorageDirectory() in a comment is not a hint
+  public static File tempDir(android.content.Context ctx) {
+    File parent = ctx.getExternalFilesDir(null);
+    if (parent == null)
+      parent = new File(Environment.getExternalStorageDirectory().getAbsolutePath());
+    File temp = new File(parent, "/temp/");
+    temp.mkdirs();
+    return temp;
+  }
+  public static String composeOnly(String sub) {
+    return Environment.getExternalStorageDirectory().getAbsolutePath() + "/" + sub;
+  }
+  public static boolean isShared(String path) {
+    return path.startsWith(Environment.getExternalStorageDirectory().getAbsolutePath());
+  }
+  public static File downloads() {
+    File d = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+    new File(d, "report.txt").createNewFile();
+    return d;
+  }
+  public static void appSpecific(android.content.Context ctx) {
+    File f = new File(ctx.getExternalFilesDir(null), "cache.bin");
+    f.mkdirs();
+  }
+}
+"""
+
+_JAVA_MEDIA = """package com.w9;
+import android.provider.MediaStore;
+import android.content.Intent;
+public class Media {
+  void scanAll(android.content.ContentResolver r) {
+    android.database.Cursor c = r.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, null, null, null, null);
+    while (c.moveToNext()) { index(c); }
+  }
+  void pickOne(android.app.Activity a) {
+    Intent i = new Intent(MediaStore.ACTION_PICK_IMAGES);
+    a.startActivityForResult(i, 7);
+  }
+  void constantOnly() {
+    String s = MediaStore.Images.Media.EXTERNAL_CONTENT_URI.toString();
+  }
+}
+"""
+
+
+def _test_wave2_storage_policies() -> None:
+  """WP9: photo_video_access_policy and files_and_docs_policy.
+
+  Covers: the deterministic storage-path hints (``writes`` / ``composes`` /
+  ``references``, public directory, app-specific directories and comments
+  never hint, window stops at the block end) and media-access hints
+  (``LIBRARY_QUERY`` needs collection + query, ``USER_PICK``); the manifest
+  rules (uncapped legacy read on 33+, purpose-conditioned broad media,
+  partial-access companion, uncapped legacy write on 30+,
+  ``requestLegacyExternalStorage`` on 30+, flavour straddle notes, absent
+  permissions are silent); the two batteries; the heuristic client's
+  stand-ins; the compositions (justified user-selected -> None, justified
+  full-library -> SUGGESTION, unjustified -> IMPORTANT, contradiction and
+  unknown purpose -> review, relevance drop; root folder confirmed /
+  uncertain / denied double gate, evidence at the hint line); the planner
+  gates (``requires_permissions``, ``applies_file``, ``one_per_file``) and an
+  end-to-end engine run.
+  """
+  from typesafe_eval import android_manifest as am
+  from typesafe_eval import constants
+  from typesafe_eval import context
+  from typesafe_eval import engine
+  from typesafe_eval import registry
+  from typesafe_eval import structure
+  from typesafe_eval import templates
+  from typesafe_eval.client import HeuristicJevClient
+  from typesafe_eval.client import JevAnswer
+
+  # --- structure: storage-path hints -----------------------------------------
+  lines = _JAVA_ROOT_FOLDER.splitlines()
+  hints = structure.external_storage_paths(lines)
+  by_line = {h.line + 1: h for h in hints}
+  _check("storage_hint_write_detected", 10 in by_line and by_line[10].kind == structure.STORAGE_ROOT
+         and by_line[10].writes and by_line[10].composes and by_line[10].strength == "writes"
+         and "mkdirs" in by_line[10].evidence, str([(h.line + 1, h.strength, h.evidence) for h in hints]))
+  _check("storage_hint_compose_only", 16 in by_line and by_line[16].strength == "composes")
+  _check("storage_hint_reference_only", 19 in by_line and by_line[19].strength == "references")
+  _check("storage_hint_public_directory", 22 in by_line and by_line[22].kind == structure.PUBLIC_DIRECTORY
+         and by_line[22].writes)
+  _check("storage_hint_comment_and_app_specific_skipped", 6 not in by_line and 27 not in by_line
+         and len(hints) == 4, str(sorted(by_line)))
+  _check("storage_hint_to_state_shape",
+         set(hints[0].to_state()) == {"hint", "line", "composes", "writes", "strength", "evidence"})
+  fs = structure.FileStructure("Store.java", "java", lines, [], {}, "com.w9")
+  ranked = context.file_storage_hints(fs, [11])
+  _check("storage_hints_ranked_strongest_first", [h.strength for h in ranked] == ["writes", "writes", "composes", "references"]
+         and ranked[0].line + 1 == 10, str([(h.line + 1, h.strength) for h in ranked]))
+  _check("storage_write_gate_true", context.has_storage_write_hint(fs) is True)
+  fs_ref = structure.FileStructure("Ref.java", "java", [
+      "class R {", "  boolean shared(String p) {", "    return p.startsWith(Environment.getExternalStorageDirectory().getPath());",
+      "  }", "}"], [], {}, "com.w9")
+  _check("storage_write_gate_reference_only_false", context.has_storage_write_hint(fs_ref) is False)
+  _check("storage_hint_window_stops_at_block_end",
+         structure.external_storage_paths(["File r = Environment.getExternalStorageDirectory();", "}", "x.mkdir();"])[0].writes is False)
+
+  # --- structure: media hints -----------------------------------------------
+  mlines = _JAVA_MEDIA.splitlines()
+  scan = structure.media_access_hints(mlines, (4, 8))
+  pick = structure.media_access_hints(mlines, (8, 12))
+  const = structure.media_access_hints(mlines, (12, 15))
+  _check("media_hint_library_query", [h.kind for h in scan] == [structure.LIBRARY_QUERY] and scan[0].line + 1 == 6, str(scan))
+  _check("media_hint_user_pick", [h.kind for h in pick] == [structure.USER_PICK]
+         and pick[0].detail == "ACTION_PICK_IMAGES" and pick[0].line + 1 == 10, str(pick))
+  _check("media_hint_collection_without_query_silent", const == [], str(const))
+
+  # --- manifest rules -------------------------------------------------------
+  def purpose(label, p=0.9, source="model"):
+    return {"purpose": label, "confidence": p, "source": source}
+
+  def perms(*names, **attrs):
+    out = []
+    for n in names:
+      extra = "".join(f' android:{k}="{v}"' for k, v in attrs.get(n, {}).items())
+      out.append(f'<uses-permission android:name="android.permission.{n}"{extra}/>')
+    return "\n  ".join(out)
+
+  def build(d, target=34, min_sdk=21, permissions="", application_attrs=""):
+    p = os.path.join(d, "app/src/main/AndroidManifest.xml")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "w", encoding="utf-8") as f:
+      f.write(_WP9_MANIFEST.format(target=target, min_sdk=min_sdk, permissions=permissions,
+                                   application_attrs=application_attrs))
+    return am.load_profile(d, {})
+
+  def run(spec_id, inputs):
+    spec = next(s for s in registry.manifest_specs() if s.policy_id == spec_id)
+    return spec.compose_manifest(inputs)
+
+  def rules(found):
+    return sorted((f["decision_trace"].get("rule"), f["severity"]) for f in found)
+
+  wave2 = {"photo_video_access_policy", "files_and_docs_policy"}
+  _check("wave2_specs_registered", wave2 <= {s.policy_id for s in registry.manifest_specs()}
+         and wave2 <= {s.policy_id for s in registry.code_signal_specs()}
+         and all(pid in templates._policies() for pid in wave2))  # pylint: disable=protected-access
+
+  with tempfile.TemporaryDirectory() as d:
+    p_legacy = build(d, target=34, permissions=perms("READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE"),
+                     application_attrs=' android:requestLegacyExternalStorage="true"')
+    pv = run("photo_video_access_policy", registry.ManifestInputs(profile=p_legacy, app_purpose=purpose("file_manager")))
+    _check("pv_uncapped_legacy_read_on_34_important_plus_purpose_suggestion",
+           rules(pv) == [("broad_media_purpose", "SUGGESTION"), ("legacy_read_uncapped_on_33_plus", "IMPORTANT")]
+           and any('maxSdkVersion="32"' in f["issue_summary"] for f in pv)
+           and any("no READ_MEDIA_*" in f["evidence"] for f in pv), str(pv))
+    fd = run("files_and_docs_policy", registry.ManifestInputs(profile=p_legacy, app_purpose=purpose("file_manager")))
+    _check("fd_uncapped_write_important_and_legacy_flag_suggestion",
+           rules(fd) == [("legacy_storage_flag_on_30_plus", "SUGGESTION"), ("legacy_write_uncapped_on_30_plus", "IMPORTANT")]
+           and any("source set main" in f["evidence"] for f in fd), str(fd))
+    _check("wave2_manifest_findings_shape", all(f.get("kind") == "manifest" and f.get("client") == "deterministic"
+                                                  and "AndroidManifest.xml" in f["files_involved"] for f in pv + fd))
+    p_other = registry.ManifestInputs(profile=p_legacy, app_purpose=purpose("launcher"))
+    pv_o = run("photo_video_access_policy", p_other)
+    _check("pv_other_purpose_important_no_review",
+           rules(pv_o) == [("broad_media_purpose", "IMPORTANT"), ("legacy_read_uncapped_on_33_plus", "IMPORTANT")]
+           and not any(f.get("needs_manual_review") for f in pv_o), str(pv_o))
+    pv_u = run("photo_video_access_policy", registry.ManifestInputs(profile=p_legacy, app_purpose=purpose("unknown")))
+    _check("pv_unknown_purpose_important_review",
+           any(f["decision_trace"].get("rule") == "broad_media_purpose" and f["severity"] == "IMPORTANT"
+               and f.get("needs_manual_review") is True for f in pv_u), str(pv_u))
+    # Capped legacy permissions and a 32 target are quiet on the cap rules.
+    p_capped = build(d, target=34, permissions=perms(
+        "READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE", "READ_MEDIA_IMAGES", "READ_MEDIA_VISUAL_USER_SELECTED",
+        READ_EXTERNAL_STORAGE={"maxSdkVersion": "32"}, WRITE_EXTERNAL_STORAGE={"maxSdkVersion": "29"}))
+    pv_c = run("photo_video_access_policy", registry.ManifestInputs(profile=p_capped, app_purpose=purpose("media_gallery_or_editor")))
+    _check("pv_capped_legacy_with_media_perms_gallery_suggestion_only",
+           rules(pv_c) == [("broad_media_purpose", "SUGGESTION")]
+           and "READ_MEDIA_IMAGES" in pv_c[0]["evidence"] and "READ_EXTERNAL_STORAGE" in pv_c[0]["evidence"], str(pv_c))
+    fd_c = run("files_and_docs_policy", registry.ManifestInputs(profile=p_capped, app_purpose=purpose("media_gallery_or_editor")))
+    _check("fd_capped_write_no_flag_silent", fd_c == [], str(fd_c))
+    p_no_vus = build(d, target=34, permissions=perms("READ_MEDIA_IMAGES", "READ_MEDIA_VIDEO"))
+    pv_v = run("photo_video_access_policy", registry.ManifestInputs(profile=p_no_vus, app_purpose=purpose("media_gallery_or_editor")))
+    _check("pv_missing_visual_user_selected_suggestion",
+           rules(pv_v) == [("broad_media_purpose", "SUGGESTION"), ("missing_visual_user_selected", "SUGGESTION")]
+           and any("READ_MEDIA_VISUAL_USER_SELECTED" in f["issue_summary"] for f in pv_v), str(pv_v))
+    p_vus_only = build(d, target=34, permissions=perms("READ_MEDIA_VISUAL_USER_SELECTED"))
+    _check("pv_visual_user_selected_alone_silent",
+           run("photo_video_access_policy", registry.ManifestInputs(profile=p_vus_only, app_purpose=purpose("launcher"))) == [])
+    p32 = build(d, target=32, permissions=perms("READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE"),
+                application_attrs=' android:requestLegacyExternalStorage="true"')
+    pv_32 = run("photo_video_access_policy", registry.ManifestInputs(profile=p32, app_purpose=purpose("launcher")))
+    _check("pv_target_32_no_cap_rule", rules(pv_32) == [("broad_media_purpose", "IMPORTANT")], str(pv_32))
+    p29 = build(d, target=29, permissions=perms("WRITE_EXTERNAL_STORAGE"),
+                application_attrs=' android:requestLegacyExternalStorage="true"')
+    _check("fd_target_29_silent", run("files_and_docs_policy", registry.ManifestInputs(profile=p29, app_purpose={})) == [])
+    p33min = build(d, target=34, min_sdk=33, permissions=perms("READ_EXTERNAL_STORAGE"))
+    pv_m = run("photo_video_access_policy", registry.ManifestInputs(profile=p33min, app_purpose=purpose("launcher")))
+    _check("pv_min_sdk_33_legacy_inert_everywhere",
+           rules(pv_m) == [("legacy_read_uncapped_on_33_plus", "IMPORTANT")] and "grants nothing" in pv_m[0]["evidence"], str(pv_m))
+    p_none = build(d, target=34, permissions=perms("INTERNET"))
+    _check("wave2_absent_permissions_silent",
+           run("photo_video_access_policy", registry.ManifestInputs(profile=p_none, app_purpose=purpose("launcher"))) == []
+           and run("files_and_docs_policy", registry.ManifestInputs(profile=p_none, app_purpose={})) == [])
+    # Flavour straddle: one build still targets 29.
+    p_legacy.target_sdk_values = [29, 34]
+    fd_s = run("files_and_docs_policy", registry.ManifestInputs(profile=p_legacy, app_purpose={}))
+    _check("fd_straddle_note", all("targeting API 29 still uses it" in f["evidence"] for f in fd_s) and len(fd_s) == 2, str(fd_s))
+    pv_s = run("photo_video_access_policy", registry.ManifestInputs(profile=p_legacy, app_purpose=purpose("file_manager")))
+    _check("pv_straddle_note", any("targeting API 29 still uses it" in f["evidence"]
+                                   for f in pv_s if f["decision_trace"].get("rule") == "legacy_read_uncapped_on_33_plus"), str(pv_s))
+    p_legacy.target_sdk_values = [34]
+
+    # --- batteries and heuristic stand-ins -------------------------------------
+    pvb = q.photo_video_battery("PHOTOS", "MediaStore")
+    fdb = q.files_and_docs_battery("FILES_AND_DOCS", "*/*")
+    _check("wave2_battery_shapes", list(pvb) == ["signal_relevant", "accesses_full_media_library"]
+           and list(fdb) == ["creates_root_level_external_folder"]
+           and "media_access_hints" in pvb["accesses_full_media_library"]["instructions"]
+           and "external_storage_paths" in fdb["creates_root_level_external_folder"]["instructions"])
+    heur = HeuristicJevClient()
+    st_lib = {"signal": {"data_type": "PHOTOS"}, "media_access_hints": [{"hint": "LIBRARY_QUERY"}],
+              "external_storage_paths": [{"strength": "writes"}], "co_located_signals": {}, "app": {}}
+    st_pick = {"signal": {"data_type": "PHOTOS"}, "media_access_hints": [{"hint": "USER_PICK"}],
+               "external_storage_paths": [{"strength": "references"}], "co_located_signals": {}, "app": {}}
+    a_lib = heur.system_one(st_lib, {**pvb, **fdb})
+    a_pick = heur.system_one(st_pick, {**pvb, **fdb})
+    a_none = heur.system_one({"signal": {}, "co_located_signals": {}, "app": {}}, {**pvb, **fdb})
+    _check("wave2_heuristic_priors",
+           a_lib["accesses_full_media_library"].noul == 0.85 and a_lib["creates_root_level_external_folder"].noul == 0.85
+           and a_pick["accesses_full_media_library"].noul == 0.15 and a_pick["creates_root_level_external_folder"].noul == 0.15
+           and a_none["accesses_full_media_library"].noul == 0.5 and a_none["creates_root_level_external_folder"].noul == 0.5)
+
+    # --- composition: photo_video ------------------------------------------------
+    def pv_answers(p_full, relevant=0.9):
+      return {"signal_relevant": JevAnswer("noul", noul=relevant),
+              "accesses_full_media_library": JevAnswer("noul", noul=p_full)}
+
+    def pv_state(hints=()):
+      return {"signal": {"data_type": "PHOTOS", "matched_pattern": "MediaStore", "file": "Media.java", "line": 6,
+                         "matched_line": "r.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI)", "all_lines": [6]},
+              "code_snippet": "L6: r.query(...)", "sinks": [],
+              "anchor": {"scope": [5, 8], "proximity": None, "sink_in_scope": False, "tier": 3, "media_hints": list(hints)},
+              "media_access_hints": [{"hint": h, "line": 6, "detail": h, "evidence": "..."} for h in hints],
+              "app": {}}
+
+    gallery, other, unknown = purpose("media_gallery_or_editor"), purpose("launcher"), purpose("unknown")
+    _check("pv_code_justified_user_selected_none",
+           evaluate.compose_photo_video_finding("PHOTOS", pv_state(["USER_PICK"]), pv_answers(0.1), "t", gallery) is None)
+    f_full = evaluate.compose_photo_video_finding("PHOTOS", pv_state(["LIBRARY_QUERY"]), pv_answers(0.9), "t", gallery)
+    _check("pv_code_justified_full_library_suggestion",
+           f_full is not None and f_full["severity"] == "SUGGESTION" and f_full["media_access_mode"] == "full_library"
+           and not f_full.get("needs_manual_review") and f_full["decision_trace"]["media_access"]["corroborated"] is True
+           and "[media hints: LIBRARY_QUERY]" in f_full["evidence"] and f_full["psl_constant"] == "PHOTOS", str(f_full))
+    f_pick_other = evaluate.compose_photo_video_finding("PHOTOS", pv_state(["USER_PICK"]), pv_answers(0.1), "t", other)
+    _check("pv_code_unjustified_user_selected_important",
+           f_pick_other is not None and f_pick_other["severity"] == "IMPORTANT" and f_pick_other["media_access_mode"] == "user_selected"
+           and not f_pick_other.get("needs_manual_review") and "Photo Picker" in f_pick_other["issue_summary"], str(f_pick_other))
+    f_unc = evaluate.compose_photo_video_finding("PHOTOS", pv_state(), pv_answers(0.5), "t", other)
+    _check("pv_code_uncertain_important_review",
+           f_unc["severity"] == "IMPORTANT" and f_unc["media_access_mode"] == "uncertain" and f_unc.get("needs_manual_review") is True)
+    f_unc_g = evaluate.compose_photo_video_finding("PHOTOS", pv_state(), pv_answers(0.5), "t", gallery)
+    _check("pv_code_uncertain_justified_suggestion_review",
+           f_unc_g["severity"] == "SUGGESTION" and f_unc_g.get("needs_manual_review") is True)
+    f_contra = evaluate.compose_photo_video_finding("PHOTOS", pv_state(["USER_PICK"]), pv_answers(0.9), "t", gallery)
+    _check("pv_code_contradiction_reviewed",
+           f_contra is not None and f_contra.get("needs_manual_review") is True
+           and f_contra["decision_trace"]["media_access"]["contradicted"] is True and "disagrees" in f_contra["issue_summary"], str(f_contra))
+    f_contra_pick = evaluate.compose_photo_video_finding("PHOTOS", pv_state(["LIBRARY_QUERY"]), pv_answers(0.1), "t", gallery)
+    _check("pv_code_justified_user_selected_but_query_hint_kept_for_review",
+           f_contra_pick is not None and f_contra_pick["severity"] == "SUGGESTION" and f_contra_pick.get("needs_manual_review") is True)
+    f_unknown = evaluate.compose_photo_video_finding("PHOTOS", pv_state(), pv_answers(0.9), "t", unknown)
+    _check("pv_code_unknown_purpose_important_review",
+           f_unknown["severity"] == "IMPORTANT" and f_unknown.get("needs_manual_review") is True
+           and f_unknown["decision_trace"]["app_purpose"] == "not established")
+    _check("pv_code_relevance_drop",
+           evaluate.compose_photo_video_finding("PHOTOS", pv_state(), pv_answers(0.9, relevant=0.05), "t", other) is None)
+    _check("pv_code_mode_bands", evaluate.media_access_mode(constants.T_FULL_MEDIA_LIBRARY) == "full_library"
+           and evaluate.media_access_mode(1 - constants.T_FULL_MEDIA_LIBRARY) == "user_selected"
+           and evaluate.media_access_mode(0.5) == "uncertain" and evaluate.media_access_mode(None) == "uncertain")
+
+    # --- composition: files_and_docs ----------------------------------------------
+    def fd_answers(p_root):
+      return {"creates_root_level_external_folder": JevAnswer("noul", noul=p_root)}
+
+    def fd_state(strengths=("writes",)):
+      hs = [{"hint": "STORAGE_ROOT", "line": 10 + i, "composes": s != "references", "writes": s == "writes",
+             "strength": s, "evidence": "parent = new File(Environment.getExternalStorageDirectory()) … temp.mkdirs();"}
+            for i, s in enumerate(strengths)]
+      st = {"signal": {"data_type": "FILES_AND_DOCS", "matched_pattern": "*/*", "file": "Store.java", "line": 40,
+                       "matched_line": 'setType("*/*")', "all_lines": [40]},
+            "code_snippet": "L40: ...", "sinks": [], "anchor": {"scope": [38, 42], "proximity": None, "sink_in_scope": False, "tier": 3},
+            "app": {}}
+      if hs:
+        st["external_storage_paths"] = hs
+      return st
+
+    fm = purpose("file_manager")
+    _check("fd_code_no_hint_none", evaluate.compose_files_and_docs_finding("FILES_AND_DOCS", fd_state(()), fd_answers(0.9), "t", other) is None)
+    f_conf = evaluate.compose_files_and_docs_finding("FILES_AND_DOCS", fd_state(), fd_answers(0.9), "t", other)
+    _check("fd_code_confirmed_other_important",
+           f_conf is not None and f_conf["severity"] == "IMPORTANT" and f_conf["root_folder_mode"] == "confirmed"
+           and not f_conf.get("needs_manual_review") and f_conf["evidence"].startswith("Store.java:L10 — ")
+           and "[STORAGE_ROOT, writes]" in f_conf["evidence"] and f_conf["files_involved"] == ["Store.java"], str(f_conf))
+    f_conf_fm = evaluate.compose_files_and_docs_finding("FILES_AND_DOCS", fd_state(), fd_answers(0.9), "t", fm)
+    _check("fd_code_confirmed_file_manager_suggestion",
+           f_conf_fm["severity"] == "SUGGESTION" and not f_conf_fm.get("needs_manual_review")
+           and "scoped alternative" in f_conf_fm["issue_summary"], str(f_conf_fm))
+    f_conf_u = evaluate.compose_files_and_docs_finding("FILES_AND_DOCS", fd_state(), fd_answers(0.9), "t", unknown)
+    _check("fd_code_confirmed_unknown_purpose_review", f_conf_u["severity"] == "IMPORTANT" and f_conf_u.get("needs_manual_review") is True)
+    f_unc = evaluate.compose_files_and_docs_finding("FILES_AND_DOCS", fd_state(("composes",)), fd_answers(0.5), "t", other)
+    _check("fd_code_uncertain_suggestion_review",
+           f_unc["severity"] == "SUGGESTION" and f_unc["root_folder_mode"] == "uncertain" and f_unc.get("needs_manual_review") is True)
+    _check("fd_code_denied_without_write_none",
+           evaluate.compose_files_and_docs_finding("FILES_AND_DOCS", fd_state(("composes",)), fd_answers(0.1), "t", other) is None)
+    f_den = evaluate.compose_files_and_docs_finding("FILES_AND_DOCS", fd_state(("writes", "composes")), fd_answers(0.1), "t", other)
+    _check("fd_code_denied_with_write_double_gate_review",
+           f_den is not None and f_den["severity"] == "SUGGESTION" and f_den["root_folder_mode"] == "denied"
+           and f_den.get("needs_manual_review") is True and "model disagrees" in f_den["issue_summary"]
+           and f_den["decision_trace"]["root_folder"]["deterministic_write"] is True, str(f_den))
+
+    # --- planner gates and end-to-end run -----------------------------------------
+    scratch = os.path.join(d, ".scratch")
+    for rel, body in (("app/src/main/java/com/w9/Store.java", _JAVA_ROOT_FOLDER),
+                      ("app/src/main/java/com/w9/Media.java", _JAVA_MEDIA),
+                      ("app/src/main/java/com/w9/Ref.java", "package com.w9;\nimport android.os.Environment;\nclass Ref {\n  boolean shared(String p) {\n    return p.startsWith(Environment.getExternalStorageDirectory().getPath());\n  }\n}\n")):
+      path = os.path.join(d, rel)
+      os.makedirs(os.path.dirname(path), exist_ok=True)
+      with open(path, "w", encoding="utf-8") as f:
+        f.write(body)
+    sources = {
+        "FILES_AND_DOCS": ["app/src/main/java/com/w9/Store.java (Pattern: getExternalStorageDirectory)",
+                           "app/src/main/java/com/w9/Store.java (Pattern: createNewFile)",
+                           "app/src/main/java/com/w9/Ref.java (Pattern: getExternalStorageDirectory)"],
+        "MEDIA": ["app/src/main/java/com/w9/Media.java (Pattern: MediaStore)"],
+        "PHOTOS": ["app/src/main/java/com/w9/Media.java (Pattern: MediaStore.Images)"],
+    }
+    # No storage / media permission ships: the code specs are gated, the manifest rules are silent.
+    build(d, target=34, permissions=perms("INTERNET"))
+    _write_scratch(d, scratch, sources)
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    worker = json.load(open(os.path.join(scratch, "worker_permissions_and_apis.json"), encoding="utf-8"))
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    pv_f = [f for f in worker["findings"] if f["policy_id"] == "photo_video_access_policy"]
+    gated = triage["counters"].get("planner_gated") or {}
+    _check("wave2_permission_gate_blocks_photo_video",
+           pv_f == [] and gated.get("photo_video_access_policy", 0) >= 2
+           and any("ships in the Play build" in dd.get("reason", "") for dd in triage.get("dropped", [])), f"{gated} {pv_f}")
+    fd_code = [f for f in worker["findings"] if f["policy_id"] == "files_and_docs_policy" and f.get("kind") != "manifest"]
+    _check("wave2_files_code_not_permission_gated_but_file_gated",
+           len(fd_code) == 1 and fd_code[0]["files_involved"] == ["app/src/main/java/com/w9/Store.java"]
+           and gated.get("files_and_docs_policy", 0) >= 1
+           and any("structural activation" in dd.get("reason", "") for dd in triage.get("dropped", [])), str(fd_code))
+    _check("wave2_one_per_file", (triage["counters"].get("tasks_per_policy") or {}).get("files_and_docs_policy") == 1
+           and any("asked once per file" in dd.get("reason", "") for dd in triage.get("dropped", [])),
+           str(triage["counters"].get("tasks_per_policy")))
+    # With the permissions: manifest rules fire and the media code question is asked once for the file.
+    build(d, target=34, permissions=perms("READ_EXTERNAL_STORAGE", "WRITE_EXTERNAL_STORAGE"),
+          application_attrs=' android:requestLegacyExternalStorage="true"')
+    _write_scratch(d, scratch, sources)
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    worker = json.load(open(os.path.join(scratch, "worker_permissions_and_apis.json"), encoding="utf-8"))
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    pv_f = [f for f in worker["findings"] if f["policy_id"] == "photo_video_access_policy"]
+    fd_f = [f for f in worker["findings"] if f["policy_id"] == "files_and_docs_policy"]
+    _check("wave2_engine_manifest_findings",
+           sorted(f["severity"] for f in pv_f if f.get("kind") == "manifest") == ["IMPORTANT", "IMPORTANT"]
+           and sorted(f["severity"] for f in fd_f if f.get("kind") == "manifest") == ["IMPORTANT", "SUGGESTION"],
+           str([(f["policy_id"], f.get("kind"), f["severity"]) for f in pv_f + fd_f]))
+    pv_code = [f for f in pv_f if f.get("kind") != "manifest"]
+    fd_code = [f for f in fd_f if f.get("kind") != "manifest"]
+    _check("wave2_engine_code_findings",
+           len(pv_code) == 1 and pv_code[0]["severity"] == "IMPORTANT" and pv_code[0].get("needs_manual_review") is True
+           and pv_code[0]["media_access_mode"] == "full_library"
+           and len(fd_code) == 1 and fd_code[0]["root_folder_mode"] == "confirmed" and fd_code[0]["severity"] == "IMPORTANT"
+           and "Store.java:L10" in fd_code[0]["evidence"], str([(f["policy_id"], f["severity"], f.get("media_access_mode"), f.get("root_folder_mode"), f["evidence"]) for f in pv_code + fd_code]))
+    _check("wave2_engine_tasks_per_policy",
+           (triage["counters"].get("tasks_per_policy") or {}).get("photo_video_access_policy") == 1
+           and (triage["counters"].get("tasks_per_policy") or {}).get("files_and_docs_policy") == 1,
+           str(triage["counters"].get("tasks_per_policy")))
+    # State blocks are present only where the deterministic hints exist.
+    fs_store = structure.analyze_file(d, "app/src/main/java/com/w9/Store.java")
+    st, mini = context.build_file_state(fs_store, [("FILES_AND_DOCS", "getExternalStorageDirectory")], {}, {})
+    _check("wave2_state_storage_block", len(st.get("external_storage_paths") or []) == 4
+           and st["external_storage_paths"][0]["strength"] == "writes"
+           and mini[0]["external_storage_paths"] == st["external_storage_paths"] and "media_access_hints" not in st)
+    fs_media = structure.analyze_file(d, "app/src/main/java/com/w9/Media.java")
+    st_m, mini_m = context.build_file_state(fs_media, [("PHOTOS", "EXTERNAL_CONTENT_URI")], {}, {})
+    _check("wave2_state_media_block", [h["hint"] for h in st_m.get("media_access_hints") or []] == ["LIBRARY_QUERY"]
+           and mini_m[0]["anchor"]["media_hints"] == ["LIBRARY_QUERY"] and "external_storage_paths" not in st_m,
+           str(st_m.get("media_access_hints")))
+    fs_ref2 = structure.analyze_file(d, "app/src/main/java/com/w9/Ref.java")
+    st_r, _ = context.build_file_state(fs_ref2, [("FILES_AND_DOCS", "getExternalStorageDirectory")], {}, {})
+    _check("wave2_state_reference_only_hint_listed_but_not_activating",
+           [h["strength"] for h in st_r.get("external_storage_paths") or []] == ["references"]
+           and context.has_storage_write_hint(fs_ref2) is False)
+
+
 def _test_app_profile() -> None:
   """WP1: evaluator-owned manifest parsing and source-set merge."""
   from typesafe_eval import android_manifest as am
@@ -2912,6 +3318,7 @@ def main() -> int:
   _test_triage_diff()
   _test_app_profile()
   _test_wave1_manifest_policies()
+  _test_wave2_storage_policies()
   _test_lexical_pregate()
   _test_parse_finding()
   _test_snippet_and_colocation()

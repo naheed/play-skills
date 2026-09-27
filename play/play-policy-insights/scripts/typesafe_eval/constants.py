@@ -367,8 +367,89 @@ POLICY_PERMISSIONS = {
         "android.permission.READ_CONTACTS", "android.permission.WRITE_CONTACTS",
         "android.permission.GET_ACCOUNTS"),
     "audio_recording_policy": ("android.permission.RECORD_AUDIO",),
+    # WP9 wave-2 policies (code findings attributed to the storage permissions).
+    "photo_video_access_policy": (
+        "android.permission.READ_MEDIA_IMAGES", "android.permission.READ_MEDIA_VIDEO",
+        "android.permission.READ_MEDIA_VISUAL_USER_SELECTED",
+        "android.permission.READ_EXTERNAL_STORAGE"),
+    "files_and_docs_policy": (
+        "android.permission.READ_EXTERNAL_STORAGE", "android.permission.WRITE_EXTERNAL_STORAGE"),
 }
 T_ACCOUNT_DELETION = 0.60   # deterministic gate: snippet really deletes an account
+
+# ---------------------------------------------------------------------------
+# WP9: wave-2 storage policies (photo_video_access_policy, files_and_docs_policy).
+#
+# Both policies are decided first from manifest facts (deterministic, no model
+# call) and then refined per code site with one Noul each:
+#
+# photo_video_access_policy (manifest):
+#   * targetSdk >= PHOTO_PICKER_TARGET_SDK (33) with READ_EXTERNAL_STORAGE not
+#     capped at maxSdkVersion <= LEGACY_READ_STORAGE_MAX_SDK (32) -> IMPORTANT.
+#     On 33+ the legacy permission grants no media access at all; keeping it
+#     uncapped only produces a misleading permission prompt on older devices.
+#   * a broad media permission (READ_MEDIA_IMAGES / READ_MEDIA_VIDEO, or the
+#     legacy READ_EXTERNAL_STORAGE that grants media access up to API 32) with
+#     an established purpose in PHOTO_VIDEO_PURPOSES -> SUGGESTION (Play Console
+#     declaration reminder); any other purpose -> IMPORTANT "use the Photo
+#     Picker" (review-marked when the purpose is not established).
+#   * READ_MEDIA_IMAGES / READ_MEDIA_VIDEO on targetSdk >=
+#     PARTIAL_MEDIA_ACCESS_TARGET_SDK (34) without
+#     READ_MEDIA_VISUAL_USER_SELECTED -> SUGGESTION (declare it so a partial
+#     "select photos" grant persists across sessions).
+# photo_video_access_policy (code, Noul ``accesses_full_media_library`` on
+#   MEDIA / PHOTOS / VIDEOS anchors, asked once per file and only when a broad
+#   media permission ships): the answer splits "enumerates the library" from
+#   "the user picks one item". p >= T_FULL_MEDIA_LIBRARY -> full_library;
+#   p <= 1 - T_FULL_MEDIA_LIBRARY -> user_selected; between -> uncertain
+#   (review). Deterministic ``media_access_hints`` (MediaStore collection
+#   queries vs picker intents) corroborate or contradict the answer; a
+#   contradiction is review-marked, never silently resolved. For a justified
+#   purpose a user-selected site composes nothing (a gallery may also pick one
+#   item) and a full-library site is a SUGGESTION; for any other purpose every
+#   site is IMPORTANT (the matrix's "not a dedicated media manager" row; a
+#   user-selected site is exactly the Photo Picker heuristic).
+# files_and_docs_policy (manifest):
+#   * WRITE_EXTERNAL_STORAGE not capped at maxSdkVersion <=
+#     LEGACY_WRITE_STORAGE_MAX_SDK (29) with targetSdk >=
+#     SCOPED_STORAGE_TARGET_SDK (30) -> IMPORTANT (the permission is inert under
+#     scoped storage and misleads users at install / prompt time).
+#   * requestLegacyExternalStorage="true" with targetSdk >= 30 -> SUGGESTION
+#     (ignored by the platform when targeting 30+; preserveLegacyExternalStorage
+#     is the upgrade-path flag).
+# files_and_docs_policy (code, Noul ``creates_root_level_external_folder``,
+#   asked only for files where ``structure.external_storage_paths`` finds a
+#   path composed from the external-storage root that is written or created):
+#   p >= T_ROOT_LEVEL_FOLDER confirms -> IMPORTANT unless the purpose is in
+#   ALL_FILES_ACCESS_PURPOSES (a file manager or backup tool operates on the
+#   shared tree by design -> SUGGESTION); the uncertain band -> SUGGESTION +
+#   review; a confident "no" drops the finding only when no deterministic
+#   *write* on a root-composed path exists (double gate) -- otherwise
+#   SUGGESTION + review.
+# Rollback: PHOTO_VIDEO_POLICY_ENABLED / FILES_AND_DOCS_POLICY_ENABLED remove
+# the specs from the registry; STORAGE_HINTS_ENABLED / MEDIA_HINTS_ENABLED drop
+# the deterministic state blocks (the questions are then answered on the code
+# alone).
+# ---------------------------------------------------------------------------
+PHOTO_VIDEO_POLICY_ENABLED = True
+FILES_AND_DOCS_POLICY_ENABLED = True
+STORAGE_HINTS_ENABLED = True
+MEDIA_HINTS_ENABLED = True
+PHOTO_PICKER_TARGET_SDK = 33          # READ_MEDIA_* replace READ_EXTERNAL_STORAGE for media
+LEGACY_READ_STORAGE_MAX_SDK = 32      # documented cap for READ_EXTERNAL_STORAGE
+PARTIAL_MEDIA_ACCESS_TARGET_SDK = 34  # READ_MEDIA_VISUAL_USER_SELECTED introduced
+SCOPED_STORAGE_TARGET_SDK = 30        # scoped storage enforced; WRITE_EXTERNAL_STORAGE inert
+LEGACY_WRITE_STORAGE_MAX_SDK = 29     # documented cap for WRITE_EXTERNAL_STORAGE
+T_FULL_MEDIA_LIBRARY = 0.60           # Noul mass for "enumerates the media library"
+T_ROOT_LEVEL_FOLDER = 0.60            # Noul mass for "creates a root-level external folder"
+MAX_STORAGE_HINTS_IN_STATE = 6        # external-storage path hints per state
+MAX_MEDIA_HINTS_IN_STATE = 6          # media access hints per state
+STORAGE_HINT_WINDOW = 6               # lines after a root reference searched for a write
+# Purposes for which broad media permissions are accepted (Photo and Video
+# Permissions policy: galleries / editors, backup tools, file managers).
+PHOTO_VIDEO_PURPOSES = frozenset({"media_gallery_or_editor", "backup_or_antivirus", "file_manager"})
+# Permissions that grant broad access to the user's photos and videos.
+BROAD_MEDIA_PERMISSION_SHORT_NAMES = frozenset({"READ_MEDIA_IMAGES", "READ_MEDIA_VIDEO"})
 T_DECLARATION_COVERS = 0.50  # play_declaration: declaration covers a detected type
 
 # ---------------------------------------------------------------------------

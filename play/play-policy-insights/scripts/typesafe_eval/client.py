@@ -347,6 +347,7 @@ class HeuristicJevClient(JevClient):
     )
     destination = self._destination_prior(state) if isinstance(state, dict) else "unknown"
     consent_prior = self._consent_prior(state) if isinstance(state, dict) else 0.5
+    storage_priors = self._storage_priors(state) if isinstance(state, dict) else {}
     category = str(app.get("store_category", "")).strip().lower()
 
     core_categories = self._CORE_BY_CATEGORY.get(data_type, set())
@@ -377,8 +378,28 @@ class HeuristicJevClient(JevClient):
           signal=signal,
           destination=destination,
           consent_prior=consent_prior,
+          storage_priors=storage_priors,
       )
     return answers
+
+  @staticmethod
+  def _storage_priors(state: Dict[str, Any]) -> Dict[str, float]:
+    """Offline stand-ins for the WP9 storage Nouls.
+
+    ``media``: from ``media_access_hints`` -- any ``LIBRARY_QUERY`` -> 0.85,
+    only ``USER_PICK`` -> 0.15, none -> 0.5. ``root_folder``: from
+    ``external_storage_paths`` -- a hint with ``strength == "writes"`` -> 0.85,
+    ``composes`` -> 0.5, references only -> 0.15, none -> 0.5. Heuristics for
+    hermetic runs; the live model reads the code.
+    """
+    out: Dict[str, float] = {}
+    kinds = {h.get("hint") for h in state.get("media_access_hints") or [] if isinstance(h, dict)}
+    if kinds:
+      out["media"] = 0.85 if "LIBRARY_QUERY" in kinds else 0.15
+    strengths = {h.get("strength") for h in state.get("external_storage_paths") or [] if isinstance(h, dict)}
+    if strengths:
+      out["root_folder"] = 0.85 if "writes" in strengths else (0.5 if "composes" in strengths else 0.15)
+    return out
 
   @staticmethod
   def _consent_prior(state: Dict[str, Any]) -> float:
@@ -440,6 +461,7 @@ class HeuristicJevClient(JevClient):
       signal: Dict[str, Any],
       destination: str = "unknown",
       consent_prior: float = 0.5,
+      storage_priors: Optional[Dict[str, float]] = None,
   ) -> JevAnswer:
     qtype = question.get("type")
 
@@ -454,6 +476,7 @@ class HeuristicJevClient(JevClient):
               snippet=snippet,
               signal=signal,
               consent_prior=consent_prior,
+              storage_priors=storage_priors,
           ),
       )
 
@@ -538,12 +561,22 @@ class HeuristicJevClient(JevClient):
       snippet: str,
       signal: Dict[str, Any],
       consent_prior: float = 0.5,
+      storage_priors: Optional[Dict[str, float]] = None,
   ) -> float:
+    storage_priors = storage_priors or {}
     if qid == "transmits_offdevice":
       return 0.9 if has_network else 0.1
     if qid == "consent_default_on":
       # WP8 stand-in: derived from the deterministic guard defaults in state.
       return consent_prior
+    if qid == "accesses_full_media_library":
+      # WP9 stand-in: the deterministic media hints decide (LIBRARY_QUERY ->
+      # 0.85, USER_PICK only -> 0.15, neither -> 0.5).
+      return storage_priors.get("media", 0.5)
+    if qid == "creates_root_level_external_folder":
+      # WP9 stand-in: a deterministic write on a root-composed path -> 0.85;
+      # composition only -> 0.5; bare references -> 0.15.
+      return storage_priors.get("root_folder", 0.5)
     if qid == "signal_relevant":
       # The stand-in cannot judge semantics; lean relevant (recall-safe).
       return 0.8

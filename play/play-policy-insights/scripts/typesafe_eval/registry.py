@@ -44,6 +44,7 @@ from typing import Tuple
 
 from typesafe_eval import android_manifest
 from typesafe_eval import constants
+from typesafe_eval import context
 from typesafe_eval import evaluate
 from typesafe_eval import questions as q
 from typesafe_eval import structure
@@ -148,6 +149,18 @@ class PolicySpec:
   gate_battery: Optional[Callable[[str, str], Dict[str, Any]]] = None
   gate_key: str = ""
   gate_threshold: float = 0.5
+  # WP9 planner gates for code-signal specs (all optional, all deterministic):
+  # ``requires_permissions`` -- short names; the spec is planned only when at
+  # least one ships in the Play build (the model is never asked to read the
+  # manifest). ``applies_file`` -- a structural predicate over the candidate
+  # file (e.g. "composes a path from the storage root"); ``one_per_file`` --
+  # a per-file question is asked once even when several data types anchor
+  # in the file. ``needs_app_purpose`` -- ``compose`` receives the once-per-app
+  # purpose answer as a keyword argument.
+  requires_permissions: Tuple[str, ...] = ()
+  applies_file: Optional[Callable[[structure.FileStructure], bool]] = None
+  one_per_file: bool = False
+  needs_app_purpose: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -684,6 +697,227 @@ def _target_api_level_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
       trace)]
 
 
+# ---------------------------------------------------------------------------
+# WP9 wave-2 storage policies (deterministic manifest rules + one Noul each)
+# ---------------------------------------------------------------------------
+
+
+def _target_values(inputs: ManifestInputs) -> List[int]:
+  """Every shipped ``targetSdk`` value (per flavour), highest first."""
+  if inputs.profile is not None and inputs.profile.target_sdk_values:
+    return sorted(set(inputs.profile.target_sdk_values), reverse=True)
+  return [inputs.target_sdk] if inputs.target_sdk else []
+
+
+def _straddle_note(values: List[int], boundary: int) -> str:
+  """``"; the build targeting API 29 still uses it"`` when some flavour targets below ``boundary``."""
+  below = [v for v in values if v < boundary]
+  if not below or len(values) < 2:
+    return ""
+  return f"; the build targeting API {min(below)} still uses it"
+
+
+def _photo_video_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """Photo and Video Permissions: the manifest half (WP9).
+
+  ``target`` is the highest shipped ``targetSdk`` (Play judges the current
+  release; a flavour still targeting lower is noted in the evidence).
+
+  1. ``target >= PHOTO_PICKER_TARGET_SDK`` (33) and ``READ_EXTERNAL_STORAGE``
+     shipped without ``maxSdkVersion <= LEGACY_READ_STORAGE_MAX_SDK`` (32)
+     -> IMPORTANT. On 33+ the permission grants no media access; uncapped it
+     only adds a misleading prompt on older devices (and, when
+     ``READ_MEDIA_*`` are also declared, duplicates them).
+  2. A broad media permission (``READ_MEDIA_IMAGES`` / ``READ_MEDIA_VIDEO``,
+     or the legacy ``READ_EXTERNAL_STORAGE`` that grants media access up to
+     API 32) with an established purpose in ``PHOTO_VIDEO_PURPOSES`` ->
+     SUGGESTION (declaration reminder); any other purpose -> IMPORTANT "use
+     the Photo Picker", review-marked when the purpose is not established.
+     ``READ_MEDIA_VISUAL_USER_SELECTED`` alone is the scoped grant and never
+     activates the rule.
+  3. ``READ_MEDIA_IMAGES`` / ``READ_MEDIA_VIDEO`` on ``target >=
+     PARTIAL_MEDIA_ACCESS_TARGET_SDK`` (34) without
+     ``READ_MEDIA_VISUAL_USER_SELECTED`` -> SUGGESTION (declare it so a
+     partial "select photos" grant persists across sessions).
+  A legacy permission whose ``minSdk`` floor is already 33+ is inert
+  everywhere; rule 1 says so in the evidence.
+  """
+  pid = "photo_video_access_policy"
+  findings: List[Dict[str, Any]] = []
+  legacy = _shipped_permission(inputs, "READ_EXTERNAL_STORAGE")
+  broad = [p for p in (_shipped_permission(inputs, s) for s in sorted(constants.BROAD_MEDIA_PERMISSION_SHORT_NAMES))
+           if p is not None]
+  user_selected = _shipped_permission(inputs, "READ_MEDIA_VISUAL_USER_SELECTED")
+  if legacy is None and not broad:
+    log.debug("photo_video: no broad media permission ships; no manifest finding")
+    return findings
+  values = _target_values(inputs)
+  target = values[0] if values else 0
+  min_sdk = inputs.profile.min_sdk if inputs.profile is not None else None
+  purpose = inputs.purpose_label()
+  justified = inputs.purpose_in(constants.PHOTO_VIDEO_PURPOSES)
+  established = purpose != "not established" and "below CONF_APP_PURPOSE" not in purpose
+  base_trace = {"target_sdk": target, "target_sdk_values": values, "min_sdk": min_sdk,
+                "app_purpose": purpose, "justified_by_purpose": justified,
+                "allowed_purposes": sorted(constants.PHOTO_VIDEO_PURPOSES),
+                "broad_media_permissions": [p.name for p in broad],
+                "legacy_read_storage": legacy.to_dict() if legacy is not None else None}
+
+  # Rule 1: uncapped legacy read permission on a 33+ target.
+  legacy_uncapped = (legacy is not None
+                     and (legacy.max_sdk is None or legacy.max_sdk > constants.LEGACY_READ_STORAGE_MAX_SDK))
+  if legacy_uncapped and target >= constants.PHOTO_PICKER_TARGET_SDK:
+    if min_sdk is not None and min_sdk >= constants.PHOTO_PICKER_TARGET_SDK:
+      why = f"minSdk {min_sdk} >= {constants.PHOTO_PICKER_TARGET_SDK}: the permission grants nothing on any supported device"
+    elif broad:
+      why = (f"duplicates {', '.join(p.short_name for p in broad)} on API {constants.PHOTO_PICKER_TARGET_SDK}+ "
+             f"and prompts for full storage access below it")
+    else:
+      why = (f"no READ_MEDIA_* permission is declared, so on API {constants.PHOTO_PICKER_TARGET_SDK}+ the app "
+             "gets no media access from this permission at all")
+    log.info("photo_video: READ_EXTERNAL_STORAGE uncapped (maxSdk=%s) with target %d -> IMPORTANT",
+             legacy.max_sdk, target)
+    findings.append(_manifest_finding(
+        pid, "IMPORTANT",
+        f"READ_EXTERNAL_STORAGE is requested without maxSdkVersion=\"{constants.LEGACY_READ_STORAGE_MAX_SDK}\" "
+        f"while targeting API {target}",
+        f"{_perm_evidence(legacy)}; targetSdk={target}; {why}{_straddle_note(values, constants.PHOTO_PICKER_TARGET_SDK)}",
+        {**base_trace, "permission": legacy.name, "rule": "legacy_read_uncapped_on_33_plus",
+         "max_sdk": legacy.max_sdk, "required_max_sdk": constants.LEGACY_READ_STORAGE_MAX_SDK}))
+
+  # Rule 2: broad media access, purpose-conditioned. The legacy permission
+  # counts as broad media access on devices up to API 32 unless minSdk >= 33.
+  legacy_grants_media = legacy is not None and not (min_sdk is not None and min_sdk >= constants.PHOTO_PICKER_TARGET_SDK)
+  broad_all = broad + ([legacy] if legacy_grants_media else [])
+  if broad_all:
+    ev = "; ".join(_perm_evidence(p) for p in broad_all) + f"; declared_core_purpose={purpose}"
+    trace = {**base_trace, "permission": broad_all[0].name, "rule": "broad_media_purpose"}
+    if justified:
+      log.info("photo_video: broad media permission(s) %s justified by purpose %s -> SUGGESTION",
+               [p.short_name for p in broad_all], purpose)
+      findings.append(_manifest_finding(
+          pid, "SUGGESTION",
+          "Broad photo / video access is requested; the core purpose qualifies but the Play Console "
+          "Photo and Video Permissions declaration must match",
+          ev, trace))
+    else:
+      log.info("photo_video: broad media permission(s) %s with purpose %s -> IMPORTANT",
+               [p.short_name for p in broad_all], purpose)
+      findings.append(_manifest_finding(
+          pid, "IMPORTANT",
+          "Broad photo / video access is requested but the app's core purpose does not qualify; "
+          "one-off media selection should use the Photo Picker",
+          ev, trace, needs_review=not established))
+
+  # Rule 3: partial-access companion permission on 34+.
+  if broad and user_selected is None and target >= constants.PARTIAL_MEDIA_ACCESS_TARGET_SDK:
+    findings.append(_manifest_finding(
+        pid, "SUGGESTION",
+        f"{', '.join(p.short_name for p in broad)} requested on API {target} without "
+        "READ_MEDIA_VISUAL_USER_SELECTED (partial access grants will not persist)",
+        "; ".join(_perm_evidence(p) for p in broad) + f"; targetSdk={target}; no READ_MEDIA_VISUAL_USER_SELECTED",
+        {**base_trace, "permission": broad[0].name, "rule": "missing_visual_user_selected"},
+        recommendation=("Declare READ_MEDIA_VISUAL_USER_SELECTED next to READ_MEDIA_IMAGES / "
+                        "READ_MEDIA_VIDEO so a user's partial selection persists across sessions.")))
+  return findings
+
+
+def _files_and_docs_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """Files and Docs Access: the manifest half (WP9).
+
+  1. ``WRITE_EXTERNAL_STORAGE`` shipped without ``maxSdkVersion <=
+     LEGACY_WRITE_STORAGE_MAX_SDK`` (29) while the highest shipped target is
+     ``>= SCOPED_STORAGE_TARGET_SDK`` (30) -> IMPORTANT. Under scoped storage
+     the permission grants nothing; keeping it uncapped misleads users at
+     install / prompt time and is the matrix's "broad storage permission on
+     30+" row.
+  2. ``android:requestLegacyExternalStorage="true"`` with target ``>= 30`` ->
+     SUGGESTION: the platform ignores the flag when targeting 30+;
+     ``preserveLegacyExternalStorage`` is the upgrade-path flag. A flavour
+     still targeting 29 is noted, since the flag matters for that build.
+  ``MANAGE_EXTERNAL_STORAGE`` belongs to ``all_files_access_policy`` (WP5)
+  and is not repeated here.
+  """
+  pid = "files_and_docs_policy"
+  findings: List[Dict[str, Any]] = []
+  values = _target_values(inputs)
+  target = values[0] if values else 0
+  purpose = inputs.purpose_label()
+  write = _shipped_permission(inputs, "WRITE_EXTERNAL_STORAGE")
+  if write is not None and target >= constants.SCOPED_STORAGE_TARGET_SDK and (
+      write.max_sdk is None or write.max_sdk > constants.LEGACY_WRITE_STORAGE_MAX_SDK):
+    log.info("files_and_docs: WRITE_EXTERNAL_STORAGE uncapped (maxSdk=%s) with target %d -> IMPORTANT",
+             write.max_sdk, target)
+    findings.append(_manifest_finding(
+        pid, "IMPORTANT",
+        f"WRITE_EXTERNAL_STORAGE is requested without maxSdkVersion=\"{constants.LEGACY_WRITE_STORAGE_MAX_SDK}\" "
+        f"while targeting API {target} (inert under scoped storage)",
+        f"{_perm_evidence(write)}; targetSdk={target}; scoped storage applies from API "
+        f"{constants.SCOPED_STORAGE_TARGET_SDK}{_straddle_note(values, constants.SCOPED_STORAGE_TARGET_SDK)}",
+        {"permission": write.name, "rule": "legacy_write_uncapped_on_30_plus", "max_sdk": write.max_sdk,
+         "required_max_sdk": constants.LEGACY_WRITE_STORAGE_MAX_SDK, "target_sdk": target,
+         "target_sdk_values": values, "app_purpose": purpose}))
+  application = (inputs.profile.application if inputs.profile is not None else {}) or {}
+  legacy_flag = application.get("request_legacy_external_storage")
+  if legacy_flag is True and target >= constants.SCOPED_STORAGE_TARGET_SDK:
+    source = (inputs.profile.application_sources.get("request_legacy_external_storage")
+              if inputs.profile is not None else None)
+    log.info("files_and_docs: requestLegacyExternalStorage=true with target %d -> SUGGESTION", target)
+    findings.append(_manifest_finding(
+        pid, "SUGGESTION",
+        f"android:requestLegacyExternalStorage=\"true\" is set while targeting API {target}; the platform "
+        "ignores it from API 30",
+        f"<application android:requestLegacyExternalStorage=\"true\"> (source set {source or 'unknown'}); "
+        f"targetSdk={target}{_straddle_note(values, constants.SCOPED_STORAGE_TARGET_SDK)}",
+        {"attribute": "requestLegacyExternalStorage", "rule": "legacy_storage_flag_on_30_plus",
+         "target_sdk": target, "target_sdk_values": values, "source": source, "app_purpose": purpose},
+        recommendation=("Remove android:requestLegacyExternalStorage once every build targets API 30+; "
+                        "use android:preserveLegacyExternalStorage only to keep legacy access for "
+                        "users upgrading from a legacy install.")))
+  if not findings:
+    log.debug("files_and_docs: no manifest finding (WRITE_EXTERNAL_STORAGE=%s, legacy flag=%s, target=%d)",
+              write.to_dict() if write is not None else None, legacy_flag, target)
+  return findings
+
+
+def _storage_root_file_gate(fs: structure.FileStructure) -> bool:
+  """``applies_file`` for ``files_and_docs_policy``: the file composes a path from the storage root."""
+  return context.has_storage_write_hint(fs)
+
+
+def _photo_video_code_spec() -> PolicySpec:
+  """Per-file media access mode under a broad media permission (WP9)."""
+  members = frozenset({"MEDIA", "PHOTOS", "VIDEOS"})
+  return PolicySpec(
+      policy_id="photo_video_access_policy",
+      kind=CODE_SIGNAL,
+      goal="permissions_and_apis",
+      applies_data_type=lambda dt: dt in members,
+      make_battery=lambda dt, desc, token="": q.photo_video_battery(dt, token),
+      compose=lambda dt, finding_str, state, answers, client_name, app_purpose=None: (
+          evaluate.compose_photo_video_finding(dt, state, answers, client_name, app_purpose)),
+      requires_permissions=tuple(sorted(constants.BROAD_MEDIA_PERMISSION_SHORT_NAMES)) + ("READ_EXTERNAL_STORAGE",),
+      one_per_file=True,
+      needs_app_purpose=True,
+  )
+
+
+def _files_and_docs_code_spec() -> PolicySpec:
+  """Per-file root-level folder creation on shared storage (WP9)."""
+  return PolicySpec(
+      policy_id="files_and_docs_policy",
+      kind=CODE_SIGNAL,
+      goal="permissions_and_apis",
+      applies_data_type=lambda dt: dt == "FILES_AND_DOCS",
+      make_battery=lambda dt, desc, token="": q.files_and_docs_battery(dt, token),
+      compose=lambda dt, finding_str, state, answers, client_name, app_purpose=None: (
+          evaluate.compose_files_and_docs_finding(dt, state, answers, client_name, app_purpose)),
+      applies_file=_storage_root_file_gate,
+      one_per_file=True,
+      needs_app_purpose=True,
+  )
+
+
 def _manifest_spec(policy_id: str, compose: Callable[[ManifestInputs], List[Dict[str, Any]]]) -> PolicySpec:
   return PolicySpec(policy_id=policy_id, kind=MANIFEST, goal="permissions_and_apis",
                     compose_manifest=compose)
@@ -719,6 +953,11 @@ REGISTRY: Tuple[PolicySpec, ...] = (
     _manifest_spec("package_visibility_policy", _package_visibility_findings),
     _manifest_spec("exact_alarm_policy", _exact_alarm_findings),
     _manifest_spec("target_api_level", _target_api_level_findings),
+    # WP9 wave-2 storage policies: manifest rules plus one per-file Noul each.
+    *([_manifest_spec("photo_video_access_policy", _photo_video_findings), _photo_video_code_spec()]
+      if constants.PHOTO_VIDEO_POLICY_ENABLED else []),
+    *([_manifest_spec("files_and_docs_policy", _files_and_docs_findings), _files_and_docs_code_spec()]
+      if constants.FILES_AND_DOCS_POLICY_ENABLED else []),
     _play_declaration_spec(),
 )
 

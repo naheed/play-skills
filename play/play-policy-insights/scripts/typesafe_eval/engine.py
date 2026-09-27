@@ -860,14 +860,69 @@ def plan(data_sources: Dict[str, List[str]]) -> List[Task]:
   return tasks
 
 
-def _plan_from_candidates(kept: Dict[str, List[Candidate]]) -> List[Task]:
+def _spec_permission_ships(ctx: Optional[RunContext], spec: registry.PolicySpec) -> bool:
+  """WP9 planner gate: at least one of ``spec.requires_permissions`` ships.
+
+  Reads the merged profile (Play build only); falls back to the legacy
+  ``manifest_details.permissions`` list; with neither available the spec is
+  planned (unknowns err towards recall).
+  """
+  if not spec.requires_permissions or ctx is None:
+    return True
+  if ctx.profile is not None and ctx.profile.permissions:
+    return any(p is not None and ctx.profile.ships_in_play_build(p)
+               for p in (ctx.profile.permission(n) for n in spec.requires_permissions))
+  legacy = [str(n).rsplit(".", 1)[-1] for n in (ctx.manifest.get("permissions") or [])]
+  if legacy:
+    return any(n in legacy for n in spec.requires_permissions)
+  return True
+
+
+def _plan_from_candidates(kept: Dict[str, List[Candidate]], ctx: Optional[RunContext] = None) -> List[Task]:
+  """Turns triaged candidates into (policy, candidate) tasks.
+
+  WP9 adds three deterministic planner gates a spec may declare, each
+  recorded in ``ctx.dropped`` so the triage file shows what was not asked:
+  ``requires_permissions`` (the policy's permission must ship),
+  ``applies_file`` (a structural fact about the candidate file) and
+  ``one_per_file`` (a per-file question is asked once; the first candidate
+  in triage rank order carries it).
+  """
   tasks: List[Task] = []
   specs = registry.code_signal_specs() + registry.deterministic_specs()
+  permission_ok = {spec.policy_id: _spec_permission_ships(ctx, spec) for spec in specs}
+  asked_per_file: set = set()
+  skipped: Dict[str, int] = {}
   for data_type, cands in kept.items():
     for c in cands:
       for spec in specs:
-        if spec.applies_data_type(data_type):
-          tasks.append(Task(spec, data_type, c.finding_str, c.relpath, c.pattern))
+        if not spec.applies_data_type(data_type):
+          continue
+        if not permission_ok[spec.policy_id]:
+          _drop(ctx, data_type, c.finding_str,
+                f"{spec.policy_id}: none of {list(spec.requires_permissions)} ships in the Play build")
+          skipped[spec.policy_id] = skipped.get(spec.policy_id, 0) + 1
+          continue
+        if spec.applies_file is not None and ctx is not None:
+          fs = ctx.files.get(c.relpath)
+          if fs is None or not spec.applies_file(fs):
+            _drop(ctx, data_type, c.finding_str, f"{spec.policy_id}: file does not meet the structural activation")
+            skipped[spec.policy_id] = skipped.get(spec.policy_id, 0) + 1
+            continue
+        if spec.one_per_file:
+          key = (spec.policy_id, c.relpath)
+          if key in asked_per_file:
+            _drop(ctx, data_type, c.finding_str, f"{spec.policy_id}: asked once per file")
+            continue
+          asked_per_file.add(key)
+        tasks.append(Task(spec, data_type, c.finding_str, c.relpath, c.pattern))
+  if ctx is not None:
+    ctx.counters["planner_gated"] = skipped
+    ctx.counters["tasks_per_policy"] = {}
+    for t in tasks:
+      ctx.counters["tasks_per_policy"][t.spec.policy_id] = ctx.counters["tasks_per_policy"].get(t.spec.policy_id, 0) + 1
+  if skipped:
+    log.info("planner: gated tasks per policy %s", skipped)
   return tasks
 
 
@@ -900,8 +955,16 @@ def _error_finding(task: Task, mini_state: Dict[str, Any], exc: Exception) -> Di
   }
 
 
-def _compose_task(task: Task, mini_state: Dict[str, Any], answers, client_name: str):
+def _compose_task(task: Task, mini_state: Dict[str, Any], answers, client_name: str,
+                  ctx: Optional[RunContext] = None):
+  """Composes one finding; specs with ``needs_app_purpose`` also receive the
+  once-per-app purpose answer (WP9) as ``app_purpose=``."""
   try:
+    if task.spec.needs_app_purpose:
+      return task.spec.compose(
+          task.data_type, task.finding_str, mini_state, answers, client_name,
+          app_purpose=ctx.app_purpose if ctx is not None else None,
+      )
     return task.spec.compose(
         task.data_type, task.finding_str, mini_state, answers, client_name
     )
@@ -1043,7 +1106,7 @@ def _run_batched(ctx: RunContext, tasks: Sequence[Task], client: JevClient,
       for i, task in enumerate(chunk):
         prefix = f"a{i}__"
         sub = {qid[len(prefix):]: a for qid, a in answers.items() if qid.startswith(prefix)}
-        finding = _compose_task(task, per_task[i], sub, client.name)
+        finding = _compose_task(task, per_task[i], sub, client.name, ctx)
         if finding:
           _attribute_sources(ctx, finding, task.spec.policy_id)
           findings_by_goal[task.spec.goal].append(finding)
@@ -1067,7 +1130,7 @@ def _run_per_finding(ctx: RunContext, tasks: Sequence[Task], client: JevClient,
     except Exception as exc:  # pylint: disable=broad-exception-caught
       findings_by_goal[task.spec.goal].append(_error_finding(task, state, exc))
       continue
-    finding = _compose_task(task, state, answers, client.name)
+    finding = _compose_task(task, state, answers, client.name, ctx)
     if finding:
       _attribute_sources(ctx, finding, task.spec.policy_id)
       findings_by_goal[task.spec.goal].append(finding)
@@ -1249,7 +1312,7 @@ def run(
   _resolve_callees(ctx, candidates)
   _classify_semantics(ctx, client, capability_cache, model)
   kept = _triage(ctx, candidates)
-  tasks = _plan_from_candidates(kept)
+  tasks = _plan_from_candidates(kept, ctx)
   ctx.counters["tasks"] = len(tasks)
 
   findings_by_goal: Dict[str, List[Dict[str, Any]]] = {g: [] for g in registry.goals()}

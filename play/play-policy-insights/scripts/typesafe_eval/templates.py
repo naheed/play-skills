@@ -151,6 +151,35 @@ _RECOMMENDATIONS: Dict[str, object] = {
             " manifest; verify it meets the current Play requirement."
         ),
     },
+    # WP9 wave-2 storage policies. Wording mirrors the goal matrices.
+    "photo_video_access_policy": {
+        "IMPORTANT": (
+            "Migrate one-off media selection to the Android Photo Picker"
+            " (MediaStore.ACTION_PICK_IMAGES / ActivityResultContracts."
+            "PickVisualMedia), which needs no permission, and cap"
+            " READ_EXTERNAL_STORAGE at maxSdkVersion 32 or remove it."
+        ),
+        "SUGGESTION": (
+            "Complete the Photo and Video Permissions declaration in the Play"
+            " Console, cap READ_EXTERNAL_STORAGE at maxSdkVersion 32, and"
+            " declare READ_MEDIA_VISUAL_USER_SELECTED alongside READ_MEDIA_IMAGES"
+            " / READ_MEDIA_VIDEO so a partial grant persists."
+        ),
+    },
+    "files_and_docs_policy": {
+        "IMPORTANT": (
+            "Adopt scoped storage: cap WRITE_EXTERNAL_STORAGE at maxSdkVersion 29,"
+            " write app outputs to getExternalFilesDir() or a MediaStore"
+            " collection, and open user documents through the Storage Access"
+            " Framework (Intent.ACTION_OPEN_DOCUMENT) instead of the raw path."
+        ),
+        "SUGGESTION": (
+            "Prefer app-specific directories (getExternalFilesDir) or"
+            " SAF-scoped locations over folders created at the external-storage"
+            " root, and drop requestLegacyExternalStorage once every build"
+            " targets API 30+ (preserveLegacyExternalStorage covers upgrades)."
+        ),
+    },
     "foreground_services_policy": {
         "CRITICAL": (
             "Declare the specific android:foregroundServiceType(s) (and the"
@@ -230,3 +259,34 @@ def issue_summary(
   # Generic fallback keeps output well-formed for policies without a template.
   subject = f"{data_type} " if data_type else ""
   return f"{subject}may violate {name}".strip()
+
+
+# WP9: per-mode wording for the two storage code findings. ``mode`` values are
+# the ones ``evaluate`` derives from the Noul (``full_library`` /
+# ``user_selected`` / ``uncertain``; ``confirmed`` / ``uncertain`` / ``denied``).
+_MEDIA_ACCESS_SUMMARY = {
+    "full_library": "enumerates the media library under a broad media permission",
+    "user_selected": "handles user-selected media while a broad media permission is held",
+    "uncertain": "accesses media under a broad media permission (library vs user-selected unclear)",
+}
+_ROOT_FOLDER_SUMMARY = {
+    "confirmed": "creates its own folder or files at the external-storage root",
+    "uncertain": "may create a folder at the external-storage root (unclear)",
+    "denied": "composes a path from the external-storage root and writes to it (model disagrees)",
+}
+
+
+def media_access_summary(data_type: str, mode: str, justified: bool) -> str:
+  """Summary for a ``photo_video_access_policy`` code finding (WP9)."""
+  what = _MEDIA_ACCESS_SUMMARY.get(mode, _MEDIA_ACCESS_SUMMARY["uncertain"])
+  tail = ("; the core purpose qualifies — confirm the Play Console declaration" if justified
+          else "; the core purpose does not qualify for broad media access — use the Photo Picker")
+  return f"{data_type}: code {what}{tail}"
+
+
+def root_folder_summary(mode: str, justified: bool) -> str:
+  """Summary for a ``files_and_docs_policy`` code finding (WP9)."""
+  what = _ROOT_FOLDER_SUMMARY.get(mode, _ROOT_FOLDER_SUMMARY["uncertain"])
+  tail = (" (file-management purpose: scoped alternative suggested)" if justified
+          else " (scoped storage mandate)")
+  return f"App {what}{tail}"

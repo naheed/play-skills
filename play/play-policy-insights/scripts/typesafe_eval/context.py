@@ -379,6 +379,48 @@ def anchor_guards(
   return out
 
 
+_STORAGE_STRENGTH_RANK = {"writes": 0, "composes": 1, "references": 2}
+
+
+def file_storage_hints(fs: structure.FileStructure, anchor_lines: Sequence[int]) -> List[structure.StorageHint]:
+  """The file's shared-storage path hints, strongest first (WP9).
+
+  ``structure.external_storage_paths`` is scanned over the whole file because
+  the ``creates_root_level_external_folder`` question is asked once per file
+  and the composing helper (``getTempDir``) is rarely inside the anchor's
+  scope. Hints are ordered by strength (``writes`` > ``composes`` >
+  ``references``), then by distance to the nearest anchor, and capped at
+  ``constants.MAX_STORAGE_HINTS_IN_STATE``. Empty when the feature is off or
+  the file never names the storage root.
+  """
+  if not constants.STORAGE_HINTS_ENABLED:
+    return []
+  hints = structure.external_storage_paths(fs.lines)
+  if not hints:
+    return []
+
+  def _distance(h: structure.StorageHint) -> int:
+    return min((abs(h.line - a) for a in anchor_lines), default=h.line)
+
+  ranked = sorted(hints, key=lambda h: (_STORAGE_STRENGTH_RANK[h.strength], _distance(h), h.line))
+  out = ranked[:constants.MAX_STORAGE_HINTS_IN_STATE]
+  log.debug("storage hints for %s: %d found, %d kept: %s", fs.relpath, len(hints), len(out),
+            [(h.kind, h.line + 1, h.strength) for h in out])
+  return out
+
+
+def has_storage_write_hint(fs: structure.FileStructure) -> bool:
+  """True when the file composes a path from the shared-storage root (and
+  possibly writes or creates it) — the deterministic activation of
+  ``files_and_docs_policy``'s code question (WP9). A bare reference
+  (``path.startsWith(root)``, a constant holding the root) does not activate
+  it; composition alone does, because the created folder is often returned
+  to a caller and the model must judge the whole file (recall first)."""
+  if not constants.STORAGE_HINTS_ENABLED:
+    return False
+  return any(h.writes or h.composes for h in structure.external_storage_paths(fs.lines))
+
+
 def resolved_strings(
     fs: structure.FileStructure, line_numbers: Sequence[int], resources: Any,
 ) -> Dict[str, Optional[str]]:
@@ -429,11 +471,20 @@ class Anchor:
   # (``structure.guard_flags`` / ``declaration_of``). Priors for the
   # ``consent_default_on`` Noul and the deterministic half of its double gate.
   guards: List["GuardState"] = dataclasses.field(default_factory=list)
+  # WP9: deterministic media-access priors read from the chosen scope
+  # (``structure.media_access_hints``): MediaStore collection queries vs
+  # picker intents. Priors for the ``accesses_full_media_library`` Noul.
+  media_hints: List[structure.MediaHint] = dataclasses.field(default_factory=list)
 
   @property
   def destination_hint_kinds(self) -> List[str]:
     """Distinct hint kinds in the chosen scope (WP7), e.g. ``["USER_CHOSEN_DESTINATION"]``."""
     return sorted({h.kind for h in self.destination_hints})
+
+  @property
+  def media_hint_kinds(self) -> List[str]:
+    """Distinct media-access hint kinds in the chosen scope (WP9)."""
+    return sorted({h.kind for h in self.media_hints})
 
   @property
   def guard_defaults(self) -> List[Optional[bool]]:
@@ -717,6 +768,14 @@ def build_file_state(
     for a in anchors:
       if a.chosen is not None:
         a.guards = anchor_guards(fs, a.scope, first_party_index, app_dir)
+  # WP9: media-access priors of the chosen scope (per anchor) and the file's
+  # shared-storage path hints (per file: the root-folder question is asked
+  # once per file, and the composing line is often outside the anchor scope).
+  if constants.MEDIA_HINTS_ENABLED:
+    for a in anchors:
+      if a.chosen is not None:
+        a.media_hints = structure.media_access_hints(fs.lines, a.scope)
+  storage_hints = file_storage_hints(fs, [a.chosen for a in anchors if a.chosen is not None])
   code, related = _render_snippet(fs, anchors, sinks)
   callee_section, callee_snippets = _render_callees(anchors)
   code += callee_section
@@ -779,6 +838,18 @@ def build_file_state(
   guard_states = [{"data_type": a.data_type, **g.to_state()} for a in anchors for g in a.guards]
   if guard_states:
     state["guards"] = guard_states
+  # WP9: media-access hints (flat, tagged by data type) and the file's
+  # shared-storage path hints. Present only when non-empty.
+  media_states = [{"data_type": a.data_type, **h.to_state()} for a in anchors for h in a.media_hints]
+  if media_states:
+    state["media_access_hints"] = media_states[:constants.MAX_MEDIA_HINTS_IN_STATE]
+    log.info("state for %s: %d media access hint(s): %s", fs.relpath, len(media_states),
+             sorted({(h["data_type"], h["hint"], h["detail"]) for h in media_states}))
+  storage_states = [h.to_state() for h in storage_hints]
+  if storage_states:
+    state["external_storage_paths"] = storage_states
+    log.info("state for %s: %d external storage path hint(s): %s", fs.relpath, len(storage_states),
+             [(h["hint"], h["line"], h["strength"]) for h in storage_states])
   strings: Dict[str, Optional[str]] = {}
   if constants.STRING_RESOLUTION_ENABLED and resources is not None:
     scope_lines: List[int] = []
@@ -828,6 +899,7 @@ def build_file_state(
             "callee_capabilities": a.callee_capabilities,
             "destination_hints": a.destination_hint_kinds,
             "guard_defaults": a.guard_defaults,
+            "media_hints": a.media_hint_kinds,
         },
         "callees": own_callees,
         "app": app_facts,
@@ -837,6 +909,10 @@ def build_file_state(
       mini["destination_hints"] = [h.to_state() for h in a.destination_hints]
     if a.guards:
       mini["guards"] = [g.to_state() for g in a.guards]
+    if a.media_hints:
+      mini["media_access_hints"] = [h.to_state() for h in a.media_hints]
+    if storage_states:
+      mini["external_storage_paths"] = storage_states
     if strings:
       mini["strings"] = strings
     per_ask.append(mini)

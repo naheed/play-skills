@@ -1871,6 +1871,196 @@ def string_references(lines: Sequence[str], line_numbers: Sequence[int]) -> List
   return out
 
 
+# ---------------------------------------------------------------------------
+# Storage-path and media-access hints (WP9).
+#
+# Two wave-2 policies need a code fact the manifest cannot give:
+#
+# * files_and_docs_policy: does the app create its own folder at the *root* of
+#   external storage (``Environment.getExternalStorageDirectory() + "/my"``)
+#   rather than in an app-specific or SAF-scoped location? The structure layer
+#   finds every line that names the storage root (or a public collection
+#   directory) and looks a few lines ahead for a path composed from it and a
+#   write / create call. The Noul ``creates_root_level_external_folder`` is
+#   asked only for files with such a hint, and the hint's strength (a write on
+#   a root-composed path) is the deterministic half of the double gate in
+#   ``evaluate.compose_files_and_docs_finding``.
+# * photo_video_access_policy: does a code site enumerate the media library
+#   (a ``MediaStore`` collection query) or let the user pick one item (a
+#   picker intent)? These are priors for the Noul ``accesses_full_media_library``
+#   and corroborate or contradict its answer in the trace; they never decide.
+#
+# Only Android platform API names and path literals appear below.
+
+#: Hint kinds. Names are stable: they appear in states, traces and labels.
+STORAGE_ROOT = "STORAGE_ROOT"
+PUBLIC_DIRECTORY = "PUBLIC_DIRECTORY"
+LIBRARY_QUERY = "LIBRARY_QUERY"
+USER_PICK = "USER_PICK"
+
+# The shared-storage root: the platform accessor and the literal mount points.
+_STORAGE_ROOT_TOKENS = ("getExternalStorageDirectory(", "\"/sdcard", "'/sdcard",
+                        "\"/storage/emulated/0", "\"/mnt/sdcard")
+# A standard public collection (Downloads, Pictures, ...): a sub-folder there
+# is not "root-level" but is still shared storage the model should weigh.
+_PUBLIC_DIRECTORY_TOKENS = ("getExternalStoragePublicDirectory(",)
+# A path built from the root on the same or a following line.
+_PATH_COMPOSE_TOKENS = ("File(", "+ \"", "+ '", ".resolve(", "Paths.get(", "separator", "\"/")
+# The composed path is created or written.
+_PATH_WRITE_TOKENS = ("mkdir(", "mkdirs(", "createNewFile(", "createDirectory(", "createDirectories(",
+                      "FileOutputStream(", "FileWriter(", "PrintWriter(", "RandomAccessFile(",
+                      "ZipOutputStream(", "renameTo(", "copyTo(", "writeText(", "writeBytes(",
+                      "outputStream(", "openFileOutput(", "Files.write(", "Files.copy(", "Files.move(")
+# MediaStore collections and the calls that enumerate them.
+_MEDIA_COLLECTION_TOKENS = ("EXTERNAL_CONTENT_URI", "MediaStore.Images", "MediaStore.Video",
+                            "MediaStore.Files", "MediaStore.Downloads", "getContentUri(")
+_MEDIA_QUERY_TOKENS = ("query(", "ContentResolver", "contentResolver", "Cursor", "loadInBackground(",
+                       "CursorLoader(")
+# The user selects the item: the Photo Picker or a document / content picker.
+_MEDIA_PICK_TOKENS = ("ACTION_PICK_IMAGES", "PickVisualMedia", "PickMultipleVisualMedia", "ACTION_PICK",
+                      "ACTION_GET_CONTENT", "ACTION_OPEN_DOCUMENT", "OpenDocument", "GetContent",
+                      "registerForActivityResult(", "onActivityResult(")
+
+
+@dataclasses.dataclass
+class StorageHint:
+  """One place a file composes a path from shared external storage.
+
+  Attributes:
+    kind: :data:`STORAGE_ROOT` or :data:`PUBLIC_DIRECTORY`.
+    line: 0-based line naming the root.
+    composes: A path is built from the root within ``STORAGE_HINT_WINDOW`` lines.
+    writes: That window creates or writes a file / directory.
+    evidence: The root line and, when present, the first write line (bounded).
+  """
+
+  kind: str
+  line: int
+  composes: bool
+  writes: bool
+  evidence: str
+
+  @property
+  def strength(self) -> str:
+    """``writes`` > ``composes`` > ``references``."""
+    if self.writes:
+      return "writes"
+    return "composes" if self.composes else "references"
+
+  def to_state(self) -> Dict[str, object]:
+    return {"hint": self.kind, "line": self.line + 1, "composes": self.composes,
+            "writes": self.writes, "strength": self.strength, "evidence": self.evidence}
+
+
+@dataclasses.dataclass
+class MediaHint:
+  """One deterministic prior about how a scope reaches the user's media.
+
+  Attributes:
+    kind: :data:`LIBRARY_QUERY` (a MediaStore collection is queried) or
+      :data:`USER_PICK` (the user selects an item through a picker).
+    line: 0-based line.
+    detail: The token that produced the hint.
+    evidence: The stripped source line (bounded).
+  """
+
+  kind: str
+  line: int
+  detail: str
+  evidence: str
+
+  def to_state(self) -> Dict[str, object]:
+    return {"hint": self.kind, "line": self.line + 1, "detail": self.detail, "evidence": self.evidence}
+
+
+def _code_line(line: str) -> bool:
+  stripped = line.strip()
+  return bool(stripped) and not stripped.startswith(_COMMENT_PREFIXES) and not stripped.startswith(_IMPORT_PREFIXES)
+
+
+def external_storage_paths(lines: Sequence[str], scope: Optional[Tuple[int, int]] = None) -> List[StorageHint]:
+  """Lines that name the shared-storage root and what the following lines do with it.
+
+  Args:
+    lines: The file's lines (0-based).
+    scope: Optional half-open 0-based line range; None scans the whole file
+      (the policy question is per file, not per anchor scope).
+
+  Each hit is followed for ``constants.STORAGE_HINT_WINDOW`` lines (stopping
+  at a line that is only ``}``, the end of the enclosing block) to see whether
+  a path is composed from the root and whether that path is created or
+  written. ``getExternalFilesDir`` / ``getExternalCacheDir`` (app-specific
+  directories) are never hints: scoped storage is exactly what they are for.
+  Comment and import lines are skipped. Returns hints in line order.
+  """
+  start, end = (0, len(lines)) if scope is None else (max(0, scope[0]), min(len(lines), scope[1]))
+  out: List[StorageHint] = []
+  for i in range(start, end):
+    line = lines[i]
+    if not _code_line(line):
+      continue
+    kind = None
+    if any(tok in line for tok in _STORAGE_ROOT_TOKENS):
+      kind = STORAGE_ROOT
+    elif any(tok in line for tok in _PUBLIC_DIRECTORY_TOKENS):
+      kind = PUBLIC_DIRECTORY
+    if kind is None:
+      continue
+    composes = False
+    writes = False
+    write_line: Optional[str] = None
+    for j in range(i, min(len(lines), i + 1 + constants.STORAGE_HINT_WINDOW)):
+      text = lines[j]
+      if j > i and text.strip() in ("}", "};"):
+        break
+      if not _code_line(text):
+        continue
+      if any(tok in text for tok in _PATH_COMPOSE_TOKENS):
+        composes = True
+      if any(tok in text for tok in _PATH_WRITE_TOKENS):
+        writes = True
+        if write_line is None and j != i:
+          write_line = text.strip()[:_MAX_HINT_EVIDENCE_CHARS]
+    evidence = line.strip()[:_MAX_HINT_EVIDENCE_CHARS]
+    if write_line:
+      evidence += f" … {write_line}"
+    out.append(StorageHint(kind, i, composes, writes, evidence))
+  if out:
+    log.debug("external storage hints in lines %d-%d: %s", start + 1, end,
+              [(h.kind, h.line + 1, h.strength) for h in out])
+  return out
+
+
+def media_access_hints(lines: Sequence[str], scope: Tuple[int, int]) -> List[MediaHint]:
+  """Deterministic media-access priors for the lines in ``[scope[0], scope[1])``.
+
+  A :data:`LIBRARY_QUERY` hint needs a MediaStore collection token *and* a
+  query token on the same line or within ``constants.STORAGE_HINT_WINDOW``
+  following lines (``resolver.query(MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+  ...)``). A :data:`USER_PICK` hint is any picker token. One hint per
+  (kind, line); comment and import lines are skipped.
+  """
+  out: List[MediaHint] = []
+  start, end = max(0, scope[0]), min(len(lines), scope[1])
+  for i in range(start, end):
+    line = lines[i]
+    if not _code_line(line):
+      continue
+    evidence = line.strip()[:_MAX_HINT_EVIDENCE_CHARS]
+    collection = next((tok for tok in _MEDIA_COLLECTION_TOKENS if tok in line), None)
+    if collection is not None:
+      window = [lines[j] for j in range(i, min(len(lines), i + 1 + constants.STORAGE_HINT_WINDOW))]
+      if any(tok in text for text in window for tok in _MEDIA_QUERY_TOKENS):
+        out.append(MediaHint(LIBRARY_QUERY, i, collection, evidence))
+    pick = next((tok for tok in _MEDIA_PICK_TOKENS if tok in line), None)
+    if pick is not None:
+      out.append(MediaHint(USER_PICK, i, pick, evidence))
+  if out:
+    log.debug("media access hints in lines %d-%d: %s", start + 1, end,
+              [(h.kind, h.line + 1, h.detail) for h in out])
+  return out
+
+
 def analyze_file(app_dir: str, relpath: str) -> FileStructure:
   """Reads and structurally indexes one file (imports + symbol references)."""
   content = _read(os.path.join(app_dir, relpath))

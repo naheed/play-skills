@@ -369,6 +369,74 @@ def account_deletion_gate(data_type: str, description: str) -> Dict[str, Dict[st
   }
 
 
+def photo_video_battery(data_type: str, token: str = "") -> Dict[str, Dict[str, Any]]:
+  """Battery for one media code site under ``photo_video_access_policy`` (WP9).
+
+  Asked once per file that anchors a MEDIA / PHOTOS / VIDEOS signal, and only
+  when the app ships a broad media permission (the planner gates on the
+  manifest; the model is never asked to read XML). The relevance gate is the
+  shared one; the single policy question separates "enumerates the user's
+  media library" (what a gallery or backup tool does, and what a broad media
+  permission is for) from "the user picks one item" (what the Photo Picker
+  does without any permission). ``media_access_hints`` in the state are the
+  deterministic priors (MediaStore collection queries vs picker intents); the
+  model weighs them against the code.
+  """
+  subject = f"the data type {data_type}"
+  return {
+      "signal_relevant": _relevance(subject, token),
+      "accesses_full_media_library": _noul(
+          instructions=(
+              "Does `code_snippet` enumerate or scan the user's photo / video "
+              "library as a whole — querying a MediaStore collection, listing "
+              "media folders, generating thumbnails for every item, indexing or "
+              "syncing all media — rather than handling one or a few items the "
+              "user explicitly selected (a picker intent, a Photo Picker result, "
+              "a shared URI)? `media_access_hints`, when present, lists "
+              "deterministic clues: LIBRARY_QUERY (a MediaStore collection is "
+              "queried) and USER_PICK (a picker or activity-result contract). "
+              "Judge the code itself; the hints are priors."
+          ),
+          yes="The code enumerates, scans or indexes the media library (needs broad media access).",
+          no="The code handles only items the user selected or that were shared to it.",
+      ),
+  }
+
+
+def files_and_docs_battery(data_type: str, token: str = "") -> Dict[str, Dict[str, Any]]:
+  """Battery for one shared-storage code site under ``files_and_docs_policy`` (WP9).
+
+  Asked once per file, and only for files where the structure layer found a
+  path composed from the external-storage root (``external_storage_paths`` in
+  the state, each with ``strength``: ``writes`` / ``composes`` /
+  ``references``). There is no relevance gate: the deterministic hint *is*
+  the activation. The question is whether the app creates its own folder or
+  files at the root of shared storage (``/sdcard/MyApp``) instead of an
+  app-specific directory (``getExternalFilesDir``), a public collection
+  (``Downloads/`` via MediaStore) or a location the user picked through the
+  Storage Access Framework.
+  """
+  del data_type, token  # the deterministic hint anchors this question, not the scanner token
+  return {
+      "creates_root_level_external_folder": _noul(
+          instructions=(
+              "Does `code_snippet` (or the file lines quoted in "
+              "`external_storage_paths`) create or write a custom folder or file "
+              "directly under the external-storage root — e.g. "
+              "`Environment.getExternalStorageDirectory()` + \"/my_folder\" followed "
+              "by mkdir / mkdirs / a FileOutputStream — for the app's own outputs, "
+              "temp files, logs or config? Answer no when the path is an "
+              "app-specific directory (getExternalFilesDir / getExternalCacheDir), "
+              "a standard public collection (Downloads, Pictures, DCIM) used "
+              "through MediaStore, a location the user chose (SAF tree / document "
+              "URI), or when the root is only read, compared or displayed."
+          ),
+          yes="The app creates or writes its own folder / files at the external-storage root.",
+          no="No root-level folder is created (app-specific, public collection, user-chosen, or read-only).",
+      ),
+  }
+
+
 def critic_battery(claim_kind: str = "generic") -> Dict[str, Dict[str, Any]]:
   """One cheap Noul that verifies only the *atomic* claim a finding rests on.
 

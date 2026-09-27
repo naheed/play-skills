@@ -179,6 +179,8 @@ def _decision_trace(
           # WP8: declared defaults of the boolean guards around the anchor
           # (``{flag: True|False|None}``); None when no guard was found.
           "guard_defaults": anchor.get("guard_defaults"),
+          # WP9: deterministic media-access hint kinds in the scope.
+          "media_hints": anchor.get("media_hints"),
       },
       # WP7: the deterministic destination priors read from the anchor scope
       # (kind, line, why, source line). Empty when none was found.
@@ -1265,6 +1267,252 @@ def _compose_permission_finding(
       ),
   }
   if (decision == UNCERTAIN and severity != "SUGGESTION") or relevance_low:
+    finding["needs_manual_review"] = True
+  return finding
+
+
+# ---------------------------------------------------------------------------
+# WP9: wave-2 storage code findings
+# ---------------------------------------------------------------------------
+
+MEDIA_FULL_LIBRARY = "full_library"
+MEDIA_USER_SELECTED = "user_selected"
+MEDIA_UNCERTAIN = "uncertain"
+
+
+def media_access_mode(p_full: Optional[float]) -> str:
+  """Three-way reading of the ``accesses_full_media_library`` Noul (WP9).
+
+  ``p >= T_FULL_MEDIA_LIBRARY`` -> :data:`MEDIA_FULL_LIBRARY`;
+  ``p <= 1 - T_FULL_MEDIA_LIBRARY`` -> :data:`MEDIA_USER_SELECTED`; the band
+  between (and a missing answer) -> :data:`MEDIA_UNCERTAIN`, which is always
+  review-marked. The band is symmetric so neither direction is favoured.
+  """
+  if p_full is None:
+    return MEDIA_UNCERTAIN
+  if p_full >= constants.T_FULL_MEDIA_LIBRARY:
+    return MEDIA_FULL_LIBRARY
+  if p_full <= 1.0 - constants.T_FULL_MEDIA_LIBRARY:
+    return MEDIA_USER_SELECTED
+  return MEDIA_UNCERTAIN
+
+
+def _media_hint_kinds(state: Dict[str, Any]) -> List[str]:
+  anchor_kinds = (state.get("anchor") or {}).get("media_hints") or []
+  if anchor_kinds:
+    return sorted(set(anchor_kinds))
+  return sorted({h.get("hint") for h in state.get("media_access_hints") or [] if h.get("hint")})
+
+
+def _purpose_status(app_purpose: Optional[Dict[str, Any]], allowed: Iterable[str]) -> Tuple[bool, bool, str]:
+  """``(justified, established, label)`` for a purpose-conditioned code finding.
+
+  ``justified`` is :func:`purpose_in`; ``established`` is whether the purpose
+  is known at all at acting confidence (an unknown purpose can only raise a
+  severity and always sends the finding to review); ``label`` is the trace /
+  evidence text (``file_manager (p=0.92, model)`` / ``not established``).
+  """
+  ap = app_purpose or {}
+  purpose = ap.get("purpose") or "unknown"
+  established = purpose != "unknown" and purpose_in(ap, {purpose})
+  conf = float(ap.get("confidence") or 0.0)
+  src = ap.get("source") or "unavailable"
+  label = "not established" if not ap or purpose == "unknown" else (
+      f"{purpose} (p={conf:.2f}, {src}{'' if established else ', below CONF_APP_PURPOSE'})")
+  return purpose_in(ap, allowed), established, label
+
+
+def compose_photo_video_finding(
+    data_type: str,
+    state: Dict[str, Any],
+    answers: Dict[str, JevAnswer],
+    client_name: str,
+    app_purpose: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+  """One ``photo_video_access_policy`` code finding, or None (WP9).
+
+  The manifest rule already decides the app-level verdict; this per-site
+  finding says *how* the code reaches media so the reviewer can tell a
+  library scan from a one-item pick:
+
+  * Relevance gate first (shared with every code-signal policy).
+  * ``mode`` from :func:`media_access_mode`; ``media_access_hints`` in the
+    state corroborate (``LIBRARY_QUERY`` with full_library, ``USER_PICK`` with
+    user_selected) or contradict it. A contradiction never flips the mode; it
+    review-marks the finding and is traced.
+  * Purpose in ``PHOTO_VIDEO_PURPOSES`` (gallery / editor, backup, file
+    manager): a user-selected site is compliant (None; a gallery may also
+    pick one item); a full-library site is the SUGGESTION declaration
+    reminder; uncertain -> SUGGESTION + review.
+  * Any other purpose: IMPORTANT for every mode — a full-library scan in a
+    non-media app is the matrix's "not a dedicated media manager" row and a
+    user-selected site is exactly its Photo Picker heuristic. Review-marked
+    when the purpose is not established or the mode is uncertain.
+  The severity is never raised above IMPORTANT (the matrix has no Critical row).
+  """
+  verdict, p_relevant = relevance_verdict(answers, state)
+  file = state["signal"]["file"]
+  if verdict == RELEVANCE_DROP:
+    log.info("photo_video: relevance gate dropped %s in %s (p=%.2f)", data_type, file, p_relevant or 0.0)
+    return None
+  relevance_low = relevance_is_low(verdict)
+  answer = answers.get("accesses_full_media_library")
+  p_full = answer.noul if answer is not None else None
+  mode = media_access_mode(p_full)
+  hints = _media_hint_kinds(state)
+  corroborated = ((mode == MEDIA_FULL_LIBRARY and "LIBRARY_QUERY" in hints)
+                  or (mode == MEDIA_USER_SELECTED and "USER_PICK" in hints))
+  contradicted = ((mode == MEDIA_FULL_LIBRARY and hints == ["USER_PICK"])
+                  or (mode == MEDIA_USER_SELECTED and hints == ["LIBRARY_QUERY"]))
+  justified, established, purpose_label = _purpose_status(app_purpose, constants.PHOTO_VIDEO_PURPOSES)
+  trace_extra = {
+      "media_access": {"p_full_library": round(p_full, 4) if p_full is not None else None,
+                       "mode": mode, "hints": hints, "corroborated": corroborated,
+                       "contradicted": contradicted, "T_FULL_MEDIA_LIBRARY": constants.T_FULL_MEDIA_LIBRARY},
+      "app_purpose": purpose_label, "justified_by_purpose": justified,
+      "allowed_purposes": sorted(constants.PHOTO_VIDEO_PURPOSES),
+      "p_relevant": p_relevant, "relevance": relevance_trace(verdict),
+  }
+  if justified and mode == MEDIA_USER_SELECTED and not contradicted:
+    log.info("photo_video: %s in %s handles user-selected media and the purpose (%s) qualifies; "
+             "no finding", data_type, file, purpose_label)
+    return None
+  severity = "SUGGESTION" if justified else "IMPORTANT"
+  needs_review = (mode == MEDIA_UNCERTAIN or contradicted or relevance_low
+                  or (not justified and not established))
+  summary = templates.media_access_summary(data_type, mode, justified)
+  if contradicted:
+    summary += f" [deterministic hint {hints[0]} disagrees; verify]"
+  if relevance_low:
+    summary += f" [data-type match uncertain: p={p_relevant or 0.0:.2f}; verify]"
+  evidence = _evidence_line(state)
+  if hints:
+    evidence += f" [media hints: {', '.join(hints)}]"
+  log.info("photo_video: %s in %s mode=%s (p=%.2f, hints=%s, corroborated=%s, contradicted=%s) purpose=%s "
+           "-> %s%s", data_type, file, mode, p_full or 0.0, hints, corroborated, contradicted, purpose_label,
+           severity, " [review]" if needs_review else "")
+  finding = {
+      "policy_id": "photo_video_access_policy",
+      "issue_summary": summary,
+      "severity": severity,
+      "files_involved": files_involved(state),
+      "evidence": evidence,
+      "evidence_flow": {**evidence_flow(state), "media_access_mode": mode, "media_hints": hints},
+      "evidence_snippet": state.get("code_snippet", ""),
+      "recommendation": templates.recommendation("photo_video_access_policy", severity),
+      "claim_kind": "generic",
+      "psl_constant": data_type,
+      "media_access_mode": mode,
+      "sinks": [{"symbol": s["symbol"], "capabilities": s["capabilities"]} for s in (state.get("sinks") or [])],
+      "client": client_name,
+      "typesafe_answers": _answers_log(answers),
+      "decision_trace": _decision_trace(state, answers, None, trace_extra),
+  }
+  if needs_review:
+    finding["needs_manual_review"] = True
+  return finding
+
+
+ROOT_FOLDER_CONFIRMED = "confirmed"
+ROOT_FOLDER_UNCERTAIN = "uncertain"
+ROOT_FOLDER_DENIED = "denied"
+
+
+def root_folder_mode(p_root: Optional[float]) -> str:
+  """Three-way reading of the ``creates_root_level_external_folder`` Noul (WP9)."""
+  if p_root is None:
+    return ROOT_FOLDER_UNCERTAIN
+  if p_root >= constants.T_ROOT_LEVEL_FOLDER:
+    return ROOT_FOLDER_CONFIRMED
+  if p_root <= 1.0 - constants.T_ROOT_LEVEL_FOLDER:
+    return ROOT_FOLDER_DENIED
+  return ROOT_FOLDER_UNCERTAIN
+
+
+def compose_files_and_docs_finding(
+    data_type: str,
+    state: Dict[str, Any],
+    answers: Dict[str, JevAnswer],
+    client_name: str,
+    app_purpose: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+  """One ``files_and_docs_policy`` code finding, or None (WP9).
+
+  Activation is deterministic: ``state["external_storage_paths"]`` (the
+  file's paths composed from the shared-storage root, strongest first) must
+  be non-empty, otherwise nothing was asked and nothing composes. Then:
+
+  * ``mode`` from :func:`root_folder_mode`.
+  * ``confirmed`` -> IMPORTANT (the matrix's manual-file-sync heuristic),
+    or SUGGESTION when the established purpose is in
+    ``ALL_FILES_ACCESS_PURPOSES`` (a file manager or backup tool operates on
+    the shared tree by design; the scoped alternative is still suggested).
+    Review-marked when the purpose is not established.
+  * ``uncertain`` -> SUGGESTION + review.
+  * ``denied`` -> None only when no hint has ``strength == "writes"``
+    (double gate: the model says no *and* the structure layer saw no write
+    on a root-composed path); with such a write the finding stays as a
+    review-marked SUGGESTION that says the model disagrees.
+  The evidence points at the strongest hint line (``<file>:L<n> — <root
+  line> … <write line>``) rather than the scanner anchor, because the anchor
+  (a MIME literal, a permission string) is rarely where the folder is made.
+  """
+  file = state["signal"]["file"]
+  hints = state.get("external_storage_paths") or []
+  if not hints:
+    log.info("files_and_docs: no external storage path hint in %s; nothing to compose", file)
+    return None
+  answer = answers.get("creates_root_level_external_folder")
+  p_root = answer.noul if answer is not None else None
+  mode = root_folder_mode(p_root)
+  strongest = hints[0]
+  has_write = any(h.get("writes") for h in hints)
+  justified, established, purpose_label = _purpose_status(app_purpose, constants.ALL_FILES_ACCESS_PURPOSES)
+  trace_extra = {
+      "root_folder": {"p_root_level": round(p_root, 4) if p_root is not None else None, "mode": mode,
+                      "hints": [{"hint": h.get("hint"), "line": h.get("line"), "strength": h.get("strength")}
+                                for h in hints],
+                      "deterministic_write": has_write, "T_ROOT_LEVEL_FOLDER": constants.T_ROOT_LEVEL_FOLDER},
+      "app_purpose": purpose_label, "justified_by_purpose": justified,
+      "allowed_purposes": sorted(constants.ALL_FILES_ACCESS_PURPOSES),
+  }
+  if mode == ROOT_FOLDER_DENIED and not has_write:
+    log.info("files_and_docs: model denies a root-level folder in %s (p=%.2f) and no deterministic write "
+             "exists; no finding", file, p_root or 0.0)
+    return None
+  if mode == ROOT_FOLDER_CONFIRMED:
+    severity = "SUGGESTION" if justified else "IMPORTANT"
+    needs_review = not justified and not established
+  else:
+    severity = "SUGGESTION"
+    needs_review = True
+  summary = templates.root_folder_summary(mode, justified)
+  root_line = strongest.get("line")
+  evidence = f"{file}:L{root_line} — {str(strongest.get('evidence') or '').replace('|', '¦')}"
+  evidence += f" [{strongest.get('hint')}, {strongest.get('strength')}]"
+  log.info("files_and_docs: %s mode=%s (p=%.2f, strongest=%s@L%s, write=%s) purpose=%s -> %s%s",
+           file, mode, p_root or 0.0, strongest.get("hint"), root_line, has_write, purpose_label, severity,
+           " [review]" if needs_review else "")
+  finding = {
+      "policy_id": "files_and_docs_policy",
+      "issue_summary": summary,
+      "severity": severity,
+      "files_involved": [file],
+      "evidence": evidence,
+      "evidence_flow": {**evidence_flow(state), "storage_hint": dict(strongest), "root_folder_mode": mode},
+      "evidence_snippet": state.get("code_snippet", ""),
+      "recommendation": templates.recommendation("files_and_docs_policy", severity),
+      "claim_kind": "generic",
+      "root_folder_mode": mode,
+      "sinks": [{"symbol": s["symbol"], "capabilities": s["capabilities"]} for s in (state.get("sinks") or [])],
+      "client": client_name,
+      "typesafe_answers": _answers_log(answers),
+      "decision_trace": _decision_trace(state, answers, None, trace_extra),
+      # The scanner data type that brought the file in; the hint, not the
+      # anchor, is what the finding rests on.
+      "psl_constant": data_type,
+  }
+  if needs_review:
     finding["needs_manual_review"] = True
   return finding
 
