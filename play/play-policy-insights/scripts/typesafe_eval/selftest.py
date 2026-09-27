@@ -670,6 +670,32 @@ def _test_three_way_decision() -> None:
   no_sink_state = {**state, "anchor": {**state["anchor"], "tier": 3}}
   _check("relevance_soft_gate_drops_without_sink",
          evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", no_sink_state, _answers(0.95, relevant=uncertain_rel), "test") is None)  # pylint: disable=protected-access
+  # WP4 second condition: tier 3 anchor but the *file* references a strong egress
+  # sink -> kept for review, traced distinctly. IPC-only or UNKNOWN file sinks do
+  # not qualify (the tier-3 state above has only an Intent sink and is dropped).
+  egress_file_state = {**no_sink_state, "sinks": [
+      {"symbol": "Intent", "capabilities": ["IPC_SHARING"], "lines": [150]},
+      {"symbol": "HttpClient", "capabilities": ["NETWORK_EGRESS"], "lines": [200]}]}
+  fe = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", egress_file_state, _answers(0.95, relevant=uncertain_rel), "test")  # pylint: disable=protected-access
+  _check("relevance_soft_gate_file_egress_keeps",
+         fe is not None and fe.get("needs_manual_review") is True and fe["severity"] == "IMPORTANT"
+         and fe["decision_trace"].get("relevance") == "low_file_egress" and "(out of scope)" in fe["evidence"],
+         str(fe and (fe["severity"], fe["decision_trace"].get("relevance"), fe["evidence"])))
+  unknown_file_state = {**no_sink_state, "sinks": [{"symbol": "Foo", "capabilities": ["UNKNOWN"], "lines": [200]}]}
+  _check("relevance_soft_gate_file_unknown_drops",
+         evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", unknown_file_state, _answers(0.95, relevant=uncertain_rel), "test") is None)  # pylint: disable=protected-access
+  _check("relevance_soft_gate_file_egress_floor",
+         evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", egress_file_state, _answers(0.95, relevant=constants.T_RELEVANCE_FLOOR / 2), "test") is None)  # pylint: disable=protected-access
+  constants.RELEVANCE_SOFT_GATE_FILE_EGRESS = False
+  try:
+    _check("relevance_soft_gate_file_egress_flag_off",
+           evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", egress_file_state, _answers(0.95, relevant=uncertain_rel), "test") is None)  # pylint: disable=protected-access
+  finally:
+    constants.RELEVANCE_SOFT_GATE_FILE_EGRESS = True
+  perm_fe = evaluate._compose_permission_finding("PRECISE_LOCATION", "location_access_policy", egress_file_state, {  # pylint: disable=protected-access
+      **_answers(0.95, relevant=uncertain_rel), "is_core_functionality": JevAnswer("noul", noul=0.1)}, "test")
+  _check("relevance_soft_gate_file_egress_permission", perm_fe is not None and perm_fe.get("needs_manual_review") is True
+         and perm_fe["decision_trace"].get("relevance") == "low_file_egress", str(perm_fe and perm_fe["decision_trace"].get("relevance")))
   # A confidently negative relevance answer (below the floor) is dropped even
   # with a sink in scope: the soft band is for uncertain matches only.
   _check("relevance_soft_gate_floor_drops_confident_negative",
@@ -963,6 +989,117 @@ def _test_calibrate() -> None:
                                "decision_trace": {"scores": {"transmits_offdevice": 0.77}}}]}, f)
     joined = calibrate.join_probabilities([{"file": "A.kt", "data_type": "T", "transfers": True}], [d])
     _check("calibrate_joins_worker_probability", joined and joined[0]["p_transmit"] == 0.77, str(joined))
+
+
+def _test_app_purpose() -> None:
+  """WP4: once-per-app purpose question — cache miss/hit, low confidence, failure, purpose_in."""
+  from typesafe_eval import capabilities as capsmod
+  from typesafe_eval import constants
+  from typesafe_eval import engine
+  from typesafe_eval.client import HeuristicJevClient, JevAnswer, JevClient
+
+  class _Purpose(JevClient):
+    name = "fixed-purpose"
+    def __init__(self, purpose, confidence, fail=False):
+      super().__init__(); self.purpose = purpose; self.confidence = confidence; self.fail = fail
+      self.calls = 0; self.states = []; self.other_states = []
+    def system_one(self, state, questions, model=None):
+      if "declared_core_purpose" in questions:
+        self.calls += 1; self.states.append(state)
+        if self.fail:
+          raise RuntimeError("boom")
+        opts = list(questions["declared_core_purpose"]["criteria"])
+        probs = {o: (self.confidence if o == self.purpose else (1 - self.confidence) / (len(opts) - 1)) for o in opts}
+        return {"declared_core_purpose": JevAnswer("choice", choice=self.purpose, probabilities=probs, confidence=self.confidence)}
+      self.other_states.append(state)
+      return HeuristicJevClient().system_one(state, questions, model)
+
+  _check("purpose_in_established", evaluate.purpose_in({"purpose": "file_manager", "confidence": 0.9, "source": "model"}, {"file_manager"}))
+  _check("purpose_in_wrong_purpose", not evaluate.purpose_in({"purpose": "launcher", "confidence": 0.9, "source": "model"}, {"file_manager"}))
+  _check("purpose_in_low_confidence", not evaluate.purpose_in(
+      {"purpose": "file_manager", "confidence": constants.CONF_APP_PURPOSE - 0.01, "source": "model"}, {"file_manager"}))
+  _check("purpose_in_unknown", not evaluate.purpose_in({"purpose": "unknown", "confidence": 0.99, "source": "model"}, {"unknown", "file_manager"}))
+  _check("purpose_in_missing", not evaluate.purpose_in(None, {"file_manager"}) and not evaluate.purpose_in({}, {"file_manager"}))
+  _check("purpose_in_human_pinned", evaluate.purpose_in({"purpose": "file_manager", "confidence": 0.0, "source": "human"}, {"file_manager"}))
+  _check("purpose_options_closed", "unknown" in q.APP_PURPOSE_OPTIONS and "other" in q.APP_PURPOSE_OPTIONS
+         and set(q.app_purpose_battery()["declared_core_purpose"]["criteria"]) == set(q.APP_PURPOSE_OPTIONS))
+
+  with tempfile.TemporaryDirectory() as d:
+    rel = "app/Loc.kt"
+    os.makedirs(os.path.join(d, "app/src/main"))
+    with open(os.path.join(d, rel), "w", encoding="utf-8") as f:
+      f.write(_KT_LOCATION_SINK)
+    with open(os.path.join(d, "app/src/main/AndroidManifest.xml"), "w", encoding="utf-8") as f:
+      f.write('<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.x">'
+              '<uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE"/>'
+              '<application android:label="Files"><activity android:name=".Main" android:exported="true">'
+              '<intent-filter><action android:name="android.intent.action.MAIN"/>'
+              '<category android:name="android.intent.category.LAUNCHER"/></intent-filter></activity>'
+              '</application></manifest>')
+    cache_path = os.path.join(d, "caps.json")
+    scratch = os.path.join(d, ".scratch")
+    _write_scratch(d, scratch, {"PRECISE_LOCATION": [f"{rel} (Pattern: FusedLocationProviderClient)"]},
+                   play_store_info={"category": "Tools", "description": "A file manager. " * 60})
+    client = _Purpose("file_manager", 0.92)
+    engine.run(scratch, client, batched=True, capability_cache=capsmod.CapabilityCache(cache_path))
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    ap = triage.get("app_purpose") or {}
+    _check("app_purpose_in_triage", ap.get("purpose") == "file_manager" and ap.get("source") == "model"
+           and abs(ap.get("confidence", 0) - 0.92) < 1e-9 and ap.get("digest"), json.dumps(ap))
+    _check("app_purpose_asked_once", client.calls == 1 and triage["counters"].get("app_purpose_requests") == 1, str(client.calls))
+    st = client.states[0]
+    _check("app_purpose_state_compact",
+           set(st) == {"app", "profile"} and "MANAGE_EXTERNAL_STORAGE" in st["profile"]
+           and st["app"]["store_description"].endswith("…") and len(st["app"]["store_description"]) <= 600,
+           str(sorted(st))[:200])
+    # Every later finding-level state carries the purpose label in its ``app``
+    # block so the per-finding questions can see it. Symbol-classification states
+    # (``capability_definitions``) deliberately carry only the package: symbol
+    # capability is app-independent and the cross-app cache must stay purpose-free.
+    later = [s for s in client.other_states if isinstance(s, dict) and isinstance(s.get("app"), dict)
+             and "capability_definitions" not in s]
+    classif = [s for s in client.other_states if isinstance(s, dict) and "capability_definitions" in s]
+    _check("app_purpose_in_app_facts",
+           later and all(s["app"].get("purpose") == "file_manager" for s in later),
+           f"{len(later)} later states; purposes={sorted({str(s['app'].get('purpose')) for s in later})}")
+    _check("app_purpose_not_in_classification_state",
+           all("purpose" not in s["app"] for s in classif), f"{len(classif)} classification states")
+    # Second run: cache hit, no model call, same answer.
+    scratch2 = os.path.join(d, ".scratch2")
+    _write_scratch(d, scratch2, {"PRECISE_LOCATION": [f"{rel} (Pattern: FusedLocationProviderClient)"]},
+                   play_store_info={"category": "Tools", "description": "A file manager. " * 60})
+    client2 = _Purpose("launcher", 0.99)
+    engine.run(scratch2, client2, batched=True, capability_cache=capsmod.CapabilityCache(cache_path))
+    triage2 = json.load(open(os.path.join(scratch2, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    _check("app_purpose_cache_hit", client2.calls == 0 and triage2["app_purpose"]["purpose"] == "file_manager"
+           and triage2["app_purpose"]["source"] == "cache", json.dumps(triage2.get("app_purpose")))
+    # Human pin in the cache wins over the model answer.
+    cc = capsmod.CapabilityCache(cache_path)
+    cc.put_app_answer(engine.APP_PURPOSE_QID, triage2["app_purpose"]["digest"], None,
+                      {"purpose": "backup_or_antivirus", "confidence": 1.0, "source": "human"})
+    cc.save()
+    scratch3 = os.path.join(d, ".scratch3")
+    _write_scratch(d, scratch3, {"PRECISE_LOCATION": [f"{rel} (Pattern: FusedLocationProviderClient)"]},
+                   play_store_info={"category": "Tools", "description": "A file manager. " * 60})
+    engine.run(scratch3, _Purpose("launcher", 0.99), batched=True, capability_cache=capsmod.CapabilityCache(cache_path))
+    triage3 = json.load(open(os.path.join(scratch3, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    _check("app_purpose_human_pin", triage3["app_purpose"]["purpose"] == "backup_or_antivirus"
+           and triage3["app_purpose"]["source"] == "human", json.dumps(triage3.get("app_purpose")))
+    # Client failure degrades to unknown / unavailable and the run completes.
+    scratch4 = os.path.join(d, ".scratch4")
+    _write_scratch(d, scratch4, {"PRECISE_LOCATION": [f"{rel} (Pattern: FusedLocationProviderClient)"]})
+    engine.run(scratch4, _Purpose("launcher", 0.99, fail=True), batched=True)
+    triage4 = json.load(open(os.path.join(scratch4, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    _check("app_purpose_failure_degrades", triage4["app_purpose"]["purpose"] == "unknown"
+           and triage4["app_purpose"]["source"] == "unavailable" and "app_purpose_error" in triage4["counters"]
+           and os.path.exists(os.path.join(scratch4, "worker_data_safety.json")), json.dumps(triage4.get("app_purpose")))
+    # Heuristic stand-in answers unknown with a peaked distribution.
+    scratch5 = os.path.join(d, ".scratch5")
+    _write_scratch(d, scratch5, {"PRECISE_LOCATION": [f"{rel} (Pattern: FusedLocationProviderClient)"]})
+    engine.run(scratch5, HeuristicJevClient(), batched=True)
+    triage5 = json.load(open(os.path.join(scratch5, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    _check("app_purpose_heuristic_unknown", triage5["app_purpose"]["purpose"] == "unknown"
+           and triage5["app_purpose"]["source"] == "model", json.dumps(triage5.get("app_purpose")))
 
 
 def _test_evidence_line() -> None:
@@ -1417,6 +1554,7 @@ def main() -> int:
   _test_identifier_lint()
   _test_calibrate()
   _test_evidence_line()
+  _test_app_purpose()
   _test_relevance_token_embedded()
   print()
   if _FAILURES:

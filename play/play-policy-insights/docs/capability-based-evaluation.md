@@ -232,6 +232,13 @@ is plain JSON so a reviewer can inspect or correct a label; human-authored entri
 over model entries. A taxonomy or model change changes the key and therefore invalidates
 nothing silently. Cache hit/miss counts are recorded in the triage file.
 
+The same file also holds **per-app answers** (WP4) under keys
+`"app|{TAXONOMY_VERSION}|{model}|{question_id}|{digest}"`, where `digest` is the SHA-256 of
+the exact state and battery the model saw. Today the only such question is
+`declared_core_purpose` (below). `get_app_answer()` returns a human-authored entry regardless
+of model; `put_app_answer()` never overwrites one. A reviewer therefore pins an app's purpose
+by editing one JSON entry with `"source": "human"`, and the pin survives model changes.
+
 **Offline stand-in.** `HeuristicJevClient` answers classification questions from generic
 substring hints (`"http"`, `"socket"`, `"intent"`, `"prefs"`, ...). It exists so selftest and
 the wiring can run without a key. It is a labelled mock, never a source of judgment, and
@@ -262,6 +269,36 @@ most `MAX_PER_FILE_PER_TYPE = 2` per file. Every dropped candidate is written to
 file with its rank, tier, proximity and reason, so a reviewer can see exactly what was not
 asked and why.
 
+**Declared core purpose** (`engine._ask_app_purpose`, `questions.app_purpose_battery`, WP4).
+Several policies (foreground-service types, `MANAGE_EXTERNAL_STORAGE`, exact alarms, package
+visibility, accessibility, SMS/call log) are only satisfiable when the app's *core purpose* is
+one of a short list Play names in the policy. The evaluator asks that once per app, before any
+per-finding work, as a single `Choice` over a closed option set —
+`file_manager`, `backup_or_antivirus`, `alarm_or_timer`, `calendar`,
+`messaging_default_handler`, `accessibility_tool`, `media_gallery_or_editor`, `launcher`,
+`per_app_network_control`, `other`, `unknown` — with a compact state: app name, package,
+`targetSdk`, store category, the first 600 characters of the store description and the
+`AppProfile` digest (permissions, components, intent filters). The answer, its confidence and
+the full distribution are recorded in `typesafe_triage.json["app_purpose"]` with `source`
+`model` / `cache` / `human` / `unavailable`, and the label alone is copied into
+`app_facts["purpose"]` so every later finding-level state carries it (symbol-classification
+states do not: identifier capability is app-independent and the cross-app cache must stay
+purpose-free). Rules that make the answer safe to consume:
+
+- `evaluate.purpose_in(app_purpose, allowed)` is the only reader. It returns `False` for
+  `unknown`, for a missing answer, and for any model answer below
+  `CONF_APP_PURPOSE = 0.75`; only a human pin bypasses the confidence check. Low confidence
+  therefore reads as "purpose not established" → the policy treats the permission as
+  *unjustified* (higher severity, review), never as a reason to suppress or soften.
+- An answer outside the closed set, a transport failure or a malformed reply degrade to
+  `unknown` / `unavailable`, are counted (`app_purpose_error`) and the run continues.
+- The offline `HeuristicJevClient` always answers `unknown` (peaked distribution) — it is a
+  labelled stand-in, not a purpose classifier.
+- Cost is one request per cold run (`app_purpose_requests`); the cache key covers the whole
+  state, so a changed store listing, manifest or option wording re-asks instead of reusing a
+  stale answer. On the development set the model answers `file_manager` (App B, p = 1.00) and
+  `per_app_network_control` (App A), matching the apps' listings.
+
 **Batteries.** Kept candidates are grouped per file and sent in chunks of
 `MAX_ASKS_PER_REQUEST = 6` data types per request (question ids are namespaced
 `a<i>__<qid>`). The file state contains the anchored scope, the capability-labelled sink
@@ -282,6 +319,15 @@ marked `needs_manual_review`, suffixed `[data-type match uncertain: p=…; verif
 as `relevance: "low"`. Below `T_RELEVANCE_FLOOR = 0.10` the model is confidently negative and
 the finding is dropped regardless (on the dev apps every keep under 0.10 was `track`→MUSIC,
 `record`→AUDIO or `PowerManager`→DIAGNOSTICS). Rollback: `RELEVANCE_SOFT_GATE_ENABLED`.
+
+A second condition (WP4, `RELEVANCE_SOFT_GATE_FILE_EGRESS`) keeps an uncertain answer when the
+*file* references a strong egress sink (`NETWORK_EGRESS`, `THIRD_PARTY_TELEMETRY`,
+`ADVERTISING_SDK`) outside the anchor's function. The evidence is weaker, so the verdict is
+distinct: traced as `relevance: "low_file_egress"`, and the evidence line shows the sink
+`(out of scope)`. IPC-only or `UNKNOWN` file sinks do not qualify (every Activity references
+`Intent`). It was added when a labelled credential transfer was lost to answer drift
+(`signal_relevant` 0.29 against 0.30 at a tier-3 anchor in a file whose network client sits in
+another method); on the development set it costs one extra review item per app.
 
 **Disclosure reconciliation** (`evaluate.reconcile_disclosure_status`, WP2). The battery asks
 about disclosure twice (a Noul and a Choice); when they disagree the Choice is the less stable
@@ -346,8 +392,10 @@ facts as a dict (`source`, `sink`) for downstream tooling; WP7 appends `destinat
 Written next to the worker files on every run. Keys: `evaluator_version`, `model`,
 `counters` (raw signals, candidates, kept, files analysed, imports first-party skipped,
 third-party, packages, refined, dependencies, capability-cache hits/misses,
-`lexical_pregate{checked, kept_*, dropped_*, files_pruned}`, `cap_exempt_sink_in_scope`),
-`app_profile` (WP1), `usage`
+`lexical_pregate{checked, kept_*, dropped_*, files_pruned}`, `cap_exempt_sink_in_scope`,
+`app_purpose_requests` / `app_purpose_error`),
+`app_profile` (WP1), `app_purpose` (WP4: `purpose`, `confidence`, `source`, `probabilities`,
+`digest`), `usage`
 (requests, tokens), `findings_by_severity`, `transfer_decisions`, `capabilities` (label
 histogram and unknown count), `dependency_capabilities`, `sinks_by_file`, `thresholds`, and
 `dropped` (every candidate not asked, with reason and rank data). This is the observability

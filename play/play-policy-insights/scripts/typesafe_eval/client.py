@@ -532,6 +532,14 @@ class HeuristicJevClient(JevClient):
     if qid == "critic_verdict" and probs:
       # The heuristic critic is permissive: verify what the scanner surfaced.
       return _peak(probs, "VERIFIED")
+    if qid == "declared_core_purpose" and probs:
+      # Offline stand-in for the once-per-app purpose question (WP4): it has
+      # no store listing to read, so it answers ``unknown`` with a peaked
+      # distribution. Downstream reads ``unknown`` as "purpose not
+      # established" (never as a justification), which is the recall-safe
+      # default for hermetic runs. Tests that need a specific purpose use a
+      # fixed client.
+      return _peak(probs, "unknown" if "unknown" in probs else options[-1])
     # Uniform when we have no opinion.
     if options:
       even = 1.0 / len(options)

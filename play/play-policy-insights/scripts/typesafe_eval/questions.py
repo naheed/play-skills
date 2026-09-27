@@ -304,3 +304,73 @@ def critic_battery(claim_kind: str = "generic") -> Dict[str, Dict[str, Any]]:
           no="The snippet does not support the claim, or is too abstract.",
       ),
   }
+
+
+# ---------------------------------------------------------------------------
+# Once-per-app question (WP4)
+# ---------------------------------------------------------------------------
+
+#: Closed option set for ``declared_core_purpose``. Drawn from the policy
+#: matrices that condition severity on the app's *primary* purpose
+#: (all-files access, package visibility, exact alarms, default handlers,
+#: accessibility, media). ``other`` is a real answer ("none of the listed
+#: purposes"); ``unknown`` is the escape hatch that always means "not
+#: justified" downstream. Adding an option requires a fixture app that
+#: exercises it (plan §3, closed option lists).
+APP_PURPOSE_OPTIONS: Dict[str, str] = {
+    "file_manager": (
+        "Browsing, copying, moving and opening arbitrary files across storage is"
+        " the app's main job (file explorer, archive/FTP/SMB client)."
+    ),
+    "backup_or_antivirus": (
+        "Whole-device backup/restore, anti-malware or device-cleaning is the main job."
+    ),
+    "alarm_or_timer": (
+        "The app exists to fire alarms, timers or reminders at exact wall-clock times."
+    ),
+    "calendar": "Calendar or agenda management is the main job.",
+    "messaging_default_handler": (
+        "The app is meant to be the user's default SMS/MMS, dialer or call-screening app."
+    ),
+    "accessibility_tool": (
+        "The app is an assistive tool for users with disabilities (screen reader,"
+        " switch access, magnification, voice control)."
+    ),
+    "media_gallery_or_editor": (
+        "Browsing, organising or editing the user's photos/videos/audio is the main job."
+    ),
+    "launcher": "The app replaces the home screen / app drawer.",
+    "per_app_network_control": (
+        "The app filters, routes or monitors other apps' network traffic (firewall,"
+        " DNS changer, VPN-based blocker, traffic monitor)."
+    ),
+    "other": "A clear primary purpose that is none of the above (game, shopping, news, ...).",
+    "unknown": "The facts given do not make the primary purpose clear.",
+}
+
+
+def app_purpose_battery() -> Dict[str, Dict[str, Any]]:
+  """One Choice, asked once per app and cached by the profile digest.
+
+  The state is ``{"app": {name, package, target_sdk, store_category,
+  store_description}, "profile": <AppProfile.render_compact()>}``. The answer's
+  option and calibrated confidence are placed in every later request's
+  ``app.purpose`` line and read by ``evaluate.purpose_in`` when a policy's
+  severity depends on the primary purpose (WP5+). Low confidence never
+  lowers a severity: ``purpose_in`` returns False below
+  ``constants.CONF_APP_PURPOSE``.
+  """
+  return {
+      "declared_core_purpose": {
+          "type": "choice",
+          "instructions": (
+              "From `app` (store listing facts) and `profile` (the merged Android "
+              "manifest: permissions, components, launcher, file-handling and "
+              "default-handler roles), what is this app's PRIMARY purpose — the "
+              "job a user installs it for? Pick the single best option; choose "
+              "`other` when the purpose is clear but not listed, and `unknown` "
+              "only when the facts do not show it."
+          ),
+          "criteria": dict(APP_PURPOSE_OPTIONS),
+      }
+  }

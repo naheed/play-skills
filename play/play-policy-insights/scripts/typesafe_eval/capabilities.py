@@ -249,6 +249,42 @@ class CapabilityCache:
       return
     self._data[k] = profile.to_dict()
 
+  # -- Once-per-app answers (WP4) ------------------------------------------
+  #
+  # The same JSON file also memoises answers that are asked once per *app*
+  # rather than once per identifier (``declared_core_purpose``). They live
+  # under a distinct key prefix so ``get``/``put`` never see them, and are
+  # keyed by the sha256 of the rendered ``AppProfile`` plus the question text:
+  # a manifest change or a reworded question re-asks by construction. A
+  # ``"source": "human"`` entry is authoritative here too (a reviewer can pin
+  # an app's purpose).
+
+  APP_PREFIX = "app"
+
+  @classmethod
+  def app_key(cls, question_id: str, digest: str, model: Optional[str]) -> str:
+    return f"{cls.APP_PREFIX}|{TAXONOMY_VERSION}|{model or '-'}|{question_id}|{digest}"
+
+  def get_app_answer(self, question_id: str, digest: str, model: Optional[str]) -> Optional[Dict[str, Any]]:
+    """Cached per-app answer dict or None. Human entries are model-independent."""
+    human = self._data.get(self.app_key(question_id, digest, None))
+    if human and human.get("source") == "human":
+      self.hits += 1
+      return dict(human)
+    entry = self._data.get(self.app_key(question_id, digest, model))
+    if entry is None:
+      self.misses += 1
+      return None
+    self.hits += 1
+    return dict(entry)
+
+  def put_app_answer(self, question_id: str, digest: str, model: Optional[str], answer: Dict[str, Any]) -> None:
+    k = self.app_key(question_id, digest, None if answer.get("source") == "human" else model)
+    existing = self._data.get(k)
+    if existing and existing.get("source") == "human":
+      return
+    self._data[k] = dict(answer)
+
   def save(self) -> None:
     if not self.path:
       return

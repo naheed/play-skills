@@ -185,6 +185,19 @@ RELEVANCE_SOFT_GATE_ENABLED = True
 # transfer sat at p=0.12 (MIME "video/*" -> VIDEOS). Applies only when the
 # soft gate is enabled; below the floor the finding is dropped as before.
 T_RELEVANCE_FLOOR = 0.10
+# Second soft-gate condition (WP4 recall fix): an uncertain relevance answer
+# (floor <= p < T_RELEVANCE) also keeps the finding when the *file* references
+# a strong egress sink (NETWORK_EGRESS / THIRD_PARTY_TELEMETRY /
+# ADVERTISING_SDK) anywhere, not only inside the anchor's own function. A file
+# that both matches a sensitive-data token and talks to the network is exactly
+# where a threshold-adjacent judgement must not suppress silently: on the dev
+# apps a labelled credential transfer (relevance p=0.29 vs T_RELEVANCE=0.30,
+# anchor tier 3, file-level network client) was lost to answer drift after the
+# app-purpose fact entered the state. IPC-only or UNKNOWN file sinks do not
+# qualify (too common: every Activity references Intent). Kept findings are
+# capped at IMPORTANT, routed to review and traced as
+# ``relevance="low_file_egress"``. Rollback flag.
+RELEVANCE_SOFT_GATE_FILE_EGRESS = True
 T_DISCLOSURE = 0.50        # a prominent disclosure gate is present
 T_CORE_FUNCTION = 0.60     # the access is core to the app's stated purpose
 T_USER_INITIATED = 0.60    # the transfer is triggered by an explicit user action
@@ -200,6 +213,12 @@ T_DECLARATION_COVERS = 0.50  # play_declaration: declaration covers a detected t
 # or refuse to act. The critic maps a low-confidence verdict to MANUAL_REVIEW.
 # ---------------------------------------------------------------------------
 
+# WP4: the once-per-app ``declared_core_purpose`` Choice moderates severity in
+# purpose-conditioned policies (all-files access, package visibility, exact
+# alarms, ...). Below this confidence the purpose is treated as *not*
+# established: ``evaluate.purpose_in`` returns False, which can only raise a
+# severity, never lower one. Same bar as the critic's "act" threshold.
+CONF_APP_PURPOSE = 0.75
 CONF_ACT = 0.75            # at/above: act on the model's answer automatically
 CONF_REVIEW_FLOOR = 0.50   # below: send to a human instead of guessing
 

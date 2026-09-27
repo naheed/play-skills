@@ -304,6 +304,62 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
 - **Exit.** App B → `file_manager`, App A → `per_app_network_control`, both
   recorded in triage; one extra model request per cold run.
 - **Size.** Small additions to three modules.
+- **Outcome (done).**
+  - `questions.APP_PURPOSE_OPTIONS` / `app_purpose_battery()`: one Choice,
+    eleven closed options (`unknown` always present). The state is compact
+    and reviewable: app name, package, `targetSdk`, store category, the first
+    600 chars of the store description, and `AppProfile.render_compact()`.
+  - `capabilities.CapabilityCache.get_app_answer / put_app_answer` under
+    `app|<taxonomy>|<model>|<qid>|<digest>` keys; the digest is the SHA-256 of
+    the *whole* state plus the battery (not only the profile as planned), so a
+    changed store listing or reworded option re-asks instead of reusing a
+    stale answer. Human entries are model-independent and never overwritten.
+  - `engine._ask_app_purpose()` runs once after `_load_profile`, records
+    `{purpose, confidence, source ∈ model|cache|human|unavailable,
+    probabilities, digest}` on `RunContext.app_purpose` and in
+    `typesafe_triage.json["app_purpose"]`, copies the label alone into
+    `app_facts["purpose"]` (confidence is a routing input, not evidence), and
+    never raises: an out-of-set choice, transport failure or malformed reply
+    degrades to `unknown` / `unavailable` with `counters.app_purpose_error`.
+    Symbol-classification states keep only the package so the cross-app
+    capability cache stays purpose-free.
+  - `evaluate.purpose_in(app_purpose, allowed)` with
+    `constants.CONF_APP_PURPOSE = 0.75`: `False` for `unknown`, missing or a
+    model answer below the confidence unless human-pinned. `HeuristicJevClient`
+    answers `unknown` (labelled stand-in).
+  - **Exit measured.** App B → `file_manager` (p = 1.00), App A →
+    `per_app_network_control` (p = 1.00), both in triage;
+    `app_purpose_requests = 1` per cold run (App B 39 + 1, App A 100 + 1).
+    Selftest 261 checks (16 new: `purpose_in_*`, cache miss/hit/human-pin,
+    failure degradation, state compactness, `app_facts` propagation,
+    classification-state exclusion, and the soft-gate cases below).
+  - **Recall fix surfaced by the gate.** Adding `purpose` to `app_facts`
+    changes every model-facing state, so the live re-run was a full cache
+    miss and answers drifted. `calibrate --rejoin` exited 2: App B's labelled
+    `SMBAdapter.java/USER_ACCOUNT` was lost because `signal_relevant` moved to
+    0.29 against `T_RELEVANCE = 0.30` at a tier-3 anchor (the `login` token
+    sits in a menu handler; the network client is elsewhere in the same
+    file). Fix: a second soft-gate condition
+    (`constants.RELEVANCE_SOFT_GATE_FILE_EGRESS`, rollback flag) keeps an
+    uncertain relevance answer (floor ≤ p < `T_RELEVANCE`) when the *file*
+    references a strong egress sink (`NETWORK_EGRESS` /
+    `THIRD_PARTY_TELEMETRY` / `ADVERTISING_SDK`), traced as
+    `relevance = "low_file_egress"`, capped at IMPORTANT and routed to review
+    with the WP3 evidence line showing the sink `(out of scope)`. IPC-only or
+    `UNKNOWN` file sinks do not qualify. Measured cost: exactly one extra
+    review item per app (App B recovers the labelled transfer, now TRANSMITS
+    p = 0.77 with `[data-type match uncertain: p=0.29; verify]`; App A adds
+    one LOCAL diagnostics SUGGESTION at p = 0.12). `calibrate --rejoin`: exit
+    0, 48/48 rejoined.
+  - `triage-diff` vs WP3 output: App A 75 → 75 (+5 −5 ~3), App B 60 → 60
+    (+3 −3 ~3). All differences are answer drift from the state change: two
+    App A TRANSMITS → UNCERTAIN flips against `T_HIGH = 0.70` (p 0.73 → 0.69,
+    0.70 → 0.68; both remain review items and both would be TRANSMITS under
+    the rejoined band applied at M2), the play-declaration representative for
+    CRASH_LOGS moving between two files in the same flavour, and the usual
+    per-file swaps between `data_safety_section` and
+    `prominent_disclosure_policy` for UNCERTAIN findings. No labelled positive
+    lost.
 
 ### WP5 — Wave 1 policies (deterministic manifest policies)
 
@@ -592,7 +648,7 @@ touching the rest of the cascade.
 - [x] WP1 `android_manifest.py` / `AppProfile`
 - [x] WP2 identifier-boundary pre-gate
 - [x] WP3 structured evidence
-- [ ] WP4 `declared_core_purpose` (per-app cache)
+- [x] WP4 `declared_core_purpose` (per-app cache)
 - [ ] WP5 wave 1 policies (FGS fixes, package visibility, all files, exact alarm, target API)
 - [ ] **M1 gate**
 - [ ] WP6 one-hop callee resolution

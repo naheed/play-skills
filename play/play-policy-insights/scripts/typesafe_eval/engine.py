@@ -52,6 +52,7 @@ crash and never a silent drop.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -68,6 +69,7 @@ from typesafe_eval import capabilities as caps
 from typesafe_eval import constants
 from typesafe_eval import context
 from typesafe_eval import evaluate
+from typesafe_eval import questions as q
 from typesafe_eval import registry
 from typesafe_eval import snippets
 from typesafe_eval import structure
@@ -133,6 +135,9 @@ class RunContext:
   dependency_profiles: Dict[str, caps.CapabilityProfile] = dataclasses.field(default_factory=dict)
   counters: Dict[str, Any] = dataclasses.field(default_factory=dict)
   dropped: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+  # Once-per-app ``declared_core_purpose`` answer (WP4); see ``_ask_app_purpose``.
+  app_purpose: Dict[str, Any] = dataclasses.field(default_factory=lambda: {
+      "purpose": "unknown", "confidence": 0.0, "source": "unavailable"})
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +189,100 @@ def _load_profile(ctx: RunContext) -> android_manifest.AppProfile:
   ctx.counters["manifest_warnings"] = len(profile.warnings)
   ctx.counters["manifest_other_modules"] = list(profile.other_modules)
   return profile
+
+
+# ---------------------------------------------------------------------------
+# Stage 1b: once-per-app question (WP4)
+# ---------------------------------------------------------------------------
+
+APP_PURPOSE_QID = "declared_core_purpose"
+_STORE_DESCRIPTION_MAX = 600  # characters of the store description sent with the question
+
+
+def _app_purpose_state(ctx: RunContext) -> Dict[str, Any]:
+  """The compact state for the per-app purpose question.
+
+  Store facts come from ``play_store_info.json`` via ``app_facts`` plus the
+  description (truncated); manifest facts are the profile digest. Nothing
+  else — the answer must be reproducible from facts a reviewer can read in
+  the triage file.
+  """
+  store = evaluate._load_json(os.path.join(ctx.temp_dir, "play_store_info.json"))  # pylint: disable=protected-access
+  desc = store.get("description") or ""
+  if len(desc) > _STORE_DESCRIPTION_MAX:
+    desc = desc[:_STORE_DESCRIPTION_MAX - 1] + "…"
+  return {
+      "app": {
+          "name": ctx.app_facts.get("name"),
+          "package": ctx.app_facts.get("package"),
+          "target_sdk": ctx.app_facts.get("target_sdk"),
+          "store_category": ctx.app_facts.get("store_category"),
+          "store_description": desc or None,
+      },
+      "profile": ctx.profile.render_compact() if ctx.profile is not None else "",
+  }
+
+
+def _ask_app_purpose(
+    ctx: RunContext,
+    client: JevClient,
+    cache: Optional[caps.CapabilityCache],
+    model: Optional[str],
+) -> Dict[str, Any]:
+  """Asks ``declared_core_purpose`` once per app (or reads it from the cache).
+
+  Result (also stored on ``ctx.app_purpose`` and in the triage file)::
+
+    {"purpose": "file_manager", "confidence": 0.91, "source": "model"|"cache"|"human"|"unavailable",
+     "probabilities": {...}, "digest": "<sha256 of the question state + battery>"}
+
+  The option label alone is appended to ``ctx.app_facts["purpose"]`` so every
+  later request carries it; the confidence stays out of the model-facing
+  state (it is a routing input for :func:`evaluate.purpose_in`, not evidence).
+  A client failure degrades to ``unknown`` / confidence 0 / ``unavailable``,
+  which downstream reads as "not justified" — never as a reason to lower a
+  severity. Never raises.
+  """
+  battery = q.app_purpose_battery()
+  state = _app_purpose_state(ctx)
+  # The digest covers everything the model sees (manifest profile, store facts,
+  # question wording), so a changed store listing or reworded option re-asks
+  # instead of silently reusing a stale answer.
+  digest_src = json.dumps(state, sort_keys=True, ensure_ascii=False) + "\n" + json.dumps(battery, sort_keys=True)
+  digest = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
+  result: Dict[str, Any] = {"purpose": "unknown", "confidence": 0.0, "source": "unavailable",
+                            "probabilities": None, "digest": digest}
+  cached = cache.get_app_answer(APP_PURPOSE_QID, digest, model) if cache is not None else None
+  if cached is not None:
+    result.update({k: cached.get(k, result.get(k)) for k in ("purpose", "confidence", "probabilities")})
+    result["source"] = "human" if cached.get("source") == "human" else "cache"
+    log.info("app purpose (from %s): %s (confidence %.2f)", result["source"], result["purpose"], result["confidence"])
+  else:
+    try:
+      answers = client.system_one(state, battery, model=model)
+      a = answers.get(APP_PURPOSE_QID)
+      if a is None or a.type != "choice" or not a.choice:
+        raise ValueError(f"no choice answer for {APP_PURPOSE_QID}: {a}")
+      purpose = a.choice if a.choice in q.APP_PURPOSE_OPTIONS else "unknown"
+      if purpose != a.choice:
+        log.warning("app purpose answer %r not in the closed option set; recorded as unknown", a.choice)
+      result.update({"purpose": purpose, "confidence": float(a.confidence or 0.0),
+                     "probabilities": a.probabilities, "source": "model"})
+      ctx.counters["app_purpose_requests"] = ctx.counters.get("app_purpose_requests", 0) + 1
+      if cache is not None:
+        cache.put_app_answer(APP_PURPOSE_QID, digest, model, {
+            "purpose": result["purpose"], "confidence": result["confidence"],
+            "probabilities": result["probabilities"], "source": "model", "model": model})
+        cache.save()  # classify() only saves when it had a batch to ask
+      log.info("app purpose (model): %s (confidence %.2f) top=%s", result["purpose"], result["confidence"],
+               sorted((a.probabilities or {}).items(), key=lambda kv: -kv[1])[:3])
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      log.warning("app purpose question failed (%s: %s); recorded as unknown/unavailable",
+                  type(exc).__name__, exc)
+      ctx.counters["app_purpose_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+  ctx.app_purpose = result
+  ctx.app_facts["purpose"] = result["purpose"]
+  return result
 
 
 # ---------------------------------------------------------------------------
@@ -861,6 +960,7 @@ def _write_triage(ctx: RunContext, findings_by_goal, client: JevClient) -> str:
       # Recorded so a reviewer can audit *which* source sets and modules were
       # merged and what the parser could not resolve.
       "app_profile": ctx.profile.summary() if ctx.profile is not None else None,
+      "app_purpose": ctx.app_purpose,
   }
   path = os.path.join(ctx.temp_dir, TRIAGE_FILENAME)
   with open(path, "w", encoding="utf-8") as f:
@@ -900,6 +1000,7 @@ def run(
   log.info("run: app=%s package=%s app_dir=%s client=%s batched=%s",
            app_facts.get("name"), app_facts.get("package"), app_dir, client.name, batched)
   ctx.profile = _load_profile(ctx)
+  _ask_app_purpose(ctx, client, capability_cache, model)
 
   candidates = _filter_candidates(data_sources, ctx)
   _analyze_files(ctx, candidates)

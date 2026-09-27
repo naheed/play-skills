@@ -34,6 +34,7 @@ import logging
 import os
 from typing import Any
 from typing import Dict
+from typing import Iterable
 from typing import List
 from typing import Optional
 from typing import Tuple
@@ -151,6 +152,7 @@ def _decision_trace(
           "T_TRANSMIT_HIGH": constants.T_TRANSMIT_HIGH,
           "T_RELEVANCE": constants.T_RELEVANCE,
           "T_RELEVANCE_FLOOR": constants.T_RELEVANCE_FLOOR,
+          "RELEVANCE_SOFT_GATE_FILE_EGRESS": constants.RELEVANCE_SOFT_GATE_FILE_EGRESS,
           "T_DISCLOSURE": constants.T_DISCLOSURE,
           "T_THIRD_PARTY": constants.T_THIRD_PARTY,
           "provenance": constants.THRESHOLD_PROVENANCE,
@@ -186,6 +188,7 @@ def _relevant(answers: Dict[str, JevAnswer]) -> Tuple[bool, Optional[float]]:
 
 RELEVANT = "relevant"
 RELEVANCE_LOW_WITH_SINK = "low_with_sink"
+RELEVANCE_LOW_WITH_FILE_EGRESS = "low_with_file_egress"
 RELEVANCE_DROP = "drop"
 
 
@@ -210,22 +213,55 @@ def relevance_verdict(answers: Dict[str, JevAnswer], state: Dict[str, Any]) -> T
   client is not an audio recording). The floor keeps the review queue for
   genuinely ambiguous matches rather than lexical coincidences.
 
+  Second condition (WP4, ``constants.RELEVANCE_SOFT_GATE_FILE_EGRESS``): an
+  uncertain answer is also kept when the *file* references a strong egress
+  sink (:data:`constants.RANK_STRONG_EGRESS_CAPABILITIES`) anywhere, even
+  though the anchor's own function does not (tier 2–3). The evidence is
+  weaker — the WP3 evidence line marks the sink ``(out of scope)`` — so the
+  verdict is distinct (:data:`RELEVANCE_LOW_WITH_FILE_EGRESS`) and the trace
+  says ``relevance="low_file_egress"``. IPC-only or ``UNKNOWN`` file sinks do
+  not qualify.
+
   Returns ``(verdict, p_relevant)`` with verdict one of :data:`RELEVANT`,
-  :data:`RELEVANCE_LOW_WITH_SINK`, :data:`RELEVANCE_DROP`.
+  :data:`RELEVANCE_LOW_WITH_SINK`, :data:`RELEVANCE_LOW_WITH_FILE_EGRESS`,
+  :data:`RELEVANCE_DROP`.
   """
   relevant, p = _relevant(answers)
   if relevant:
     return RELEVANT, p
+  if not constants.RELEVANCE_SOFT_GATE_ENABLED or p is None or p < constants.T_RELEVANCE_FLOOR:
+    return RELEVANCE_DROP, p
   tier = (state.get("anchor") or {}).get("tier")
-  if (
-      constants.RELEVANCE_SOFT_GATE_ENABLED
-      and tier is not None
-      and tier <= 1
-      and p is not None
-      and p >= constants.T_RELEVANCE_FLOOR
-  ):
+  if tier is not None and tier <= 1:
     return RELEVANCE_LOW_WITH_SINK, p
+  if constants.RELEVANCE_SOFT_GATE_FILE_EGRESS and file_has_strong_egress(state):
+    return RELEVANCE_LOW_WITH_FILE_EGRESS, p
   return RELEVANCE_DROP, p
+
+
+def file_has_strong_egress(state: Dict[str, Any]) -> bool:
+  """True when any sink listed in the state carries a strong egress capability.
+
+  ``state["sinks"]`` lists every transfer-capable identifier the file
+  references (lines bounded, symbols not), so this is a file-level fact
+  independent of the anchor's scope.
+  """
+  strong = set(constants.RANK_STRONG_EGRESS_CAPABILITIES)
+  return any(set(s.get("capabilities") or []) & strong for s in state.get("sinks") or [])
+
+
+def relevance_is_low(verdict: str) -> bool:
+  """True for either soft-kept verdict (in-scope sink or file-level egress)."""
+  return verdict in (RELEVANCE_LOW_WITH_SINK, RELEVANCE_LOW_WITH_FILE_EGRESS)
+
+
+def relevance_trace(verdict: str) -> str:
+  """The ``decision_trace.relevance`` value for a verdict (``ok`` / ``low`` / ``low_file_egress``)."""
+  if verdict == RELEVANCE_LOW_WITH_SINK:
+    return "low"
+  if verdict == RELEVANCE_LOW_WITH_FILE_EGRESS:
+    return "low_file_egress"
+  return "ok"
 
 
 def reconcile_disclosure_status(
@@ -299,6 +335,28 @@ def _app_facts(base_context: dict, temp_dir: str) -> Dict[str, Any]:
       "target_sdk": base_context.get("TARGET_SDK"),
       "store_category": store.get("category"),
   }
+
+
+def purpose_in(app_purpose: Optional[Dict[str, Any]], allowed: Iterable[str]) -> bool:
+  """True when the app's established primary purpose is one of ``allowed`` (WP4).
+
+  ``app_purpose`` is the dict produced by ``engine._ask_app_purpose``
+  (``{"purpose", "confidence", "source"}``). The purpose counts as established
+  only at confidence >= ``constants.CONF_APP_PURPOSE``; ``unknown``, a missing
+  answer or a low-confidence answer all return False. Policies use the result
+  to *moderate* severity (a file manager holding all-files access is a
+  Suggestion, anything else is Critical) — False therefore means "not
+  justified", never "suppress". A human-pinned answer (``source == "human"``)
+  is trusted regardless of confidence.
+  """
+  if not app_purpose:
+    return False
+  purpose = app_purpose.get("purpose")
+  if not purpose or purpose == "unknown":
+    return False
+  if app_purpose.get("source") != "human" and float(app_purpose.get("confidence") or 0.0) < constants.CONF_APP_PURPOSE:
+    return False
+  return purpose in set(allowed)
 
 
 _EVIDENCE_MATCHED_MAX = 96  # characters of the matched source line shown in evidence
@@ -442,9 +500,10 @@ def _compose_data_safety_finding(
              state["signal"]["file"], p_relevant or 0.0, state["signal"].get("matched_pattern"),
              (state.get("anchor") or {}).get("tier"))
     return None
-  relevance_low = verdict == RELEVANCE_LOW_WITH_SINK
+  relevance_low = relevance_is_low(verdict)
   if relevance_low:
-    log.info("relevance low but sink in scope; keeping %s in %s for review (p=%.2f, token=%r)",
+    log.info("relevance low but %s; keeping %s in %s for review (p=%.2f, token=%r)",
+             "sink in scope" if verdict == RELEVANCE_LOW_WITH_SINK else "file has strong egress sink",
              data_type, state["signal"]["file"], p_relevant or 0.0,
              state["signal"].get("matched_pattern"))
 
@@ -540,7 +599,7 @@ def _compose_data_safety_finding(
       "decision_trace": _decision_trace(
           state, answers, decision,
           {"sharing_sinks_in_scope": sharing_in_scope, "p_relevant": p_relevant,
-           "relevance": "low" if relevance_low else "ok",
+           "relevance": relevance_trace(verdict),
            "disclosure_reconciled": disclosure_note},
       ),
   }
@@ -569,7 +628,11 @@ def _compose_permission_finding(
     log.info("relevance gate dropped %s (%s) in %s (p=%.2f, tier=%s)", data_type, policy_id,
              state["signal"]["file"], p_relevant or 0.0, (state.get("anchor") or {}).get("tier"))
     return None
-  relevance_low = verdict == RELEVANCE_LOW_WITH_SINK
+  relevance_low = relevance_is_low(verdict)
+  if relevance_low:
+    log.info("relevance low but %s; keeping %s (%s) in %s for review (p=%.2f)",
+             "sink in scope" if verdict == RELEVANCE_LOW_WITH_SINK else "file has strong egress sink",
+             data_type, policy_id, state["signal"]["file"], p_relevant or 0.0)
 
   is_core = (answers["is_core_functionality"].noul or 0.0) >= constants.T_CORE_FUNCTION
   has_disclosure = (
@@ -610,7 +673,7 @@ def _compose_permission_finding(
       "decision_trace": _decision_trace(
           state, answers, decision,
           {"is_core": is_core, "has_disclosure": has_disclosure, "p_relevant": p_relevant,
-           "relevance": "low" if relevance_low else "ok"},
+           "relevance": relevance_trace(verdict)},
       ),
   }
   if (decision == UNCERTAIN and severity != "SUGGESTION") or relevance_low:
