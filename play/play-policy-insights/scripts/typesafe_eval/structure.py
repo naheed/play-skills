@@ -915,6 +915,53 @@ class FileStructure:
     return len(self.lines)
 
 
+_CLASS_FILE_EXTENSIONS = (".kt", ".java", ".cs")
+_TEST_DIR_MARKERS = ("/src/test", "/src/androidTest", "/test/", "/androidTest/")
+
+
+def find_class_files(app_dir: str, class_name: str) -> List[str]:
+  """Relative paths of source files that plausibly declare ``class_name`` (WP5).
+
+  ``class_name`` may be fully qualified (``com.x.svc.Foo``) or manifest-relative
+  (``.Foo``); only the simple name is used, matched against the file's base
+  name (Java requires it; Kotlin convention follows it). Build outputs,
+  vendored trees and test source sets are skipped. Returns the shipped-source
+  matches sorted for determinism; several matches (same simple name in two
+  flavours) are all returned so a caller can check each.
+  """
+  simple = class_name.rsplit(".", 1)[-1].strip()
+  if not simple:
+    return []
+  wanted = {simple + ext for ext in _CLASS_FILE_EXTENSIONS}
+  out: List[str] = []
+  for root, dirs, files in os.walk(app_dir):
+    dirs[:] = [d for d in dirs if d not in IGNORED_DIR_NAMES]
+    rel_root = "/" + os.path.relpath(root, app_dir).replace(os.sep, "/") + "/"
+    if any(marker in rel_root for marker in _TEST_DIR_MARKERS):
+      continue
+    for name in files:
+      if name in wanted:
+        out.append(os.path.relpath(os.path.join(root, name), app_dir).replace(os.sep, "/"))
+  return sorted(out)
+
+
+def value_reference_lines(app_dir: str, relpath: str, identifier: str) -> List[int]:
+  """1-based lines where the *exact* identifier ``identifier`` is referenced in
+  ``relpath``. Unlike the scanner pre-gate (which matches camelCase *words*),
+  this is an exact-identifier match: ``startForegroundService`` does not count
+  for ``startForeground``. Comment-only and import lines are skipped. Used by
+  manifest policies that need one code fact (WP5)."""
+  exact = re.compile(r"(?<![A-Za-z0-9_])" + re.escape(identifier) + r"(?![A-Za-z0-9_])")
+  out: List[int] = []
+  for i, line in enumerate(_read(os.path.join(app_dir, relpath)).splitlines()):
+    stripped = line.lstrip()
+    if stripped.startswith(_COMMENT_PREFIXES) or stripped.startswith(_IMPORT_PREFIXES):
+      continue
+    if exact.search(line):
+      out.append(i + 1)
+  return out
+
+
 def analyze_file(app_dir: str, relpath: str) -> FileStructure:
   """Reads and structurally indexes one file (imports + symbol references)."""
   content = _read(os.path.join(app_dir, relpath))

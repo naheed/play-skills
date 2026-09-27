@@ -95,6 +95,81 @@ _RECOMMENDATIONS: Dict[str, object] = {
         "Publish a web-based account deletion path and declare it in the Play"
         " Console Data Safety form to satisfy the account-deletion policy."
     ),
+    # WP5 wave-1 manifest policies. Wording mirrors the goal matrices.
+    "all_files_access_policy": {
+        "CRITICAL": (
+            "Remove MANAGE_EXTERNAL_STORAGE from the Manifest. For document"
+            " picking or local file saving, migrate to the Storage Access"
+            " Framework (SAF) or app-specific directories."
+        ),
+        "IMPORTANT": (
+            "MANAGE_EXTERNAL_STORAGE already covers every media file: drop the"
+            " redundant media / legacy storage permissions, or drop the broad"
+            " grant and keep only the scoped media permissions."
+        ),
+        "SUGGESTION": (
+            "Complete the All files access declaration in the Play Console"
+            " (App content) with the core use case, and confirm the permission"
+            " is essential to that use case."
+        ),
+    },
+    "package_visibility_policy": {
+        "IMPORTANT": (
+            "Remove QUERY_ALL_PACKAGES from the Manifest and declare the"
+            " specific packages or intents the app needs in <queries>."
+        ),
+        "SUGGESTION": (
+            "Complete the Package visibility declaration in the Play Console"
+            " (App content) and confirm the broad query is essential to the"
+            " app's core purpose."
+        ),
+    },
+    "exact_alarm_policy": {
+        "IMPORTANT": (
+            "Replace USE_EXACT_ALARM with SCHEDULE_EXACT_ALARM (requested at"
+            " runtime with a fallback to inexact scheduling), or use standard"
+            " inexact AlarmManager / WorkManager scheduling."
+        ),
+        "SUGGESTION": (
+            "Confirm exact alarms are user-facing (alarm, timer or calendar"
+            " event), that SCHEDULE_EXACT_ALARM is checked at runtime with an"
+            " inexact fallback, and that the Play Console declaration matches."
+        ),
+    },
+    "target_api_level": {
+        "CRITICAL": (
+            "Raise targetSdk to the current Play requirement; below the"
+            " existing-app floor the app stops being available to new users on"
+            " newer devices and updates are rejected."
+        ),
+        "IMPORTANT": (
+            "Raise targetSdk to the current Play requirement for new apps and"
+            " updates before the next release; updates below it are rejected."
+        ),
+        "SUGGESTION": (
+            "The target SDK could not be determined from Gradle or the"
+            " manifest; verify it meets the current Play requirement."
+        ),
+    },
+    "foreground_services_policy": {
+        "CRITICAL": (
+            "Declare the specific android:foregroundServiceType(s) (and the"
+            " PROPERTY_SPECIAL_USE_FGS_SUBTYPE property for specialUse) with"
+            " the matching FOREGROUND_SERVICE_<TYPE> permission, or stop"
+            " running the service in the foreground."
+        ),
+        "IMPORTANT": (
+            "Re-align the foregroundServiceType with the app's core purpose,"
+            " or move the work to WorkManager if a user-visible foreground"
+            " presence is not justified."
+        ),
+        "SUGGESTION": (
+            "Confirm each declared type is used only for the purpose its"
+            " policy allows, remove unused FOREGROUND_SERVICE_<TYPE>"
+            " permissions, and complete the Play Console foreground-service"
+            " declaration for each type."
+        ),
+    },
 }
 
 _DEFAULT_RECOMMENDATION = (

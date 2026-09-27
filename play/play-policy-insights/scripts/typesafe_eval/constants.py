@@ -297,6 +297,103 @@ SENSITIVE_DATA_TYPES = frozenset({
     "SEXUAL_ORIENTATION",
 })
 
+# ---------------------------------------------------------------------------
+# WP5: wave-1 manifest policies. Every table below is keyed by the closed
+# ``declared_core_purpose`` option set (questions.APP_PURPOSE_OPTIONS) and read
+# through ``evaluate.purpose_in``, so an unknown / low-confidence purpose can
+# only *raise* a severity. Option labels are the evaluator's own; no vendor,
+# library or app names appear here.
+# ---------------------------------------------------------------------------
+
+# Play target-API requirement. Source: "Target API level requirements for
+# Google Play apps" (Play Console Help, answer 11926878), read 2026-09-27:
+# from 2026-08-31 new apps and updates must target API 36; existing apps must
+# target >= 35 to stay available to new users on newer devices. The evaluator
+# audits phone/tablet apps; Wear OS / Automotive (35) and TV / XR (34) floors
+# are not modelled. Update both values and the date together.
+PLAY_REQUIRED_TARGET_SDK = 36          # new apps and updates
+PLAY_EXISTING_APP_MIN_TARGET_SDK = 35  # published apps stay discoverable
+PLAY_TARGET_SDK_PROVENANCE = {
+    "source": "Play Console Help answer 11926878 (Target API level requirements)",
+    "effective_from": "2026-08-31",
+    "read_on": "2026-09-27",
+}
+
+# Purposes for which Play accepts MANAGE_EXTERNAL_STORAGE (All files access
+# policy: file managers, backup / antivirus, document management).
+ALL_FILES_ACCESS_PURPOSES = frozenset({"file_manager", "backup_or_antivirus"})
+# Media permissions that are redundant next to MANAGE_EXTERNAL_STORAGE (the
+# broad grant already covers every media file).
+MEDIA_PERMISSION_SHORT_NAMES = frozenset({
+    "READ_MEDIA_IMAGES", "READ_MEDIA_VIDEO", "READ_MEDIA_AUDIO",
+    "READ_MEDIA_VISUAL_USER_SELECTED", "READ_EXTERNAL_STORAGE",
+})
+
+# Purposes for which Play accepts QUERY_ALL_PACKAGES (Package visibility policy:
+# launchers, file managers, device search, antivirus / security, accessibility
+# tools, app-management and per-app network-control utilities).
+PACKAGE_VISIBILITY_PURPOSES = frozenset({
+    "launcher", "file_manager", "backup_or_antivirus", "accessibility_tool",
+    "per_app_network_control",
+})
+
+# Purposes for which Play accepts USE_EXACT_ALARM (Exact alarm policy: alarm
+# clocks, timers, calendars).
+EXACT_ALARM_PURPOSES = frozenset({"alarm_or_timer", "calendar"})
+
+# Foreground-service type -> purposes that *clearly* fall outside the type's
+# policy definition. A type absent from this table (dataSync, shortService,
+# specialUse, systemExempted, mediaProcessing) is broadly usable and is never
+# flagged as misaligned. ``other`` and ``unknown`` never appear: misalignment
+# fires only for an *established* purpose (``evaluate.purpose_in``), so an
+# unclassifiable app gets the Suggestion inventory, not an Important.
+FGS_TYPE_MISALIGNED_PURPOSES = {
+    # "Interactions with external devices over Bluetooth / NFC / IR / USB /
+    # network": a VPN or firewall, alarm, calendar, launcher, messaging or
+    # accessibility app does not drive external hardware.
+    "connectedDevice": frozenset({
+        "per_app_network_control", "alarm_or_timer", "calendar", "launcher",
+        "messaging_default_handler", "accessibility_tool",
+    }),
+    "location": frozenset({
+        "file_manager", "alarm_or_timer", "launcher", "accessibility_tool",
+        "backup_or_antivirus", "per_app_network_control",
+    }),
+    "mediaPlayback": frozenset({
+        "per_app_network_control", "calendar", "backup_or_antivirus", "accessibility_tool",
+    }),
+    "camera": frozenset({
+        "file_manager", "alarm_or_timer", "calendar", "launcher",
+        "per_app_network_control", "backup_or_antivirus",
+    }),
+    "microphone": frozenset({
+        "file_manager", "alarm_or_timer", "calendar", "launcher",
+        "per_app_network_control", "backup_or_antivirus",
+    }),
+    "health": frozenset({
+        "file_manager", "backup_or_antivirus", "alarm_or_timer", "calendar",
+        "messaging_default_handler", "accessibility_tool", "media_gallery_or_editor",
+        "launcher", "per_app_network_control",
+    }),
+    "phoneCall": frozenset({
+        "file_manager", "backup_or_antivirus", "alarm_or_timer", "calendar",
+        "accessibility_tool", "media_gallery_or_editor", "launcher", "per_app_network_control",
+    }),
+    "mediaProjection": frozenset({
+        "file_manager", "backup_or_antivirus", "alarm_or_timer", "calendar",
+        "launcher", "per_app_network_control", "messaging_default_handler",
+    }),
+    "remoteMessaging": frozenset({
+        "file_manager", "backup_or_antivirus", "alarm_or_timer", "calendar",
+        "launcher", "per_app_network_control", "media_gallery_or_editor", "accessibility_tool",
+    }),
+}
+# The manifest <property> a ``specialUse`` service must carry (Android 14+).
+FGS_SPECIAL_USE_PROPERTY = "android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+# The API level from which foregroundServiceType and per-type permissions are
+# mandatory.
+FGS_TYPE_REQUIRED_TARGET_SDK = 34
+
 # Restricted-permission policies where a non-core, undisclosed use is a real
 # risk even without observed transmission (the permission itself is the concern).
 HIGH_RISK_PERMISSION_POLICIES = frozenset({

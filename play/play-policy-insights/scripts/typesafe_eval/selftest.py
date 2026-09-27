@@ -1254,6 +1254,219 @@ _MANIFEST_FULL = """<?xml version="1.0" encoding="utf-8"?>
 """
 
 
+_WP5_MANIFEST = """<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.w5">
+  <uses-sdk android:targetSdkVersion="{target}"/>
+  {permissions}
+  {queries}
+  <application android:label="W5">
+    <service android:name=".FgSvc"/>
+    <service android:name=".PlainSvc"/>
+    <service android:name=".DevSvc" android:foregroundServiceType="connectedDevice"/>
+    <service android:name=".SpecialSvc" android:foregroundServiceType="specialUse">{property}</service>
+  </application>
+</manifest>
+"""
+
+
+def _test_wave1_manifest_policies() -> None:
+  """WP5: deterministic wave-1 manifest policies over the AppProfile + purpose."""
+  from typesafe_eval import android_manifest as am
+  from typesafe_eval import constants
+  from typesafe_eval import engine
+  from typesafe_eval import registry
+  from typesafe_eval.client import HeuristicJevClient
+
+  def purpose(label, p=0.9, source="model"):
+    return {"purpose": label, "confidence": p, "source": source}
+
+  def perms(*names, **attrs):
+    out = []
+    for n in names:
+      extra = "".join(f' android:{k}="{v}"' for k, v in attrs.get(n, {}).items())
+      out.append(f'<uses-permission android:name="android.permission.{n}"{extra}/>')
+    return "\n  ".join(out)
+
+  def build(d, target=34, permissions="", queries="", prop="", start_foreground=True):
+    def write(rel, text):
+      p = os.path.join(d, rel)
+      os.makedirs(os.path.dirname(p), exist_ok=True)
+      with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+    write("app/src/main/AndroidManifest.xml",
+          _WP5_MANIFEST.format(target=target, permissions=permissions, queries=queries, property=prop))
+    body = ("class FgSvc : Service() {\n  override fun onStartCommand(i: Intent?, f: Int, id: Int): Int {\n"
+            "    // startForeground must be called quickly (comment only)\n"
+            + ("    startForeground(1, buildNotification())\n" if start_foreground else "")
+            + "    return START_STICKY\n  }\n}\n")
+    write("app/src/main/java/com/w5/FgSvc.kt", body)
+    write("app/src/main/java/com/w5/PlainSvc.kt", "class PlainSvc : Service() {\n  fun go() { startForegroundService(Intent()) }\n}\n")
+    write("app/src/test/java/com/w5/FgSvc.kt", "class FgSvc { fun t() { startForeground(1, n) } }\n")
+    return am.load_profile(d, {})
+
+  def run(spec_id, inputs):
+    spec = next(s for s in registry.manifest_specs() if s.policy_id == spec_id)
+    return spec.compose_manifest(inputs)
+
+  wave1 = {"foreground_services_policy", "package_visibility_policy", "all_files_access_policy",
+           "exact_alarm_policy", "target_api_level"}
+  from typesafe_eval import templates
+  _check("wave1_specs_registered", wave1 <= {s.policy_id for s in registry.manifest_specs()}
+         and all(pid in templates._policies() for pid in wave1),  # pylint: disable=protected-access
+         str(sorted(s.policy_id for s in registry.manifest_specs())))
+
+  with tempfile.TemporaryDirectory() as d:
+    prof = build(d, target=34, permissions=perms("FOREGROUND_SERVICE", "FOREGROUND_SERVICE_CONNECTED_DEVICE",
+                                                  "FOREGROUND_SERVICE_SPECIAL_USE", "MANAGE_EXTERNAL_STORAGE",
+                                                  "QUERY_ALL_PACKAGES", "USE_EXACT_ALARM", "SCHEDULE_EXACT_ALARM"))
+    _check("wave1_profile_reads_uses_sdk", prof.target_sdk == 34 and len(prof.services) == 4,
+           f"{prof.target_sdk} {[s.name for s in prof.services]}")
+    vpn = registry.ManifestInputs(profile=prof, app_purpose=purpose("per_app_network_control"), app_dir=d)
+    fgs = run("foreground_services_policy", vpn)
+    def svc_key(f):
+      # The profile resolves ".FgSvc" to "com.w5.FgSvc"; key by the manifest-relative form.
+      name = f["decision_trace"].get("service")
+      return "." + name.rsplit(".", 1)[-1] if name else f["decision_trace"].get("permission")
+    by = {}
+    for f in fgs:
+      by.setdefault(svc_key(f), []).append(f)
+    _check("fgs_typeless_start_foreground_critical",
+           [f["severity"] for f in by.get(".FgSvc", [])] == ["CRITICAL"]
+           and "FgSvc.kt:L4" in by[".FgSvc"][0]["evidence"]
+           and "src/test" not in by[".FgSvc"][0]["evidence"], str(by.get(".FgSvc")))
+    _check("fgs_typeless_plain_service_silent", ".PlainSvc" not in by, str(sorted(by)))
+    dev = sorted(f["severity"] for f in by.get(".DevSvc", []))
+    _check("fgs_type_misaligned_important", dev == ["IMPORTANT", "SUGGESTION"]
+           and any("align" in f["issue_summary"] for f in by[".DevSvc"]), str(by.get(".DevSvc")))
+    sp = sorted(f["severity"] for f in by.get(".SpecialSvc", []))
+    _check("fgs_special_use_without_property_critical", "CRITICAL" in sp and "SUGGESTION" in sp
+           and any(constants.FGS_SPECIAL_USE_PROPERTY in f["evidence"] for f in by[".SpecialSvc"]), str(sp))
+    _check("fgs_special_use_permission_present_no_stray",
+           "android.permission.FOREGROUND_SERVICE_SPECIAL_USE" not in by)
+    # Unknown purpose: no misalignment, only the inventory Suggestion.
+    unk = run("foreground_services_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("unknown"), app_dir=d))
+    _check("fgs_misalignment_needs_established_purpose",
+           [f["severity"] for f in unk if svc_key(f) == ".DevSvc"] == ["SUGGESTION"])
+    low = run("foreground_services_policy", registry.ManifestInputs(
+        profile=prof, app_purpose=purpose("per_app_network_control", p=constants.CONF_APP_PURPOSE - 0.1), app_dir=d))
+    _check("fgs_misalignment_low_confidence_silent",
+           [f["severity"] for f in low if svc_key(f) == ".DevSvc"] == ["SUGGESTION"])
+    # Below API 34 the typeless-service rule does not fire.
+    p33 = build(d, target=33, permissions=perms("FOREGROUND_SERVICE"))
+    f33 = run("foreground_services_policy", registry.ManifestInputs(profile=p33, app_purpose=purpose("unknown"), app_dir=d))
+    _check("fgs_typeless_below_34_silent", not any(svc_key(f) == ".FgSvc" for f in f33))
+    # No startForeground in the class -> no finding even on 34.
+    pns = build(d, target=34, permissions=perms("FOREGROUND_SERVICE"), start_foreground=False)
+    fns = run("foreground_services_policy", registry.ManifestInputs(profile=pns, app_purpose=purpose("unknown"), app_dir=d))
+    _check("fgs_typeless_no_call_silent", not any(svc_key(f) == ".FgSvc" for f in fns))
+    # Property present -> specialUse is fine; stray SPECIAL_USE permission -> Suggestion.
+    pprop = build(d, target=34, permissions=perms("FOREGROUND_SERVICE", "FOREGROUND_SERVICE_SPECIAL_USE"),
+                  prop=f'<property android:name="{constants.FGS_SPECIAL_USE_PROPERTY}" android:value="vpn"/>')
+    fprop = run("foreground_services_policy", registry.ManifestInputs(profile=pprop, app_purpose=purpose("unknown"), app_dir=d))
+    _check("fgs_special_use_with_property_ok",
+           [f["severity"] for f in fprop if svc_key(f) == ".SpecialSvc"] == ["SUGGESTION"], str([f["severity"] for f in fprop]))
+    pstray = build(d, target=34, permissions=perms("FOREGROUND_SERVICE", "FOREGROUND_SERVICE_SPECIAL_USE"))
+    # Remove the specialUse service by rewriting the manifest without it.
+    with open(os.path.join(d, "app/src/main/AndroidManifest.xml"), "r+", encoding="utf-8") as fh:
+      txt = fh.read().replace('android:foregroundServiceType="specialUse"', "")
+      fh.seek(0); fh.write(txt); fh.truncate()
+    pstray = am.load_profile(d, {})
+    fstray = run("foreground_services_policy", registry.ManifestInputs(profile=pstray, app_purpose=purpose("unknown"), app_dir=d))
+    _check("fgs_stray_special_use_permission_suggestion",
+           any(f["severity"] == "SUGGESTION" and "FOREGROUND_SERVICE_SPECIAL_USE" in f["issue_summary"] for f in fstray),
+           str([f["issue_summary"] for f in fstray]))
+
+    # --- all files access -------------------------------------------------
+    afa_fm = run("all_files_access_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("file_manager")))
+    _check("all_files_file_manager_suggestion", [f["severity"] for f in afa_fm] == ["SUGGESTION"]
+           and not afa_fm[0].get("needs_manual_review"), str(afa_fm))
+    afa_unk = run("all_files_access_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("unknown")))
+    _check("all_files_unknown_critical_review", [f["severity"] for f in afa_unk] == ["CRITICAL"]
+           and afa_unk[0].get("needs_manual_review") is True)
+    afa_l = run("all_files_access_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("launcher")))
+    _check("all_files_other_purpose_critical", [f["severity"] for f in afa_l] == ["CRITICAL"]
+           and not afa_l[0].get("needs_manual_review"))
+    afa_low = run("all_files_access_policy", registry.ManifestInputs(
+        profile=prof, app_purpose=purpose("file_manager", p=constants.CONF_APP_PURPOSE - 0.1)))
+    _check("all_files_low_confidence_critical_review", [f["severity"] for f in afa_low] == ["CRITICAL"]
+           and afa_low[0].get("needs_manual_review") is True)
+    afa_h = run("all_files_access_policy", registry.ManifestInputs(
+        profile=prof, app_purpose=purpose("file_manager", p=0.0, source="human")))
+    _check("all_files_human_pin_suggestion", [f["severity"] for f in afa_h] == ["SUGGESTION"])
+    pmedia = build(d, target=34, permissions=perms("MANAGE_EXTERNAL_STORAGE", "READ_MEDIA_IMAGES", "READ_EXTERNAL_STORAGE",
+                                                    READ_EXTERNAL_STORAGE={"maxSdkVersion": "32"}))
+    afa_m = run("all_files_access_policy", registry.ManifestInputs(profile=pmedia, app_purpose=purpose("file_manager")))
+    _check("all_files_redundant_media_important",
+           sorted(f["severity"] for f in afa_m) == ["IMPORTANT", "SUGGESTION"]
+           and any("READ_MEDIA_IMAGES" in f["evidence"] and "READ_EXTERNAL_STORAGE" not in f["evidence"]
+                   for f in afa_m if f["severity"] == "IMPORTANT"), str(afa_m))
+    pnone = build(d, target=34, permissions=perms("INTERNET"))
+    _check("all_files_absent_silent", run("all_files_access_policy", registry.ManifestInputs(profile=pnone, app_purpose=purpose("unknown"))) == [])
+
+    # --- package visibility -----------------------------------------------
+    pv_fm = run("package_visibility_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("file_manager")))
+    _check("pkg_vis_file_manager_suggestion", [f["severity"] for f in pv_fm] == ["SUGGESTION"], str(pv_fm))
+    pv_vpn = run("package_visibility_policy", vpn)
+    _check("pkg_vis_network_control_suggestion", [f["severity"] for f in pv_vpn] == ["SUGGESTION"])
+    pv_o = run("package_visibility_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("other")))
+    _check("pkg_vis_other_important", [f["severity"] for f in pv_o] == ["IMPORTANT"] and not pv_o[0].get("needs_manual_review"))
+    pv_u = run("package_visibility_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("unknown")))
+    _check("pkg_vis_unknown_important_review", [f["severity"] for f in pv_u] == ["IMPORTANT"] and pv_u[0].get("needs_manual_review") is True)
+    pq = build(d, target=34, permissions=perms("QUERY_ALL_PACKAGES"),
+               queries='<queries><package android:name="com.other.app"/></queries>')
+    pv_q = run("package_visibility_policy", registry.ManifestInputs(profile=pq, app_purpose=purpose("file_manager")))
+    _check("pkg_vis_with_queries_important", [f["severity"] for f in pv_q] == ["IMPORTANT"]
+           and "com.other.app" in pv_q[0]["evidence"], str(pv_q))
+
+    # --- exact alarm ------------------------------------------------------
+    ea_a = run("exact_alarm_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("alarm_or_timer")))
+    _check("exact_alarm_alarm_app_suggestions", [f["severity"] for f in ea_a] == ["SUGGESTION", "SUGGESTION"], str(ea_a))
+    ea_f = run("exact_alarm_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("file_manager")))
+    _check("exact_alarm_other_purpose_important", sorted(f["severity"] for f in ea_f) == ["IMPORTANT", "SUGGESTION"]
+           and any(f["severity"] == "IMPORTANT" and "USE_EXACT_ALARM" in f["evidence"] for f in ea_f))
+    ea_c = run("exact_alarm_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("calendar")))
+    _check("exact_alarm_calendar_ok", all(f["severity"] == "SUGGESTION" for f in ea_c))
+    _check("exact_alarm_absent_silent", run("exact_alarm_policy", registry.ManifestInputs(profile=pnone, app_purpose=purpose("unknown"))) == [])
+
+    # --- target API level -------------------------------------------------
+    def tapi(target=None, values=None, profile_target=None):
+      p = am.AppProfile(target_sdk=profile_target if profile_target is not None else target,
+                        target_sdk_values=values or ([target] if target else []),
+                        sdk_provenance={"target_sdk": "gradle:app/build.gradle"})
+      return run("target_api_level", registry.ManifestInputs(profile=p, app_purpose={}))
+    _check("target_api_below_floor_critical", [f["severity"] for f in tapi(constants.PLAY_EXISTING_APP_MIN_TARGET_SDK - 1)] == ["CRITICAL"])
+    _check("target_api_one_behind_important", [f["severity"] for f in tapi(constants.PLAY_REQUIRED_TARGET_SDK - 1)] == ["IMPORTANT"])
+    _check("target_api_meets_silent", tapi(constants.PLAY_REQUIRED_TARGET_SDK) == [] and tapi(constants.PLAY_REQUIRED_TARGET_SDK + 1) == [])
+    lowest = tapi(values=[29, constants.PLAY_REQUIRED_TARGET_SDK], profile_target=constants.PLAY_REQUIRED_TARGET_SDK)
+    _check("target_api_uses_lowest_flavor_value", [f["severity"] for f in lowest] == ["CRITICAL"]
+           and "lowest of" in lowest[0]["evidence"], str(lowest))
+    unknown = run("target_api_level", registry.ManifestInputs(profile=am.AppProfile(), manifest={}, app_purpose={}))
+    _check("target_api_unknown_review", [f["severity"] for f in unknown] == ["SUGGESTION"] and unknown[0].get("needs_manual_review") is True)
+    legacy = run("target_api_level", registry.ManifestInputs(manifest={"target_sdk": 30}, app_purpose={}))
+    _check("target_api_legacy_manifest_fallback", [f["severity"] for f in legacy] == ["CRITICAL"])
+    _check("target_api_provenance_dated", lowest[0]["decision_trace"]["requirement_provenance"].get("effective_from")
+           and "read_on" in constants.PLAY_TARGET_SDK_PROVENANCE)
+
+    # --- engine integration: findings reach the worker file with counters -----
+    scratch = os.path.join(d, ".scratch")
+    build(d, target=34, permissions=perms("FOREGROUND_SERVICE", "MANAGE_EXTERNAL_STORAGE", "QUERY_ALL_PACKAGES"))
+    _write_scratch(d, scratch, {})
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    worker = json.load(open(os.path.join(scratch, "worker_permissions_and_apis.json"), encoding="utf-8"))
+    ids = sorted({f["policy_id"] for f in worker["findings"]})
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    mf = triage["counters"].get("manifest_findings") or {}
+    _check("wave1_engine_integration",
+           {"all_files_access_policy", "package_visibility_policy", "target_api_level", "foreground_services_policy"} <= set(ids)
+           and mf.get("all_files_access_policy") == 1 and mf.get("target_api_level") == 1
+           and all(f.get("kind") == "manifest" and f.get("client") == "deterministic"
+                   for f in worker["findings"] if f["policy_id"] in wave1),
+           f"{ids} {mf}")
+    # Heuristic client answers `unknown`, so purpose-conditioned rules escalate and route to review.
+    afa = [f for f in worker["findings"] if f["policy_id"] == "all_files_access_policy"]
+    _check("wave1_unknown_purpose_escalates_in_run",
+           afa and afa[0]["severity"] == "CRITICAL" and afa[0].get("needs_manual_review") is True, str(afa))
+
+
 def _test_app_profile() -> None:
   """WP1: evaluator-owned manifest parsing and source-set merge."""
   from typesafe_eval import android_manifest as am
@@ -1529,6 +1742,7 @@ def _test_lexical_pregate() -> None:
 def main() -> int:
   _test_triage_diff()
   _test_app_profile()
+  _test_wave1_manifest_policies()
   _test_lexical_pregate()
   _test_parse_finding()
   _test_snippet_and_colocation()

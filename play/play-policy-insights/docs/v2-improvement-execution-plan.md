@@ -393,6 +393,56 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
   all-files Suggestion (the two findings the legacy skill dropped, A1),
   FGS Suggestion. `triage-diff` shows only additions.
 - **Size.** Medium in `registry.py`, small in `templates.py`, `constants.py`.
+- **Outcome (done).**
+  - `registry.ManifestInputs` (profile, legacy manifest dict, `app_purpose`,
+    `app_dir`; `target_sdk` / `lowest_target_sdk` / `purpose_in` /
+    `purpose_label` helpers) is what every `MANIFEST` spec now receives;
+    `engine._run_manifest` builds it and logs each policy's finding count.
+    `_manifest_finding()` gives every app-level finding the same shape
+    (`client="deterministic"`, `kind="manifest"`, `decision_trace` with the
+    facts read, `|` neutralised for the report's table cells).
+  - `foreground_services_policy` runs over the profile
+    (`_foreground_service_findings_profile`); the legacy dict path is kept as
+    the fallback when no profile exists. New rows: typeless service whose own
+    class calls `startForeground` on API 34+ → Critical (the previously
+    unreachable branch; `structure.find_class_files` +
+    `structure.value_reference_lines`, an *exact*-identifier match so
+    `startForegroundService` and comments do not count, test source sets
+    skipped); `specialUse` without `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` →
+    Critical; type/purpose misalignment from
+    `constants.FGS_TYPE_MISALIGNED_PURPOSES` → Important (only for an
+    *established* purpose); stray `FOREGROUND_SERVICE_SPECIAL_USE` →
+    Suggestion. Per-type permission check and inventory Suggestion retained.
+  - `all_files_access_policy`, `package_visibility_policy`,
+    `exact_alarm_policy`, `target_api_level` as planned, with the allowed
+    purpose sets in `constants` and remediation text in `templates`. When the
+    purpose is not established the escalated finding is also
+    `needs_manual_review` (the severity rests on a fact the model could not
+    supply). `target_api_level` is a `MANIFEST` spec (app-level, no model
+    call) rather than the per-signal `DETERMINISTIC` kind the plan named; it
+    checks the *lowest* `targetSdk` any shipped flavour declares against
+    `PLAY_REQUIRED_TARGET_SDK = 36` / `PLAY_EXISTING_APP_MIN_TARGET_SDK = 35`
+    (Play Console Help 11926878, effective 2026-08-31, read 2026-09-27).
+  - Selftest 299 checks (38 new): every rule's positive / negative /
+    boundary case, human-pin and low-confidence purposes, `<queries>`
+    redundancy, `maxSdkVersion <= 32` legacy-storage exemption, lowest-flavour
+    target SDK, legacy-dict fallbacks, registry ⊆ `policies.json`, and an
+    engine integration run with the heuristic client (purpose `unknown` →
+    escalation + review).
+  - **Exit measured** (live, both apps; battery answers all cache hits, zero
+    new model requests). App A (`per_app_network_control`): FGS
+    `connectedDevice` misalignment Important, stray special-use Suggestion,
+    package-visibility Suggestion — exactly the plan. App B (`file_manager`):
+    package-visibility Suggestion, all-files Suggestion (A1 recovered), FGS
+    `dataSync` Suggestion, plus two findings the plan did not list but the
+    manifest supports: all-files **redundant scope** Important (uncapped
+    `READ_EXTERNAL_STORAGE` next to `MANAGE_EXTERNAL_STORAGE`) and
+    `target_api_level` **Critical** (Gradle declares `targetSdk` 29 for one
+    flavour and 34 for the rest; both are below the 35 floor). `triage-diff`
+    vs the WP4 output: App A 75 → 77, App B 60 → 63, additions only apart
+    from the FGS inventory key changing from the manifest-relative
+    `.BackgroundWork` to the resolved class name. `calibrate --rejoin` exit 0,
+    48/48.
 
 ### WP6 — One-hop first-party callee resolution (L3)
 
@@ -649,7 +699,7 @@ touching the rest of the cascade.
 - [x] WP2 identifier-boundary pre-gate
 - [x] WP3 structured evidence
 - [x] WP4 `declared_core_purpose` (per-app cache)
-- [ ] WP5 wave 1 policies (FGS fixes, package visibility, all files, exact alarm, target API)
+- [x] WP5 wave 1 policies (FGS fixes, package visibility, all files, exact alarm, target API)
 - [ ] **M1 gate**
 - [ ] WP6 one-hop callee resolution
 - [ ] WP7 `destination_class` + label schema v2 + relabel

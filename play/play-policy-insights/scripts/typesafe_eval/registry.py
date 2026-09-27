@@ -33,6 +33,7 @@ Each spec declares an **evaluation kind**:
 from __future__ import annotations
 
 import dataclasses
+import logging
 import re
 from typing import Any
 from typing import Callable
@@ -41,15 +42,78 @@ from typing import List
 from typing import Optional
 from typing import Tuple
 
+from typesafe_eval import android_manifest
 from typesafe_eval import constants
 from typesafe_eval import evaluate
 from typesafe_eval import questions as q
+from typesafe_eval import structure
 from typesafe_eval import templates
+
+log = logging.getLogger("typesafe_eval.registry")
 
 CODE_SIGNAL = "code_signal"
 MANIFEST = "manifest"
 DETERMINISTIC = "deterministic"
 PLAY_DECLARATION = "play_declaration"
+
+
+@dataclasses.dataclass
+class ManifestInputs:
+  """Everything a ``MANIFEST``-kind policy may read (WP5).
+
+  Attributes:
+    manifest: The orchestrator's ``manifest_details.json`` (legacy fallback;
+      still the only input when ``profile`` is None, e.g. in old unit tests).
+    profile: The evaluator-owned merged :class:`android_manifest.AppProfile`
+      (WP1). Policies prefer it: it has every service (typed or not),
+      ``<property>`` tags, ``<queries>``, ``maxSdkVersion`` and per-source-set
+      attribution.
+    app_purpose: The once-per-app ``declared_core_purpose`` answer (WP4), read
+      only through :func:`evaluate.purpose_in`.
+    app_dir: Application root, for the single code fact a manifest policy may
+      need (``startForeground`` in a service class).
+  """
+
+  manifest: Dict[str, Any] = dataclasses.field(default_factory=dict)
+  profile: Optional[android_manifest.AppProfile] = None
+  app_purpose: Dict[str, Any] = dataclasses.field(default_factory=dict)
+  app_dir: str = ""
+
+  @property
+  def target_sdk(self) -> Optional[int]:
+    """Effective target SDK: profile first, then ``manifest_details``."""
+    if self.profile is not None and self.profile.target_sdk is not None:
+      return self.profile.target_sdk
+    try:
+      value = int(self.manifest.get("target_sdk") or 0)
+    except (TypeError, ValueError):
+      return None
+    return value or None
+
+  @property
+  def lowest_target_sdk(self) -> Optional[int]:
+    """Lowest ``targetSdk`` among the values Gradle declares (per flavour).
+
+    Play judges every shipped build, so the *lowest* value is the one the
+    target-API policy must check; ``profile.target_sdk`` is the highest.
+    """
+    if self.profile is not None and self.profile.target_sdk_values:
+      return min(self.profile.target_sdk_values)
+    return self.target_sdk
+
+  def purpose_in(self, allowed) -> bool:
+    return evaluate.purpose_in(self.app_purpose, allowed)
+
+  def purpose_label(self) -> str:
+    """``file_manager (p=0.92, model)`` / ``not established`` for evidence text."""
+    ap = self.app_purpose or {}
+    purpose = ap.get("purpose") or "unknown"
+    if purpose == "unknown" or not ap:
+      return "not established"
+    established = evaluate.purpose_in(ap, {purpose})
+    conf = float(ap.get("confidence") or 0.0)
+    src = ap.get("source") or "unavailable"
+    return f"{purpose} (p={conf:.2f}, {src}{'' if established else ', below CONF_APP_PURPOSE'})"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,8 +139,9 @@ class PolicySpec:
   make_battery: Optional[Callable[..., Dict[str, Any]]] = None
   compose: Optional[Callable[..., Optional[Dict[str, Any]]]] = None
   compose_deterministic: Optional[Callable[..., Optional[Dict[str, Any]]]] = None
-  # (manifest) build zero or more findings from ``manifest_details`` alone.
-  compose_manifest: Optional[Callable[[Dict[str, Any]], List[Dict[str, Any]]]] = None
+  # (manifest) build zero or more findings from the app-level inputs
+  # (:class:`ManifestInputs`: profile, legacy manifest dict, app purpose).
+  compose_manifest: Optional[Callable[[ManifestInputs], List[Dict[str, Any]]]] = None
   # Optional false-positive gate for deterministic policies: a light model check
   # that must pass for the finding to be emitted. Filters generic-pattern FPs
   # (e.g. "deactivate" matching a proxy toggle) without a full battery.
@@ -241,13 +306,387 @@ def _foreground_service_findings(manifest: Dict[str, Any]) -> List[Dict[str, Any
   return findings
 
 
+def _manifest_finding(policy_id: str, severity: str, summary: str, evidence: str,
+                      trace: Dict[str, Any], recommendation: Optional[str] = None,
+                      needs_review: bool = False) -> Dict[str, Any]:
+  """One deterministic app-level finding in the shape the report expects.
+
+  Every manifest finding carries ``client = "deterministic"``, ``kind =
+  "manifest"`` and a ``decision_trace`` with the facts the rule read, so a
+  reviewer can reproduce the verdict from the triage file alone. ``|`` is
+  neutralised in the text fields because the (read-only) report renders them
+  inside Markdown table cells; the trace keeps the raw values.
+  """
+  finding = {
+      "policy_id": policy_id,
+      "issue_summary": summary.replace("|", "¦"),
+      "severity": severity,
+      "files_involved": ["AndroidManifest.xml"],
+      "evidence": evidence.replace("|", "¦").replace("\n", " "),
+      "recommendation": recommendation or templates.recommendation(policy_id, severity),
+      "client": "deterministic",
+      "kind": "manifest",
+      "decision_trace": {"evaluator_version": constants.EVALUATOR_VERSION, **trace},
+  }
+  if needs_review:
+    finding["needs_manual_review"] = True
+  return finding
+
+
+def _service_starts_foreground(app_dir: str, class_name: str) -> Tuple[Optional[str], List[int]]:
+  """``(relpath, lines)`` of ``startForeground`` value references in the
+  service's own class file, or ``(None, [])`` when the file is not found or
+  never calls it. Only the class's own file is checked (a call inherited from
+  a base class is not resolved), so a miss means "not confirmed", never
+  "not a foreground service"."""
+  if not app_dir:
+    return None, []
+  for relpath in structure.find_class_files(app_dir, class_name):
+    lines = structure.value_reference_lines(app_dir, relpath, "startForeground")
+    if lines:
+      return relpath, lines
+  return None, []
+
+
+def _foreground_service_findings_profile(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """Foreground-service checks over the merged :class:`AppProfile` (WP5).
+
+  Rules, all deterministic (``target`` = effective ``targetSdk``):
+
+  1. Typeless service whose own class calls ``startForeground`` and
+     ``target >= FGS_TYPE_REQUIRED_TARGET_SDK`` -> **CRITICAL** (the platform
+     throws at runtime and Play rejects the declaration). Typeless services
+     that never call ``startForeground`` are ordinary bound/started services
+     and produce nothing. This is the branch the legacy input made
+     unreachable (``manifest_details.foreground_services`` listed only typed
+     services).
+  2. ``specialUse`` without the ``PROPERTY_SPECIAL_USE_FGS_SUBTYPE``
+     ``<property>`` -> **CRITICAL**.
+  3. Declared type without its ``FOREGROUND_SERVICE_<TYPE>`` permission on
+     ``target >= 34`` -> IMPORTANT (kept from v1).
+  4. Declared type whose policy definition the *established* app purpose
+     clearly falls outside (``constants.FGS_TYPE_MISALIGNED_PURPOSES``) ->
+     IMPORTANT "type misalignment". Never fires for ``unknown`` / ``other`` /
+     low-confidence purposes.
+  5. Every typed service -> SUGGESTION inventory (Play Console declaration
+     reminder), unchanged from v1.
+  6. ``FOREGROUND_SERVICE_SPECIAL_USE`` permission with no ``specialUse``
+     service in the Play build -> SUGGESTION (stray permission).
+  Only components and permissions that ship in the Play build
+  (``profile.ships_in_play_build``) are examined.
+  """
+  profile = inputs.profile
+  assert profile is not None
+  findings: List[Dict[str, Any]] = []
+  target = inputs.target_sdk or 0
+  pid = "foreground_services_policy"
+  purpose = inputs.purpose_label()
+  services = [s for s in profile.play_build_components("service") if s.is_active]
+  shipped_permissions = {p.name for p in profile.permissions.values() if profile.ships_in_play_build(p)}
+  special_use_seen = False
+  for svc in services:
+    types = list(svc.fgs_types)
+    base_trace = {"service": svc.name, "types": types, "target_sdk": target,
+                  "sources": list(svc.sources), "app_purpose": purpose}
+    if not types:
+      relpath, lines = _service_starts_foreground(inputs.app_dir, svc.name)
+      if relpath and target >= constants.FGS_TYPE_REQUIRED_TARGET_SDK:
+        log.info("fgs: typeless service %s calls startForeground at %s:%s (target %d) -> CRITICAL",
+                 svc.name, relpath, lines[:3], target)
+        findings.append(_manifest_finding(
+            pid, "CRITICAL",
+            f"Foreground service {svc.name} declares no foregroundServiceType "
+            f"(required when targeting API {target})",
+            f"<service android:name=\"{svc.name}\"> has no android:foregroundServiceType; "
+            f"startForeground called at {relpath}:L{lines[0]}",
+            {**base_trace, "start_foreground": {"file": relpath, "lines": lines[:5]}}))
+      elif relpath:
+        log.info("fgs: typeless service %s calls startForeground but target %d < %d; no finding",
+                 svc.name, target, constants.FGS_TYPE_REQUIRED_TARGET_SDK)
+      else:
+        log.debug("fgs: typeless service %s: no startForeground in its class file; treated as a plain service", svc.name)
+      continue
+    if "specialUse" in types:
+      special_use_seen = True
+      if constants.FGS_SPECIAL_USE_PROPERTY not in svc.properties:
+        findings.append(_manifest_finding(
+            pid, "CRITICAL",
+            f"Foreground service {svc.name} declares specialUse without the "
+            "PROPERTY_SPECIAL_USE_FGS_SUBTYPE property",
+            f"<service android:name=\"{svc.name}\" android:foregroundServiceType=\"{'|'.join(types)}\"> "
+            f"lacks <property android:name=\"{constants.FGS_SPECIAL_USE_PROPERTY}\">",
+            {**base_trace, "properties": dict(svc.properties)}))
+    missing = [t for t in types
+               if target >= constants.FGS_TYPE_REQUIRED_TARGET_SDK
+               and _fgs_permission_for_type(t) not in shipped_permissions]
+    if missing:
+      findings.append(_manifest_finding(
+          pid, "IMPORTANT",
+          f"Foreground service {svc.name} uses type(s) {', '.join(missing)} without "
+          "the matching FOREGROUND_SERVICE_<TYPE> permission",
+          f"types={types}; missing={[_fgs_permission_for_type(t) for t in missing]}",
+          {**base_trace, "missing_permissions": [_fgs_permission_for_type(t) for t in missing]},
+          recommendation=("Add the per-type FOREGROUND_SERVICE_<TYPE> permission for each "
+                          "declared foregroundServiceType.")))
+    misaligned = [t for t in types
+                  if inputs.purpose_in(constants.FGS_TYPE_MISALIGNED_PURPOSES.get(t, frozenset()))]
+    if misaligned:
+      log.info("fgs: %s type(s) %s misaligned with established purpose %s -> IMPORTANT",
+               svc.name, misaligned, purpose)
+      findings.append(_manifest_finding(
+          pid, "IMPORTANT",
+          f"Foreground service {svc.name} declares type(s) {', '.join(misaligned)} that do not "
+          f"align with the app's core purpose ({(inputs.app_purpose or {}).get('purpose')})",
+          f"<service android:name=\"{svc.name}\" android:foregroundServiceType=\"{'|'.join(types)}\">; "
+          f"declared_core_purpose={purpose}",
+          {**base_trace, "misaligned_types": misaligned}))
+    findings.append(_manifest_finding(
+        pid, "SUGGESTION",
+        f"Foreground service {svc.name} declares type(s) {', '.join(types)}; "
+        "verify the use case matches the type's policy definition",
+        f"<service android:name=\"{svc.name}\" android:foregroundServiceType=\"{'|'.join(types)}\">",
+        base_trace))
+  special_perm = "android.permission.FOREGROUND_SERVICE_SPECIAL_USE"
+  if special_perm in shipped_permissions and not special_use_seen:
+    findings.append(_manifest_finding(
+        pid, "SUGGESTION",
+        "FOREGROUND_SERVICE_SPECIAL_USE is requested but no service declares the specialUse type",
+        f"<uses-permission android:name=\"{special_perm}\"/> with no specialUse service in the Play build",
+        {"permission": special_perm, "services": [s.name for s in services], "target_sdk": target},
+        recommendation=("Remove the unused FOREGROUND_SERVICE_SPECIAL_USE permission, or declare the "
+                        "specialUse type (with its subtype property) on the service that needs it.")))
+  return findings
+
+
+def _foreground_service_compose(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """Profile-based checks when a profile exists; legacy dict checks otherwise."""
+  if inputs.profile is not None:
+    return _foreground_service_findings_profile(inputs)
+  return _foreground_service_findings(inputs.manifest)
+
+
 def _foreground_service_spec() -> PolicySpec:
   return PolicySpec(
       policy_id="foreground_services_policy",
       kind=MANIFEST,
       goal="permissions_and_apis",
-      compose_manifest=_foreground_service_findings,
+      compose_manifest=_foreground_service_compose,
   )
+
+
+# ---------------------------------------------------------------------------
+# WP5 wave-1 manifest policies (deterministic; purpose-conditioned severity)
+# ---------------------------------------------------------------------------
+
+
+def _shipped_permission(inputs: ManifestInputs, short_name: str) -> Optional[android_manifest.Permission]:
+  """The requested permission if it ships in the Play build, else None.
+
+  Falls back to the legacy ``manifest_details.permissions`` list (as a bare
+  :class:`Permission`) when no profile is available.
+  """
+  if inputs.profile is not None:
+    perm = inputs.profile.permission(short_name)
+    if perm is not None and inputs.profile.ships_in_play_build(perm):
+      return perm
+    return None
+  for name in inputs.manifest.get("permissions") or []:
+    if str(name).rsplit(".", 1)[-1] == short_name:
+      return android_manifest.Permission(name=str(name))
+  return None
+
+
+def _perm_evidence(perm: android_manifest.Permission) -> str:
+  extra = []
+  if perm.max_sdk is not None:
+    extra.append(f'android:maxSdkVersion="{perm.max_sdk}"')
+  if perm.sources:
+    extra.append(f"sources={perm.sources}")
+  return f'<uses-permission android:name="{perm.name}"/>' + (f" ({'; '.join(extra)})" if extra else "")
+
+
+def _all_files_access_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """All files access: ``MANAGE_EXTERNAL_STORAGE`` (WP5).
+
+  - Purpose established and in ``ALL_FILES_ACCESS_PURPOSES`` -> SUGGESTION
+    (Play Console declaration reminder).
+  - Otherwise -> **CRITICAL**; an unknown / low-confidence purpose is treated
+    as unjustified and additionally marked for review, since the severity
+    rests on a fact the model could not establish.
+  - Broad grant plus scoped media / legacy storage permissions -> one extra
+    IMPORTANT (redundant scope).
+  """
+  pid = "all_files_access_policy"
+  perm = _shipped_permission(inputs, "MANAGE_EXTERNAL_STORAGE")
+  if perm is None:
+    return []
+  purpose = inputs.purpose_label()
+  justified = inputs.purpose_in(constants.ALL_FILES_ACCESS_PURPOSES)
+  established = purpose != "not established" and "below CONF_APP_PURPOSE" not in purpose
+  trace = {"permission": perm.name, "app_purpose": purpose, "justified_by_purpose": justified,
+           "allowed_purposes": sorted(constants.ALL_FILES_ACCESS_PURPOSES)}
+  findings: List[Dict[str, Any]] = []
+  if justified:
+    log.info("all_files_access: MANAGE_EXTERNAL_STORAGE justified by purpose %s -> SUGGESTION", purpose)
+    findings.append(_manifest_finding(
+        pid, "SUGGESTION",
+        "MANAGE_EXTERNAL_STORAGE is requested; the core purpose qualifies but the Play Console "
+        "All files access declaration must match",
+        f"{_perm_evidence(perm)}; declared_core_purpose={purpose}", trace))
+  else:
+    log.info("all_files_access: MANAGE_EXTERNAL_STORAGE with purpose %s -> CRITICAL", purpose)
+    findings.append(_manifest_finding(
+        pid, "CRITICAL",
+        "MANAGE_EXTERNAL_STORAGE is requested but the app's core purpose does not qualify for "
+        "All files access",
+        f"{_perm_evidence(perm)}; declared_core_purpose={purpose}", trace,
+        needs_review=not established))
+  media = [p for p in (
+      _shipped_permission(inputs, s) for s in sorted(constants.MEDIA_PERMISSION_SHORT_NAMES)) if p is not None]
+  # A legacy storage permission capped at maxSdkVersion <= 32 is the documented
+  # compatibility pattern and is not redundant with the broad grant.
+  media = [p for p in media if not (p.short_name == "READ_EXTERNAL_STORAGE" and p.max_sdk is not None and p.max_sdk <= 32)]
+  if media:
+    findings.append(_manifest_finding(
+        pid, "IMPORTANT",
+        "MANAGE_EXTERNAL_STORAGE is requested alongside scoped media / storage permissions "
+        "(redundant scope)",
+        "; ".join(_perm_evidence(p) for p in [perm] + media),
+        {**trace, "redundant_permissions": [p.name for p in media]}))
+  return findings
+
+
+def _package_visibility_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """Package visibility: ``QUERY_ALL_PACKAGES`` (WP5).
+
+  - Purpose established and in ``PACKAGE_VISIBILITY_PURPOSES`` and no
+    ``<queries>`` element -> SUGGESTION (declaration reminder).
+  - Purpose not in the set (or not established) -> IMPORTANT "use
+    ``<queries>``" (review-marked when the purpose is not established).
+  - ``<queries>`` present alongside the permission -> IMPORTANT (the app
+    already enumerates its needs; the broad grant is redundant).
+  """
+  pid = "package_visibility_policy"
+  perm = _shipped_permission(inputs, "QUERY_ALL_PACKAGES")
+  if perm is None:
+    return []
+  purpose = inputs.purpose_label()
+  justified = inputs.purpose_in(constants.PACKAGE_VISIBILITY_PURPOSES)
+  established = purpose != "not established" and "below CONF_APP_PURPOSE" not in purpose
+  queries = (inputs.profile.queries if inputs.profile is not None else {}) or {}
+  declared_queries = {k: v for k, v in queries.items() if v}
+  trace = {"permission": perm.name, "app_purpose": purpose, "justified_by_purpose": justified,
+           "allowed_purposes": sorted(constants.PACKAGE_VISIBILITY_PURPOSES),
+           "queries": declared_queries}
+  if declared_queries:
+    log.info("package_visibility: QUERY_ALL_PACKAGES with <queries> %s -> IMPORTANT", declared_queries)
+    return [_manifest_finding(
+        pid, "IMPORTANT",
+        "QUERY_ALL_PACKAGES is requested although the manifest already declares specific <queries>",
+        f"{_perm_evidence(perm)}; <queries>={declared_queries}", trace)]
+  if justified:
+    log.info("package_visibility: QUERY_ALL_PACKAGES justified by purpose %s -> SUGGESTION", purpose)
+    return [_manifest_finding(
+        pid, "SUGGESTION",
+        "QUERY_ALL_PACKAGES is requested; the core purpose qualifies but the Play Console "
+        "Package visibility declaration must match",
+        f"{_perm_evidence(perm)}; declared_core_purpose={purpose}", trace)]
+  log.info("package_visibility: QUERY_ALL_PACKAGES with purpose %s -> IMPORTANT", purpose)
+  return [_manifest_finding(
+      pid, "IMPORTANT",
+      "QUERY_ALL_PACKAGES is requested but the app's core purpose does not qualify for broad "
+      "package visibility",
+      f"{_perm_evidence(perm)}; declared_core_purpose={purpose}", trace,
+      needs_review=not established)]
+
+
+def _exact_alarm_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """Exact alarm: ``USE_EXACT_ALARM`` / ``SCHEDULE_EXACT_ALARM`` (WP5).
+
+  - ``USE_EXACT_ALARM`` with purpose in ``EXACT_ALARM_PURPOSES`` -> SUGGESTION;
+    otherwise IMPORTANT (review-marked when the purpose is not established).
+  - ``SCHEDULE_EXACT_ALARM`` -> SUGGESTION (runtime check + inexact fallback
+    reminder). Emitted once even when both permissions are present with
+    ``maxSdkVersion`` splits.
+  """
+  pid = "exact_alarm_policy"
+  findings: List[Dict[str, Any]] = []
+  purpose = inputs.purpose_label()
+  use_exact = _shipped_permission(inputs, "USE_EXACT_ALARM")
+  if use_exact is not None:
+    justified = inputs.purpose_in(constants.EXACT_ALARM_PURPOSES)
+    established = purpose != "not established" and "below CONF_APP_PURPOSE" not in purpose
+    trace = {"permission": use_exact.name, "app_purpose": purpose, "justified_by_purpose": justified,
+             "allowed_purposes": sorted(constants.EXACT_ALARM_PURPOSES)}
+    if justified:
+      findings.append(_manifest_finding(
+          pid, "SUGGESTION",
+          "USE_EXACT_ALARM is requested; the core purpose qualifies but the Play Console "
+          "declaration and user-facing alarm use must match",
+          f"{_perm_evidence(use_exact)}; declared_core_purpose={purpose}", trace))
+    else:
+      log.info("exact_alarm: USE_EXACT_ALARM with purpose %s -> IMPORTANT", purpose)
+      findings.append(_manifest_finding(
+          pid, "IMPORTANT",
+          "USE_EXACT_ALARM is requested but the app's core purpose is not an alarm, timer or "
+          "calendar app",
+          f"{_perm_evidence(use_exact)}; declared_core_purpose={purpose}", trace,
+          needs_review=not established))
+  schedule = _shipped_permission(inputs, "SCHEDULE_EXACT_ALARM")
+  if schedule is not None:
+    findings.append(_manifest_finding(
+        pid, "SUGGESTION",
+        "SCHEDULE_EXACT_ALARM is requested; confirm the runtime permission check and the "
+        "inexact-alarm fallback",
+        _perm_evidence(schedule), {"permission": schedule.name, "app_purpose": purpose}))
+  return findings
+
+
+def _target_api_level_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """Target API level (WP5), a numeric rule with a dated provenance block.
+
+  Checks the *lowest* ``targetSdk`` any shipped flavour declares:
+
+  - ``< PLAY_EXISTING_APP_MIN_TARGET_SDK`` -> **CRITICAL** (the app stops being
+    available to new users on newer devices; updates are rejected).
+  - ``< PLAY_REQUIRED_TARGET_SDK`` -> IMPORTANT (updates are rejected).
+  - unknown -> SUGGESTION marked for review (the fact could not be read; a
+    silent pass would read as compliance).
+  """
+  pid = "target_api_level"
+  lowest = inputs.lowest_target_sdk
+  values = list(inputs.profile.target_sdk_values) if inputs.profile is not None else []
+  provenance = (inputs.profile.sdk_provenance.get("target_sdk") if inputs.profile is not None else None) or "manifest_details.json"
+  trace = {"target_sdk": lowest, "target_sdk_values": values, "provenance": provenance,
+           "required": constants.PLAY_REQUIRED_TARGET_SDK,
+           "existing_app_floor": constants.PLAY_EXISTING_APP_MIN_TARGET_SDK,
+           "requirement_provenance": dict(constants.PLAY_TARGET_SDK_PROVENANCE)}
+  if lowest is None:
+    log.warning("target_api_level: targetSdk unknown; emitting review item")
+    return [_manifest_finding(
+        pid, "SUGGESTION", "Target SDK could not be determined; verify it meets the Play requirement",
+        f"targetSdk unknown (provenance: {provenance})", trace, needs_review=True)]
+  if lowest < constants.PLAY_EXISTING_APP_MIN_TARGET_SDK:
+    severity = "CRITICAL"
+  elif lowest < constants.PLAY_REQUIRED_TARGET_SDK:
+    severity = "IMPORTANT"
+  else:
+    log.info("target_api_level: targetSdk %d meets the requirement (%d)", lowest, constants.PLAY_REQUIRED_TARGET_SDK)
+    return []
+  log.info("target_api_level: lowest targetSdk %d (values %s) -> %s", lowest, values, severity)
+  which = f"lowest of {values}" if len(values) > 1 else "declared"
+  return [_manifest_finding(
+      pid, severity,
+      f"targetSdk {lowest} is below the Play requirement of API {constants.PLAY_REQUIRED_TARGET_SDK} "
+      f"(existing-app floor {constants.PLAY_EXISTING_APP_MIN_TARGET_SDK})",
+      f"targetSdk={lowest} ({which}; {provenance}); Play requires >= {constants.PLAY_REQUIRED_TARGET_SDK} "
+      f"for new apps and updates since {constants.PLAY_TARGET_SDK_PROVENANCE['effective_from']}",
+      trace)]
+
+
+def _manifest_spec(policy_id: str, compose: Callable[[ManifestInputs], List[Dict[str, Any]]]) -> PolicySpec:
+  return PolicySpec(policy_id=policy_id, kind=MANIFEST, goal="permissions_and_apis",
+                    compose_manifest=compose)
 
 
 def _account_deletion_spec() -> PolicySpec:
@@ -275,6 +714,11 @@ REGISTRY: Tuple[PolicySpec, ...] = (
     _data_safety_spec(),
     _account_deletion_spec(),
     _foreground_service_spec(),
+    # WP5 wave-1 manifest policies (deterministic, purpose-conditioned severity).
+    _manifest_spec("all_files_access_policy", _all_files_access_findings),
+    _manifest_spec("package_visibility_policy", _package_visibility_findings),
+    _manifest_spec("exact_alarm_policy", _exact_alarm_findings),
+    _manifest_spec("target_api_level", _target_api_level_findings),
     _play_declaration_spec(),
 )
 

@@ -48,15 +48,15 @@ Source of truth: `policies.json` + `goal_permissions_and_apis.md` /
 | Permissions | `audio_recording_policy` | permissions | **Prototyped** | core + mic-button alternative |
 | User Data | `account_deletion` | user_account | **Prototyped (code)** | deterministic presence check + model gate; "server-side identity without delete endpoint" heuristic planned (wave 3) |
 | Permissions | `photo_video_access_policy` | permissions | Planned (wave 2) | Photo Picker migration; SDK-version aware (code) |
-| Permissions | `all_files_access_policy` | permissions | Planned (wave 1) | MANAGE_EXTERNAL_STORAGE justification via cached app purpose |
+| Permissions | `all_files_access_policy` | permissions | **Shipped (manifest, WP5)** | `MANAGE_EXTERNAL_STORAGE`: Suggestion when the cached `declared_core_purpose` is a file manager / backup-antivirus, otherwise Critical (review-marked when the purpose is not established); redundant media permissions → Important |
 | Permissions | `files_and_docs_policy` | permissions | Planned (wave 2) | Scoped storage / SAF; `maxSdkVersion` caps |
 | Permissions | `sms_call_log_policy` | permissions | Planned (wave 4) | default-handler check; OTP retriever alternative; needs external fixtures |
-| Permissions | `package_visibility_policy` | permissions | Planned (wave 1) | QUERY_ALL_PACKAGES justification via cached app purpose |
+| Permissions | `package_visibility_policy` | permissions | **Shipped (manifest, WP5)** | `QUERY_ALL_PACKAGES`: Suggestion for qualifying purposes, Important otherwise or when `<queries>` is also declared |
 | Permissions | `accessibility_api_policy` | permissions | Planned (wave 4) | tool vs misuse; disclosure gate; needs external fixtures |
-| Permissions | `exact_alarm_policy` | permissions | Planned (wave 1) | alarm/calendar core vs sync misuse |
-| Privacy/Abuse | `foreground_services_policy` | permissions | **Prototyped (manifest, partial)** | type/permission check ships; missing-type, `specialUse` property and type-alignment rows planned (wave 1) |
+| Permissions | `exact_alarm_policy` | permissions | **Shipped (manifest, WP5)** | `USE_EXACT_ALARM` outside alarm/timer/calendar → Important; `SCHEDULE_EXACT_ALARM` → Suggestion |
+| Privacy/Abuse | `foreground_services_policy` | permissions | **Shipped (manifest, WP5)** | over the `AppProfile`: typeless service that calls `startForeground` on API 34+ → Critical; `specialUse` without its `<property>` → Critical; missing per-type permission → Important; type/purpose misalignment → Important; inventory Suggestion; stray `FOREGROUND_SERVICE_SPECIAL_USE` → Suggestion. Notification-integrity Noul still planned |
 | Play Console | `login_credentials` | user_account | Planned (wave 3) | login-gate type Choice; demo-credential reminder |
-| Privacy/Abuse | `target_api_level` | (Phase 1) | **Code-only** | numeric SDK check stays in code; deterministic port planned (wave 1) |
+| Privacy/Abuse | `target_api_level` | permissions | **Shipped (manifest, WP5)** | lowest shipped `targetSdk` vs `constants.PLAY_REQUIRED_TARGET_SDK` (dated provenance): below the existing-app floor → Critical, one behind → Important, unknown → review |
 
 Numeric/threshold checks (target SDK, counts) stay in code per the charter — Jev
 is not asked to do arithmetic.

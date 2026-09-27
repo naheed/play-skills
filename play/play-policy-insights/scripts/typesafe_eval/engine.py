@@ -754,10 +754,20 @@ def _run_deterministic(ctx: RunContext, tasks: Sequence[Task], client: JevClient
 
 
 def _run_manifest(ctx: RunContext, findings_by_goal) -> None:
-  """Manifest-kind policies: app-level facts, no model call."""
+  """Manifest-kind policies: app-level facts, no model call.
+
+  Each spec receives :class:`registry.ManifestInputs` (WP5): the merged
+  profile, the legacy manifest dict, the once-per-app purpose answer and the
+  app root. A failing policy is isolated into one review finding so the other
+  policies still run.
+  """
+  inputs = registry.ManifestInputs(manifest=ctx.manifest, profile=ctx.profile,
+                                   app_purpose=ctx.app_purpose, app_dir=ctx.app_dir)
   for spec in registry.manifest_specs():
     try:
-      found = spec.compose_manifest(ctx.manifest) if spec.compose_manifest else []
+      found = spec.compose_manifest(inputs) if spec.compose_manifest else []
+      log.info("manifest policy %s: %d finding(s) %s", spec.policy_id, len(found),
+               sorted(f.get("severity", "?") for f in found))
     except Exception as exc:  # pylint: disable=broad-exception-caught
       log.warning("manifest policy %s failed: %s", spec.policy_id, exc)
       found = [{

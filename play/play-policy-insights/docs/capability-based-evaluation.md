@@ -356,8 +356,27 @@ sharing.
 when a Play declaration is present; UNCERTAIN findings are not turned into Non-Compliant
 verdicts on their own.
 
-**Manifest checks** (`_run_manifest`) are deterministic: foreground-service types declared in
-the manifest yield a Suggestion to confirm the Play Console declaration, bypassing the critic.
+**Manifest checks** (`_run_manifest`) are deterministic and bypass the critic. Each
+`MANIFEST`-kind spec receives `registry.ManifestInputs` — the merged `AppProfile` (WP1), the
+legacy `manifest_details` dict as fallback, the cached `declared_core_purpose` answer (WP4)
+and the app root — and returns zero or more findings with `client = "deterministic"`,
+`kind = "manifest"` and a `decision_trace` holding the facts it read. Only components and
+permissions that ship in the Play build are examined. Wave 1 (WP5):
+
+| Policy | Rule (severity) |
+| --- | --- |
+| `foreground_services_policy` | typeless service whose own class calls `startForeground` on `targetSdk >= 34` → **Critical** (the branch the legacy input made unreachable: `manifest_details.foreground_services` listed only typed services); `specialUse` without `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` → **Critical**; type without its `FOREGROUND_SERVICE_<TYPE>` permission → Important; type whose definition the *established* purpose clearly falls outside (`constants.FGS_TYPE_MISALIGNED_PURPOSES`) → Important; every typed service → Suggestion inventory; `FOREGROUND_SERVICE_SPECIAL_USE` with no `specialUse` service → Suggestion |
+| `all_files_access_policy` | `MANAGE_EXTERNAL_STORAGE`: purpose in `ALL_FILES_ACCESS_PURPOSES` → Suggestion, otherwise **Critical** (review-marked when the purpose is not established); plus scoped media / uncapped legacy storage permissions → Important (redundant scope) |
+| `package_visibility_policy` | `QUERY_ALL_PACKAGES`: `<queries>` also declared → Important; purpose in `PACKAGE_VISIBILITY_PURPOSES` → Suggestion; otherwise Important (review-marked when not established) |
+| `exact_alarm_policy` | `USE_EXACT_ALARM`: purpose in `EXACT_ALARM_PURPOSES` → Suggestion, otherwise Important; `SCHEDULE_EXACT_ALARM` → Suggestion |
+| `target_api_level` | lowest `targetSdk` among the shipped flavours: `< PLAY_EXISTING_APP_MIN_TARGET_SDK` → **Critical**, `< PLAY_REQUIRED_TARGET_SDK` → Important, unknown → Suggestion + review. The requirement is a dated constant (`PLAY_TARGET_SDK_PROVENANCE`), never a model question |
+
+Purpose conditioning goes through `evaluate.purpose_in` only, so an `unknown`, `other` or
+low-confidence purpose can raise a severity (and marks the finding for review) but never
+lowers one. The one code fact a manifest policy reads — `startForeground` in the service's own
+class file — is an exact-identifier match (`structure.value_reference_lines`) that ignores
+comments, imports and `startForegroundService`; a base-class call is not resolved, so a miss
+means "not confirmed", never "not a foreground service".
 
 **Critic** (`evaluate.evaluate_critic_chunk`) verifies one atomic claim per finding, the
 transfer claim ("this snippet sends or shares <data type>"), against the anchored evidence
