@@ -741,6 +741,81 @@ whether broad access is *justified*.
   (the root-folder question is then never activated; the media question composes without
   corroboration).
 
+**Confirming the data type (WP10, L7)**
+(`taxonomy.py`, `questions.data_type_confirmed_question`, `evaluate.compose_type_confirmation`,
+`calibrate.type_confirmation_report`). The scanner labels a candidate by token: `uid` is
+`USER_ACCOUNT`, `email` is `EMAILS`, a `.jpg` path is `PHOTOS`. The label is often right and
+sometimes not — an Android app UID is not a user account, an SSH key file is not a photo, a
+share login is a user ID rather than a name — and before WP10 every downstream decision
+(sensitivity, severity, the Data Safety category the finding names) was composed on the
+scanner's guess. The legacy skill's most frequent manual relabel was exactly this. WP10 asks
+the model one closed question and composes on the answer without letting a judgement remove
+a finding.
+
+- **The question is closed and taxonomy-driven.** `taxonomy.load()` reads the Data Safety
+  taxonomy from `resources/policies.json` once (`lru_cache`; an unreadable file logs a warning
+  and yields an empty taxonomy, which disables the question's options rather than the run).
+  `taxonomy.siblings(data_type)` returns the alternatives a reviewer would actually consider:
+  the type's confusion siblings first (`constants.TYPE_CONFUSION_SIBLINGS`, e.g.
+  `USER_ACCOUNT → DEVICE_ID, NAME, …`), then the other types in the same category, capped at
+  `MAX_TYPE_SIBLING_OPTIONS = 6`. `data_type_confirmed_question` offers `as_labelled`, those
+  siblings, `NOT_PERSONAL` ("the value is not personal data — an app UID, a package name, a
+  developer constant") and `unknown`, each with the taxonomy's own description, and asks "what
+  is the value at the anchor, really?". It sits in the data-safety battery immediately after
+  `signal_relevant` (before `transmits_offdevice`) so the model settles what the value is
+  before it reasons about where it goes.
+- **Read only in band.** `compose_type_confirmation` reads the answer only when the transfer
+  is at or above `T_TRANSMIT_LOW` (`transmits`); below the band the finding is local inventory
+  and the label is moot (`read: false` in the trace). An answer below `CONF_TYPE_CONFIRM =
+  0.75`, `as_labelled`, or an option the taxonomy does not know (stale cache, edited
+  question) composes as labelled and is traced only.
+- **Composition follows the charter's asymmetry.** A sibling type at or above the bar
+  **relabels**: the finding is composed on that type throughout — `psl_constant`, category,
+  display name, sensitivity, summary, the Play declaration check — and `scanner_data_type`
+  keeps the original so labels and diffs still join. A relabel that *raises* severity applies
+  in full (`EMAIL → EMAILS`, a more sensitive type is more of a finding); one that would
+  *lower* it moves one step at most (CRITICAL → IMPORTANT), sets `lowered`, flags review and
+  is reported as disputed. `NOT_PERSONAL` keeps the finding and the scanner's type (a model
+  judgement never removes a finding; the inventory stays as the scanner saw it), caps severity
+  at IMPORTANT and routes to review with the note "model says the value is not personal data
+  (conf=…); finding kept as labelled, severity capped at IMPORTANT, review" — the reviewer, not
+  the model, decides an app UID is not a user account. `unknown` flags review. A consent
+  raise (WP8) on a disputed type is capped (`capped_by: disputed_type`): the evaluator does not
+  assert a Critical on a type it is not sure of.
+- **Evidence and trace.** The finding gains `scanner_data_type`, `data_type_confirmed` (the
+  raw answer), `confirmed_type` (the effective type) and `psl_constant` set to the effective
+  type; `decision_trace.type_confirmation` records `answer`, `confidence`, `read`, `action`
+  (`as_labelled` / `relabelled` / `not_personal` / `unknown`), `effective_type`, `lowered`,
+  `review`, and `type_note` explains any change in one sentence; `thresholds` gains
+  `CONF_TYPE_CONFIRM`. The summary is suffixed `[type: X -> Y conf=…]` (plus `; verify` when
+  the relabel lowered the severity), `[type disputed: not personal data per model conf=…;
+  verify]` or `[type unclear conf=…; verify]`. `typesafe_triage.json["type_confirmations"]` lists every
+  non-`as_labelled` answer (`file`, `scanner_type`, `answer`, `effective_type`, `confidence`,
+  `lowered`) and the counter `type_confirmations` gives the per-run split.
+- **Calibration.** `calibrate --rejoin` joins labels through `scanner_data_type` (falling back
+  to `psl_constant`) so a relabelled finding still meets its label, accepts an optional
+  `confirmed_type` on a label, and prints a `type_confirmation` block: the
+  labelled-vs-confirmed confusion table, `accuracy`, `n_labelled_confirmed_type`,
+  `missed_relabels` (label says a different type, run composed as labelled), `wrong_relabels`
+  (label confirms the scanner's type, run relabelled or disputed) and `not_read`. A
+  `wrong_relabels` entry is a warning, not an error: the finding is still in the report.
+- **What it did on the dev apps.** All six App A adapter `uid` findings (`USER_ACCOUNT`) came
+  back `NOT_PERSONAL` at p 0.83–0.99 and are now IMPORTANT + review with a `type_note` instead
+  of silent Important findings; `CrashReporter.kt` relabelled `PERFORMANCE_DIAGNOSTICS →
+  CRASH_LOGS` (p 1.00); App B relabelled `KeysActivity.java PHOTOS → FILES_AND_DOCS` (p 0.86,
+  SSH key files) and `SMBAdapter.java NAME → USER_ACCOUNT` (p 0.99, a share login). Two App A
+  `EMAILS` cases (the developer's support address placed in an `ACTION_SENDTO` chooser) came
+  back `NOT_PERSONAL` against labels that say `EMAILS`; the labels were not changed to fit the
+  model and both findings stay in the report as labelled with review. Recall 48/48; type
+  confirmation accuracy 0.938 over the labelled set.
+- **Stand-in client.** `HeuristicJevClient` answers `as_labelled` (peaked) for every
+  `data_type_confirmed` question so offline runs and the selftest compose as before; the
+  selftest exercises every other branch by hand-built answers. Labelled as a stand-in, never
+  used in a live run.
+- Rollback: `DATA_TYPE_CONFIRMED_ENABLED = False` removes the question from the battery
+  (cached answers for the previous battery text become valid again) and composes exactly as
+  WP9 did.
+
 **Play declaration check** (`_run_play_declaration`) runs only for TRANSMITS findings and only
 when a Play declaration is present; UNCERTAIN findings are not turned into Non-Compliant
 verdicts on their own.
@@ -797,8 +872,8 @@ facts as a dict (`source`, `sink`) for downstream tooling; the finding's top-lev
 `thresholds` (the values in force), `anchor` (file, line, scope, `scope_capabilities`,
 `rank_tier`, proximity, `lexical` verdict, `destination_hints`, `guard_defaults` (WP8),
 `media_hints` (WP9)), `sinks`, `relevance` (`ok`/`low`), `disclosure_reconciled`,
-`destination` (WP7), `consent` (WP8), `media_access` / `root_folder` (WP9), `model`,
-`taxonomy_version` and `evaluator_version`.
+`destination` (WP7), `consent` (WP8), `media_access` / `root_folder` (WP9),
+`type_confirmation` / `type_note` (WP10), `model`, `taxonomy_version` and `evaluator_version`.
 
 ### 3.4 Triage file (`typesafe_triage.json`)
 
@@ -815,9 +890,11 @@ third-party, packages, refined, dependencies, capability-cache hits/misses,
 `app_profile` (WP1), `app_purpose` (WP4: `purpose`, `confidence`, `source`, `probabilities`,
 `digest`), `usage`
 (requests, tokens), `findings_by_severity`, `transfer_decisions`, `capabilities` (label
-histogram and unknown count), `dependency_capabilities`, `sinks_by_file`, `thresholds`, and
-`dropped` (every candidate not asked, with reason and rank data). This is the observability
-surface for the run; the legacy pipeline had none.
+histogram and unknown count), `dependency_capabilities`, `sinks_by_file`, `thresholds`,
+`dropped` (every candidate not asked, with reason and rank data), and `type_confirmations`
+(WP10: every finding whose `data_type_confirmed` answer was not `as_labelled`, with the
+counter `type_confirmations{as_labelled, relabelled, not_personal, unknown}`). This is the
+observability surface for the run; the legacy pipeline had none.
 
 ## 4. Calibration (`calibrate.py`)
 

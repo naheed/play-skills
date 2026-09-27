@@ -775,6 +775,56 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
   `country_code` from a remote peer → not user location) reproduce on the
   dev apps; recall unchanged.
 - **Size.** Small.
+- **Outcome (done).** Implemented as planned with two refinements and one
+  recorded disagreement:
+  1. *Refinement — the question is closed and taxonomy-driven.* The new
+     `taxonomy.py` reads `resources/policies.json` once and offers, per data
+     type, its confusion siblings first (`TYPE_CONFUSION_SIBLINGS`), then
+     same-category types, capped at `MAX_TYPE_SIBLING_OPTIONS`, plus
+     `as_labelled`, `NOT_PERSONAL` and `unknown`. Options that are not in the
+     taxonomy never reach the composer (a stale cache or edited question
+     composes as labelled with a warning). The question is asked in the
+     data-safety battery right after `signal_relevant` for every anchor, but
+     **read** only when the transfer is at or above `T_TRANSMIT_LOW`: below
+     the band the finding is local inventory and the label is moot.
+  2. *Refinement — the composition follows the charter's asymmetry.* A
+     relabel that raises severity applies in full; a relabel that would lower
+     it moves one step at most (CRITICAL → IMPORTANT), is flagged for review
+     and reported as disputed; `NOT_PERSONAL` keeps the finding on the
+     scanner's type, caps severity at IMPORTANT and routes it to review — a
+     model judgement never removes a finding; the reviewer decides an app
+     UID is not a user account. A consent raise on a disputed type is capped
+     (`capped_by: disputed_type`). `calibrate --rejoin` joins labels through
+     the new `scanner_data_type` field so a relabelled finding still meets
+     its label, and prints a `type_confirmation` block (confusion table,
+     `missed_relabels`, `wrong_relabels`, `not_read`).
+  3. *Disagreement recorded, not relabelled.* App A's two `EMAILS` cases in
+     `CustomerSupportActivity.kt` / `UIUtils.kt` (the developer's support
+     address placed in an `ACTION_SENDTO` chooser) came back `NOT_PERSONAL`
+     at p 0.85 / 0.94; the labels say `EMAILS`. The model's reading is
+     defensible (the address is the developer's, not the user's) but the
+     labels are not changed to fit the model; both findings stay in the
+     report as labelled with review, exactly as the composition intends.
+  Live results (WP10 vs the WP9 snapshot; the new question invalidated the
+  battery cache, so every in-band anchor was re-asked): App A 128 → 127
+  findings, App B 88 → 86, `calibrate --rejoin` exit 0, **48/48**,
+  `missing_positives` empty. Type confirmation over the 48 labelled cases:
+  accuracy **0.938**, `not_read` 1, `missed_relabels` 0, `wrong_relabels` 2
+  (the recorded disagreement). The exit criterion reproduced: all six App A
+  adapter `uid` findings (`AppWiseDomainsAdapter`, `CustomDomainAdapter`,
+  `CustomIpAdapter`, `DomainConnectionsAdapter`, `RethinkLogAdapter`,
+  `SummaryStatisticsAdapter`; `USER_ACCOUNT`) came back `NOT_PERSONAL` at p
+  0.83–0.99 and are now IMPORTANT + review with a `type_note` instead of
+  silent Important findings; `CrashReporter.kt` relabelled
+  `PERFORMANCE_DIAGNOSTICS → CRASH_LOGS` (p 1.00, same severity); App B
+  relabelled `KeysActivity.java PHOTOS → FILES_AND_DOCS` (p 0.86, SSH key
+  files, not photos) and `SMBAdapter.java NAME → USER_ACCOUNT` (p 0.99, a
+  share login). `typesafe_triage.json["type_confirmations"]` lists every
+  non-`as_labelled` answer; counters `type_confirmations` (App A 30 / 9 / 1,
+  App B 36 / 2 / 2 as-labelled / not-personal / relabelled). Selftest 539 →
+  564 checks. Rollback: `DATA_TYPE_CONFIRMED_ENABLED = False` removes the
+  question from the battery and composes as before. Version bump folded
+  into M3.
 
 ### WP11 — Wave 3 policies (`account_deletion` heuristics, `login_credentials`)
 
@@ -1018,7 +1068,7 @@ touching the rest of the cascade.
 - [x] **M2 gate** (passed; abstention 0.562 vs < 0.50 recorded as the exception)
 - [x] WP8 consent defaults, string resources, flavor attribution
 - [x] WP9 wave 2 policies
-- [ ] WP10 `data_type_confirmed`
+- [x] WP10 `data_type_confirmed`
 - [ ] WP11 wave 3 policies
 - [ ] **M3 gate**
 - [ ] WP12 wave 4 (review-only) + fixture apps
