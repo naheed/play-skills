@@ -370,3 +370,12 @@ Bump `EVALUATOR_VERSION` and re-run `calibrate` when any of these change: questi
   `T_TRANSMIT_HIGH`.
 - Human corrections to the capability cache are supported by the file format but there is no
   review UI; edit the JSON directly.
+- Generalisations mined from the full legacy-skill runs (identifier-boundary pre-gate,
+  `destination_class`, one-hop first-party call resolution, consent-default and string-resource
+  context, a manifest-derived `AppProfile`) and the per-policy plan for the nine policies v2 does
+  not evaluate yet are specified in
+  [legacy-skill-lessons-and-coverage-plan.md](legacy-skill-lessons-and-coverage-plan.md).
+  Known defect recorded there: the "missing `foregroundServiceType`" branch in
+  `registry._foreground_service_findings` is unreachable because `manifest_details.json` only
+  lists services that already declare a type; the fix is the evaluator-owned manifest parser
+  in that plan (§6.1).

@@ -68,7 +68,10 @@ for the label format and method.
 See [`../../docs/evaluation-charter.md`](../../docs/evaluation-charter.md) for the
 quality dimensions and bars, and
 [`../../docs/policy-coverage-evolution.md`](../../docs/policy-coverage-evolution.md)
-for the plan to reach parity across all policies and select models.
+for the plan to reach parity across all policies and select models. The
+per-policy expansion plan and the generalisations mined from the legacy-skill
+runs are in
+[`../../docs/legacy-skill-lessons-and-coverage-plan.md`](../../docs/legacy-skill-lessons-and-coverage-plan.md).
 
 ## Files
 
