@@ -301,14 +301,99 @@ def _app_facts(base_context: dict, temp_dir: str) -> Dict[str, Any]:
   }
 
 
+_EVIDENCE_MATCHED_MAX = 96  # characters of the matched source line shown in evidence
+
+
+def nearest_sink(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+  """The capability-labelled sink reference closest to the anchor, or None.
+
+  Preference order: a sink line inside the anchor's own scope (the transfer
+  happens in the same function), then the smallest line distance to the
+  anchor line. Only sinks with a *transfer* capability count — a
+  ``LOCAL_PERSISTENCE`` or ``USER_DISCLOSURE_UI`` symbol is not a sink for
+  evidence purposes even though it is listed in ``state["sinks"]`` for the
+  model. Returns ``{"symbol", "line", "capabilities", "in_scope", "distance"}``
+  with a 1-based line.
+  """
+  signal = state.get("signal") or {}
+  anchor_line = signal.get("line")
+  scope = (state.get("anchor") or {}).get("scope") or [0, 0]
+  transfer_caps = set(constants.SHARING_CAPABILITY_NAMES) | set(constants.RANK_STRONG_EGRESS_CAPABILITIES) | {"UNKNOWN"}
+  best: Optional[Dict[str, Any]] = None
+  best_key: Optional[Tuple[int, int, str]] = None
+  for s in state.get("sinks") or []:
+    caps_ = [c for c in (s.get("capabilities") or []) if c in transfer_caps]
+    if not caps_:
+      continue
+    for ln in s.get("lines") or []:
+      in_scope = bool(scope) and scope[0] <= ln <= scope[1]
+      distance = abs(ln - anchor_line) if anchor_line is not None else 1 << 30
+      key = (0 if in_scope else 1, distance, s.get("symbol") or "")
+      if best_key is None or key < best_key:
+        best_key = key
+        best = {"symbol": s.get("symbol"), "line": ln, "capabilities": caps_,
+                "in_scope": in_scope, "distance": distance}
+  return best
+
+
+def evidence_flow(state: Dict[str, Any]) -> Dict[str, Any]:
+  """Machine-readable source -> sink evidence for one finding (WP3).
+
+  ``source`` is the anchor: file, the matched line number, the enclosing
+  scope (1-based inclusive) and the matched source text. ``sink`` is
+  :func:`nearest_sink` or None. Downstream ignores unknown keys; WP7 appends
+  the destination class here.
+  """
+  signal = state.get("signal") or {}
+  scope = (state.get("anchor") or {}).get("scope") or None
+  return {
+      "source": {
+          "file": signal.get("file"),
+          "line": signal.get("line"),
+          "scope": list(scope) if scope else None,
+          "matched": (signal.get("matched_line") or "").strip()[:_EVIDENCE_MATCHED_MAX],
+      },
+      "sink": nearest_sink(state),
+  }
+
+
 def _evidence_line(state: Dict[str, Any]) -> str:
-  """One-line evidence: ``file:Lnn — <the matched source line>``."""
+  """One-line, human-readable evidence (WP3 structured form).
+
+  With a transfer sink in the file::
+
+    source@<file>:L<start>-L<end> (L<line>: <matched>) -> sink@L<n> <Symbol> [<CAPS>]
+
+  ``L<start>-L<end>`` is the anchor's enclosing scope, so a reviewer sees the
+  function that performs the operation, not a single line; the sink is the
+  nearest capability-labelled transfer reference (:func:`nearest_sink`),
+  suffixed ``(out of scope)`` when it lies outside that function. Without a
+  transfer sink the previous form is kept unchanged::
+
+    <file>:L<line> — <matched>
+
+  ``|`` and newlines never appear (the report renders this inside a Markdown
+  table cell). The same data is available structurally as
+  ``finding["evidence_flow"]``.
+  """
   signal = state.get("signal", {})
   file = signal.get("file")
   line = signal.get("line")
-  matched = (signal.get("matched_line") or "").strip()
-  where = f"{file}:L{line}" if line else str(file)
-  return f"{where} — {matched}" if matched else str(where)
+  matched = (signal.get("matched_line") or "").strip().replace("|", "¦")
+  if len(matched) > _EVIDENCE_MATCHED_MAX:
+    matched = matched[:_EVIDENCE_MATCHED_MAX - 1] + "…"
+  sink = nearest_sink(state)
+  scope = (state.get("anchor") or {}).get("scope")
+  if sink is None or not scope or line is None:
+    where = f"{file}:L{line}" if line else str(file)
+    return f"{where} — {matched}" if matched else str(where)
+  caps_ = ", ".join(sink["capabilities"])
+  span = f"L{scope[0]}-L{scope[1]}" if scope[0] != scope[1] else f"L{scope[0]}"
+  src = f"source@{file}:{span} (L{line}: {matched})" if matched else f"source@{file}:{span} (L{line})"
+  dst = f"sink@L{sink['line']} {sink['symbol']} [{caps_}]"
+  if not sink["in_scope"]:
+    dst += " (out of scope)"
+  return f"{src} -> {dst}"
 
 
 def _answers_log(answers: Dict[str, JevAnswer]) -> Dict[str, Any]:
@@ -436,6 +521,7 @@ def _compose_data_safety_finding(
       "severity": severity,
       "files_involved": [state["signal"]["file"]],
       "evidence": _evidence_line(state),
+      "evidence_flow": evidence_flow(state),
       "evidence_snippet": state.get("code_snippet", ""),
       "recommendation": templates.recommendation(policy_id, severity),
       "is_transferred": transmits,
@@ -511,6 +597,7 @@ def _compose_permission_finding(
       "severity": severity,
       "files_involved": [state["signal"]["file"]],
       "evidence": _evidence_line(state),
+      "evidence_flow": evidence_flow(state),
       "evidence_snippet": state.get("code_snippet", ""),
       "recommendation": templates.recommendation(policy_id, severity),
       "claim_kind": "generic",

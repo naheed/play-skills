@@ -965,6 +965,44 @@ def _test_calibrate() -> None:
     _check("calibrate_joins_worker_probability", joined and joined[0]["p_transmit"] == 0.77, str(joined))
 
 
+def _test_evidence_line() -> None:
+  """WP3 structured evidence: golden strings for the sink / no-sink / out-of-scope cases."""
+  base = {
+      "signal": {"data_type": "PRECISE_LOCATION", "matched_pattern": "loc", "file": "app/A.kt",
+                 "line": 10, "matched_line": "  val l = loc()  ", "all_lines": [3, 10]},
+      "anchor": {"scope": [8, 14], "proximity": 0, "sink_in_scope": True, "tier": 0},
+      "sinks": [
+          {"symbol": "SharedPreferences", "capabilities": ["LOCAL_PERSISTENCE"], "lines": [9]},
+          {"symbol": "Intent", "capabilities": ["IPC_SHARING"], "lines": [2, 40]},
+          {"symbol": "HttpClient", "capabilities": ["NETWORK_EGRESS"], "lines": [12, 30]},
+      ],
+  }
+  ev = evaluate._evidence_line(base)  # pylint: disable=protected-access
+  _check("evidence_structured_golden",
+         ev == "source@app/A.kt:L8-L14 (L10: val l = loc()) -> sink@L12 HttpClient [NETWORK_EGRESS]", ev)
+  flow = evaluate.evidence_flow(base)
+  _check("evidence_flow_fields",
+         flow["source"] == {"file": "app/A.kt", "line": 10, "scope": [8, 14], "matched": "val l = loc()"}
+         and flow["sink"]["symbol"] == "HttpClient" and flow["sink"]["line"] == 12 and flow["sink"]["in_scope"] is True,
+         json.dumps(flow))
+  # Persistence-only symbols are not evidence sinks; nearest transfer sink out of scope is marked.
+  far = {**base, "anchor": {**base["anchor"], "sink_in_scope": False, "tier": 3},
+         "sinks": [base["sinks"][0], {"symbol": "Intent", "capabilities": ["IPC_SHARING"], "lines": [40, 2]}]}
+  ev_far = evaluate._evidence_line(far)  # pylint: disable=protected-access
+  _check("evidence_out_of_scope_marked",
+         ev_far == "source@app/A.kt:L8-L14 (L10: val l = loc()) -> sink@L2 Intent [IPC_SHARING] (out of scope)", ev_far)
+  none = {**base, "sinks": [base["sinks"][0]]}
+  ev_none = evaluate._evidence_line(none)  # pylint: disable=protected-access
+  _check("evidence_no_sink_fallback", ev_none == "app/A.kt:L10 — val l = loc()", ev_none)
+  _check("evidence_flow_no_sink", evaluate.evidence_flow(none)["sink"] is None)
+  legacy = {"signal": {"file": "app/B.kt", "line": 4, "matched_line": "x | y"}}
+  ev_legacy = evaluate._evidence_line(legacy)  # pylint: disable=protected-access
+  _check("evidence_legacy_state_and_pipe_safe", ev_legacy == "app/B.kt:L4 — x ¦ y", ev_legacy)
+  long = {**base, "signal": {**base["signal"], "matched_line": "x" * 200}}
+  ev_long = evaluate._evidence_line(long)  # pylint: disable=protected-access
+  _check("evidence_matched_truncated", "…" in ev_long and len(ev_long) < 220 and "\n" not in ev_long, str(len(ev_long)))
+
+
 def _test_relevance_token_embedded() -> None:
   b = q.data_safety_battery("AUDIO", "audio files", token="record")
   _check("relevance_embeds_token", "`record`" in b["signal_relevant"]["instructions"])
@@ -1378,6 +1416,7 @@ def main() -> int:
   _test_sink_visibility()
   _test_identifier_lint()
   _test_calibrate()
+  _test_evidence_line()
   _test_relevance_token_embedded()
   print()
   if _FAILURES:

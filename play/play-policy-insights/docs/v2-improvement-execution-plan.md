@@ -264,6 +264,22 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
 - **Exit.** Evidence in both apps' reports shows scope ranges; no metric
   change.
 - **Size.** Small, one function.
+- **Outcome (done).** `evaluate._evidence_line()` renders
+  `source@<file>:L<start>-L<end> (L<line>: <matched>) -> sink@L<n> <Symbol>
+  [<CAPS>]`, suffixed `(out of scope)` when the nearest transfer sink lies
+  outside the anchor's function; the old `<file>:L<n> — <matched>` form is
+  kept when the file has no transfer-capable sink or the state is the legacy
+  one (deterministic account-deletion findings). `evaluate.nearest_sink()`
+  prefers an in-scope sink, then the smallest line distance, and ignores
+  `LOCAL_PERSISTENCE` / `USER_DISCLOSURE_UI` symbols. The same data is
+  attached structurally as `finding["evidence_flow"]` (`source{file, line,
+  scope, matched}`, `sink{symbol, line, capabilities, in_scope, distance}`)
+  so WP7 can append `destination_class` without re-parsing strings. The
+  matched text is truncated at 96 chars and `|`/newlines are neutralised
+  because `generate_report.py` (read-only) renders evidence inside a Markdown
+  table cell. Seven golden-string selftests. Exit measured: 24 (App A) and 7
+  (App B) structured evidence lines in the reports; `triage-diff` against
+  the WP2 output: 75 → 75 and 60 → 60 with zero changed findings.
 
 ### WP4 — Once-per-app `declared_core_purpose` (L5, semantic half)
 
@@ -575,7 +591,7 @@ touching the rest of the cascade.
 - [x] WP0 baseline + `triage-diff`
 - [x] WP1 `android_manifest.py` / `AppProfile`
 - [x] WP2 identifier-boundary pre-gate
-- [ ] WP3 structured evidence
+- [x] WP3 structured evidence
 - [ ] WP4 `declared_core_purpose` (per-app cache)
 - [ ] WP5 wave 1 policies (FGS fixes, package visibility, all files, exact alarm, target API)
 - [ ] **M1 gate**

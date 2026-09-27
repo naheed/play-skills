@@ -329,6 +329,13 @@ routing (`evaluate._critic_decision`) is recall-weighted:
 
 Findings already marked `needs_manual_review` are routed without a model call.
 
+**Structured evidence (WP3).** `finding["evidence"]` reads
+`source@<file>:L<start>-L<end> (L<line>: <matched>) -> sink@L<n> <Symbol> [<CAPS>]`: the
+anchor's whole function, the matched line, and the nearest capability-labelled *transfer*
+sink (`(out of scope)` when it lies outside that function). Files without a transfer sink keep
+the single-line `<file>:L<n> — <matched>` form. `finding["evidence_flow"]` carries the same
+facts as a dict (`source`, `sink`) for downstream tooling; WP7 appends `destination_class`.
+
 **Decision trace.** Each finding's `decision_trace` records `scores` (every probability),
 `thresholds` (the values in force), `anchor` (file, line, scope, `scope_capabilities`,
 `rank_tier`, proximity, `lexical` verdict), `sinks`, `relevance` (`ok`/`low`),

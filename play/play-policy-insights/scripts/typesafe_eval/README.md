@@ -93,7 +93,7 @@ the work packages and milestone gates that implement them are in
 | `cache.py` | `ResultCache` + `CachingClient`: memoize by (model, questions, state). |
 | `snippets.py` | Legacy deterministic code-snippet + co-located data-flow extraction (v1 path). |
 | `templates.py` | Deterministic `issue_summary` / `recommendation`. |
-| `evaluate.py` | Compose functions: relevance gate (soft when an egress/IPC sink is in the anchor's scope, hard below `T_RELEVANCE_FLOOR`), three-way transfer decision, disclosure-status reconciliation against the battery's own Noul, code-derived severity, decision trace, critic on the atomic transfer claim. |
+| `evaluate.py` | Compose functions: relevance gate (soft when an egress/IPC sink is in the anchor's scope, hard below `T_RELEVANCE_FLOOR`), three-way transfer decision, disclosure-status reconciliation against the battery's own Noul, code-derived severity, structured `source@…:Lstart-Lend -> sink@Ln Symbol [CAPS]` evidence (+ `evidence_flow` dict), decision trace, critic on the atomic transfer claim. |
 | `calibrate.py` | Derives the transfer band and reliability metrics from an out-of-tree label set. `--rejoin --worker-dir DIR…` re-joins the frozen labels to a new run and exits 2 if any labelled transfer has no finding (the recall-1.0 check used at every WP gate). |
 | `batch.py` | File-state builder + namespacing used by the engine's batched path. |
 | `benchmark.py` | Per-finding vs batched: requests / tokens / latency / agreement. |
