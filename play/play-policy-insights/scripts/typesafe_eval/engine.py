@@ -193,7 +193,7 @@ def _filter_candidates(
         _drop(ctx, data_type, f, "non-prioritized build flavor")
         continue
       if any(frag in path for frag in constants.EXCLUDED_PATH_SUBSTRINGS):
-        _drop(ctx, data_type, f, "string-catalog / UI-text resource")
+        _drop(ctx, data_type, f, "excluded path (string-catalog resource or test source set)")
         continue
       if len(kept) >= constants.MAX_CANDIDATES_PER_TYPE:
         _drop(ctx, data_type, f, f"over MAX_CANDIDATES_PER_TYPE={constants.MAX_CANDIDATES_PER_TYPE}")

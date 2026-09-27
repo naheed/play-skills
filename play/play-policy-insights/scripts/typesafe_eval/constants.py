@@ -74,7 +74,9 @@ EVALUATOR_VERSION = "2.0.0-capability"
 # generic pattern like "deactivate" or "record" matching a localized
 # ``res/values-tl/strings.xml`` translation is a false positive, so exclude these
 # from signal activation. Layout XML (res/layout) and code are still scanned.
-EXCLUDED_PATH_SUBSTRINGS = ("/res/values",)
+# Test source sets (unit and instrumentation) are excluded too: they are not
+# compiled into the shipped artifact, so a transfer there is not app behaviour.
+EXCLUDED_PATH_SUBSTRINGS = ("/res/values", "/src/test/", "/src/androidTest/", "/src/testDebug/")
 
 # Documented System One evaluation endpoint.
 DEFAULT_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
@@ -150,14 +152,36 @@ CONF_REVIEW_FLOOR = 0.50   # below: send to a human instead of guessing
 
 THRESHOLD_PROVENANCE = {
     "model": DEFAULT_MODEL,
-    "calibrated_on": "dev set: 2 open-source apps, adjudicated against the legacy skill",
+    "calibrated_on": (
+        "dev set: 48 hand-adjudicated transfer claims (23 true transfers) from "
+        "the evaluator's own evidence traces on 2 open-source apps; test source "
+        "sets and ambiguous anchors excluded. IPC hand-offs count as sharing."
+    ),
     "calibrated_at": "2026-09-27",
     "method": (
         "T_TRANSMIT_LOW = highest threshold with recall 1.0 on labelled "
         "transfers; T_TRANSMIT_HIGH = lowest threshold with precision >= 0.90 "
         "on labelled transfers; band in between abstains. See calibrate.py."
     ),
-    "note": "Two-app dev set is a regression check, not a hold-out.",
+    # Derived band on the dev set was [0.38, 0.60]. The shipped values are
+    # deliberately wider: 0.35 keeps a 0.03 margin under the lowest-scoring true
+    # transfer (recall first), and the derived upper bound rests on a 4-case
+    # probability bin, too thin to move TRANSMITS (which drives Non-compliant
+    # verdicts) from 0.70. Measured at the shipped values: recall 1.0 for
+    # TRANSMITS+UNCERTAIN, precision 0.944 for TRANSMITS alone, abstention
+    # 0.625, Brier 0.18, ECE 0.26 (the 0.5-0.6 bin is over-confident: 14 cases,
+    # none a real transfer, which is why the band abstains there).
+    "derived_band": {"T_TRANSMIT_LOW": 0.38, "T_TRANSMIT_HIGH": 0.60},
+    "shipped_band": {"T_TRANSMIT_LOW": T_TRANSMIT_LOW, "T_TRANSMIT_HIGH": T_TRANSMIT_HIGH},
+    "metrics_at_shipped": {
+        "n": 48, "positives": 23, "false_negatives_local": 0,
+        "precision_at_high": 0.944, "recall_at_high": 0.739,
+        "abstention_rate": 0.625, "brier": 0.1785, "ece": 0.2552,
+    },
+    "note": (
+        "Two-app dev set is a regression check, not a hold-out. Revisit "
+        "T_TRANSMIT_HIGH once the labelled set exceeds ~100 cases."
+    ),
 }
 
 # Minimum severity Score (0-indexed levels) required to treat a finding as an
