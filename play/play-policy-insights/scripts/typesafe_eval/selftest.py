@@ -1438,31 +1438,59 @@ def _test_consent_defaults() -> None:
       "    }\n"
       "    if (uploadEnabled) { post(report) }\n"
       "    if (report.isEmpty() || true || x == null) { return }\n"
+      "    when (report.kind) { \"a\" -> post(report) }\n"
       "  }\n"
       "  fun disclose() { dialog.setMessage(R.string.crash_consent_body); title(R.string.crash_consent_title) }\n"
       "}\n"
   ).splitlines()
-  flags = structure.guard_flags(src, (7, 19))
+  flags = structure.guard_flags(src, (7, 20))
   by_id = {f.identifier: f for f in flags}
   _check("guard_flags_found",
          set(by_id) >= {"BuildConfig.DEBUG", "ps.crashReportsEnabled", "allow", "settings.isTelemetryOn",
-                        "prefs.getBoolean(share_stats)", "uploadEnabled"},
+                        "prefs.getBoolean(share_stats)"},
          str(sorted(by_id)))
   _check("guard_flags_negation", by_id["BuildConfig.DEBUG"].negated is True and by_id["allow"].negated is False)
   _check("guard_flags_call", by_id["settings.isTelemetryOn"].call is True and by_id["allow"].call is False)
   _check("guard_flags_inline_default", by_id["prefs.getBoolean(share_stats)"].inline_default is True)
   _check("guard_flags_multiline_condition", by_id["prefs.getBoolean(share_stats)"].line == 10, str(by_id["prefs.getBoolean(share_stats)"]))
   _check("guard_flags_not_comparisons_or_literals",
-         not any(k in by_id for k in ("count", "report.isEmpty", "true", "x", "null")), str(sorted(by_id)))
+         not any(k in by_id for k in ("count", "true", "x", "null")), str(sorted(by_id)))
   _check("guard_flags_skips_comments", "commentedOut" not in by_id)
+  _check("guard_flags_stdlib_predicates_not_flags", "report.isEmpty" not in by_id
+         and structure.guard_flags(["if (list.isNullOrEmpty() || file.exists() || ctx.isFinishing) { x() }"], (0, 1)) == [])
+  _check("guard_flags_when_subject_not_a_guard", "report.kind" not in by_id, str(sorted(by_id)))
   _check("guard_flags_receiver_name", by_id["ps.crashReportsEnabled"].receiver == "ps"
          and by_id["ps.crashReportsEnabled"].name == "crashReportsEnabled")
-  _check("guard_flags_cap", len(flags) <= constants.MAX_GUARDS_IN_STATE)
-  _check("guard_flags_empty_scope", structure.guard_flags(src, (19, 21)) == [])
+  _check("guard_flags_cap", len(flags) <= constants.MAX_GUARDS_IN_STATE
+         and "uploadEnabled" in {f.identifier for f in structure.guard_flags(src, (16, 17))})
+  _check("guard_flags_empty_scope", structure.guard_flags(src, (20, 22)) == [])
   # Python / bare Kotlin heads.
   py = ["if not self.upload_enabled:", "    send()", "elif telemetry and not debug:", "    pass"]
   py_ids = {(f.identifier, f.negated) for f in structure.guard_flags(py, (0, 4))}
   _check("guard_flags_python_heads", py_ids >= {("self.upload_enabled", True), ("telemetry", False), ("debug", True)}, str(py_ids))
+  # Early-exit guards protect the code *after* them, so their sense is inverted.
+  ee = (
+      "fun init() {\n"
+      "  if (!ps.reportingEnabled) {\n"
+      "    Log.i(\"x\", \"disabled\")\n"
+      "    return\n"
+      "  }\n"
+      "  if (optedOut) return\n"
+      "  if (paused) { throw IllegalStateException() }\n"
+      "  if (verbose) { Log.d(\"v\", \"...\") }\n"
+      "  upload()\n"
+      "}\n"
+  ).splitlines()
+  ee_flags = {f.identifier: f for f in structure.guard_flags(ee, (0, 10))}
+  _check("guard_flags_early_exit_block", ee_flags["ps.reportingEnabled"].early_exit is True
+         and ee_flags["ps.reportingEnabled"].negated is False, str(ee_flags.get("ps.reportingEnabled")))
+  _check("guard_flags_early_exit_inline", ee_flags["optedOut"].early_exit is True and ee_flags["optedOut"].negated is True)
+  _check("guard_flags_early_exit_throw", ee_flags["paused"].early_exit is True and ee_flags["paused"].negated is True)
+  _check("guard_flags_no_early_exit_plain_block", ee_flags["verbose"].early_exit is False and ee_flags["verbose"].negated is False)
+  py_ee = ["def f(self):", "    if not self.enabled:", "        return", "    send()"]
+  py_ee_flags = {f.identifier: f for f in structure.guard_flags(py_ee, (0, 4))}
+  _check("guard_flags_early_exit_python", py_ee_flags["self.enabled"].early_exit is True
+         and py_ee_flags["self.enabled"].negated is False, str(py_ee_flags))
 
   # --- structure: declarations ----------------------------------------------
   with tempfile.TemporaryDirectory() as d:
@@ -1527,12 +1555,34 @@ def _test_consent_defaults() -> None:
     crash_guard = gflags.get("ps.crashReportsEnabled", {})
     _check("state_guard_declaration_shape",
            crash_guard.get("default_on") is True and crash_guard.get("runs_when") == "true"
+           and crash_guard.get("runs_by_default") is True and "early_exit" not in crash_guard
            and (crash_guard.get("declaration") or {}).get("resolution") == "receiver_type"
            and crash_guard["declaration"]["line"] == 4
            and set(crash_guard["declaration"]) == {"file", "line", "text", "initialiser", "default_on", "resolution"},
            str(crash_guard))
+    # ``runs_by_default`` folds the flag's sense into the declared literal.
+    gs_on = context.GuardState(structure.GuardFlag("f", 1, negated=False),
+                               structure.Declaration("A.kt", 0, "var f = true", "true", True, "same_file"))
+    gs_inv = context.GuardState(structure.GuardFlag("f", 1, negated=True, early_exit=True),
+                                structure.Declaration("A.kt", 0, "var f = true", "true", True, "same_file"))
+    gs_unk = context.GuardState(structure.GuardFlag("f", 1), structure.Declaration("A.kt", 0, "var f = g()", "g()", None, "same_file"))
+    _check("state_runs_by_default", gs_on.runs_by_default is True and gs_inv.runs_by_default is False
+           and gs_unk.runs_by_default is None and context.GuardState(structure.GuardFlag("f", 1), None).runs_by_default is None
+           and gs_inv.to_state()["early_exit"] is True and gs_inv.to_state()["runs_when"] == "false")
     _check("state_mini_guard_defaults", True in per_ask[0]["anchor"]["guard_defaults"] and per_ask[0].get("guards"),
            str(per_ask[0]["anchor"]))
+    # A same-file declaration inside the anchor's scope is a local: listed, but ``runs_by_default`` None.
+    local_src = ["import java.net.URL", "class L {", "  var field = false", "  fun f(report: String) {",
+                 "    var pending = false", "    if (pending) { URL(x).openStream() }", "    if (field) { URL(y).openStream() }", "  }", "}"]
+    fs_local = structure.FileStructure("L.kt", "kotlin", local_src, ["java.net.URL"],
+                                       structure.symbol_references(local_src, ["java.net.URL"]), "com.w8")
+    lg = {g.flag.identifier: g for g in context.anchor_guards(fs_local, (3, 8))}
+    _check("anchor_guards_local_declaration",
+           lg["pending"].declaration is not None and lg["pending"].declaration.resolution == "local"
+           and lg["pending"].is_local and lg["pending"].runs_by_default is None
+           and lg["pending"].to_state()["declaration"]["default_on"] is False
+           and lg["field"].declaration.resolution == "same_file" and lg["field"].runs_by_default is False,
+           str({k: (v.declaration.resolution if v.declaration else None, v.runs_by_default) for k, v in lg.items()}))
     strings = state.get("strings") or {}
     _check("state_strings_from_scope_or_disclosure_lines",
            strings.get("crash_consent_title") == "Send crash reports?" or strings == {} or "crash_consent_body" in strings,
@@ -1569,10 +1619,10 @@ def _test_consent_defaults() -> None:
   # --- heuristic client prior --------------------------------------------------
   prior = clientmod.HeuristicJevClient._consent_prior  # pylint: disable=protected-access
   _check("consent_prior_no_guards_default_on", prior({}) == 0.85)
-  _check("consent_prior_any_off_wins", prior({"guards": [{"default_on": True}, {"default_on": False}]}) == 0.15)
-  _check("consent_prior_unknown_half", prior({"guards": [{"default_on": None}]}) == 0.5)
+  _check("consent_prior_any_off_wins", prior({"guards": [{"runs_by_default": True}, {"runs_by_default": False}]}) == 0.15)
+  _check("consent_prior_unknown_half", prior({"guards": [{"runs_by_default": None}]}) == 0.5)
   hc = clientmod.HeuristicJevClient()
-  ans = hc.system_one({"signal": {"data_type": "CRASH_LOGS"}, "guards": [{"default_on": False}], "app": {}},
+  ans = hc.system_one({"signal": {"data_type": "CRASH_LOGS"}, "guards": [{"runs_by_default": False}], "app": {}},
                       {"consent_default_on": battery["consent_default_on"]})
   _check("consent_prior_wired", abs(ans["consent_default_on"].noul - 0.15) < 1e-9, str(ans))
 
@@ -1601,20 +1651,31 @@ def _test_consent_defaults() -> None:
         "sinks": [{"symbol": "URL", "capabilities": ["NETWORK_EGRESS"], "lines": [13]}],
         "anchor": {"scope": [8, 19], "proximity": 0, "sink_in_scope": True, "tier": 0,
                    "scope_capabilities": ["NETWORK_EGRESS"], "destination_hints": [],
-                   "guard_defaults": [g.get("default_on") for g in guards if g.get("declaration")]},
+                   "guard_defaults": [g.get("runs_by_default") for g in guards if g.get("declaration")]},
         "app": {},
     }
     if guards:
       s["guards"] = guards
     return s
 
-  on_guard = {"flag": "ps.crashReportsEnabled", "line": 9, "runs_when": "true", "default_on": True,
+  on_guard = {"flag": "ps.crashReportsEnabled", "line": 9, "runs_when": "true", "default_on": True, "runs_by_default": True,
               "declaration": {"file": "settings/PersistentState.kt", "line": 4, "text": "var crashReportsEnabled by booleanPref(true)",
                               "initialiser": "booleanPref(true)", "default_on": True, "resolution": "receiver_type"}}
-  off_guard = {"flag": "uploadEnabled", "line": 17, "runs_when": "true", "default_on": False,
+  off_guard = {"flag": "uploadEnabled", "line": 17, "runs_when": "true", "default_on": False, "runs_by_default": False,
                "declaration": {"file": "Reporter.kt", "line": 6, "text": "var uploadEnabled: Boolean = false",
                                "initialiser": "false", "default_on": False, "resolution": "same_file"}}
-  unknown_guard = {"flag": "settings.isTelemetryOn", "line": 11, "runs_when": "true", "default_on": None, "declaration": None}
+  # Declared true but the transfer runs when the flag is *false* (``if (!optOut) send()``).
+  inverted_off_guard = {"flag": "optedIn", "line": 12, "runs_when": "false", "default_on": True, "runs_by_default": False,
+                        "declaration": {"file": "Reporter.kt", "line": 7, "text": "var optedIn = true",
+                                        "initialiser": "true", "default_on": True, "resolution": "same_file"}}
+  computed_guard = {"flag": "ps.reportingEnabled", "line": 9, "runs_when": "true", "early_exit": True,
+                    "default_on": None, "runs_by_default": None,
+                    "declaration": {"file": "settings/PersistentState.kt", "line": 40,
+                                    "text": "var reportingEnabled by booleanPref(\"k\").withDefault<Boolean>(Flavour.isStore())",
+                                    "initialiser": "booleanPref(\"k\").withDefault<Boolean>(Flavour.isStore())",
+                                    "default_on": None, "resolution": "receiver_type"}}
+  unknown_guard = {"flag": "settings.isTelemetryOn", "line": 11, "runs_when": "true", "default_on": None,
+                   "runs_by_default": None, "declaration": None}
   compose = evaluate._compose_data_safety_finding  # pylint: disable=protected-access
   # CRASH_LOGS is not a sensitive type: an undisclosed transfer starts IMPORTANT.
   base_f = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([]), _answers(None), "test")
@@ -1662,8 +1723,66 @@ def _test_consent_defaults() -> None:
          and lowered["decision_trace"]["consent"]["action"] == "lower"
          and lowered.get("needs_manual_review") is True
          and lowered["prominent_disclosure_status"] == "MISSING"
-         and "[opt-in: uploadEnabled default=false; verify toggle text]" in lowered["issue_summary"],
+         and "[opt-in: uploadEnabled off by default; verify toggle text]" in lowered["issue_summary"],
          str((lowered["severity"], lowered["issue_summary"])))
+  # The composer acts on ``runs_by_default``, not on the declared literal: a
+  # flag declared true whose *false* value runs the transfer is an opt-in.
+  inv = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([inverted_off_guard]), _answers(0.1), "test")
+  _check("consent_lower_uses_runs_by_default", inv["severity"] == "SUGGESTION"
+         and "[opt-in: optedIn off by default; verify toggle text]" in inv["issue_summary"]
+         and "[guard optedIn default=true runs when false @Reporter.kt:L7]" in inv["evidence"],
+         str((inv["issue_summary"], inv["evidence"])))
+  inv_raise = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([inverted_off_guard]), _answers(0.9), "test")
+  _check("consent_veto_uses_runs_by_default", inv_raise["severity"] == "IMPORTANT"
+         and inv_raise["decision_trace"]["consent"]["corroboration"] == "vetoed_by_guard")
+  # A default computed from an expression is unknown; the initialiser is quoted in the evidence.
+  comp = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([computed_guard]), _answers(0.7), "test")
+  _check("consent_computed_default_model_only", comp["severity"] == "CRITICAL"
+         and comp["decision_trace"]["consent"]["corroboration"] == "model_only"
+         and "default=unknown init=\"booleanPref('k').withDefault<Boolean>(Flavour.isStore())\"" in comp["evidence"]
+         and "@settings/PersistentState.kt:L40" in comp["evidence"], comp["evidence"])
+  # UNCERTAIN band: default-on is recorded but the IMPORTANT cap stands.
+  capped = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([on_guard]), _answers(0.9, p_transmit=0.5), "test")
+  _check("consent_uncertain_band_capped", capped["transfer_decision"] == "UNCERTAIN"
+         and capped["severity"] == "IMPORTANT" and capped["consent_default_on"] is True
+         and capped["decision_trace"]["consent"]["action"] == "none"
+         and capped["decision_trace"]["consent"]["capped_by"] == "uncertain_band"
+         and "[enabled by default]" not in capped["issue_summary"]
+         and "capped at IMPORTANT" in capped["decision_trace"]["consent_note"],
+         str((capped["severity"], capped["decision_trace"]["consent"])))
+  capped_lower = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([off_guard]), _answers(0.1, p_transmit=0.5), "test")
+  _check("consent_uncertain_band_lower_allowed", capped_lower["severity"] == "SUGGESTION"
+         and capped_lower["decision_trace"]["consent"]["action"] == "lower")
+  # Unresolved destination (unknown / unconfirmed non-collection): no raise, default-on recorded.
+  unk = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([on_guard]), _answers(0.9, cls="unknown"), "test")
+  _check("consent_unknown_destination_capped", unk["severity"] == "IMPORTANT" and unk["consent_default_on"] is True
+         and unk["decision_trace"]["consent"]["capped_by"] == "unresolved_destination"
+         and "[enabled by default]" not in unk["issue_summary"] and unk.get("needs_manual_review") is True
+         and "destination (unknown) is unresolved" in unk["decision_trace"]["consent_note"],
+         str((unk["severity"], unk["issue_summary"])))
+  # user_chosen_destination at high confidence but without corroboration (no hint,
+  # not user-initiated) is unconfirmed -> review, not a Critical.
+  uc_state = _state([])
+  uc_unconf = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", uc_state, _answers(0.9, cls="user_chosen_destination"), "test")
+  _check("consent_unconfirmed_user_chosen_capped", uc_unconf["severity"] == "IMPORTANT"
+         and uc_unconf["decision_trace"]["consent"]["capped_by"] == "unresolved_destination"
+         and "unconfirmed" in uc_unconf["issue_summary"], str((uc_unconf["severity"], uc_unconf["issue_summary"])))
+  # A local boolean declared inside the anchor's own scope never corroborates or vetoes.
+  local_off = {"flag": "need_restore", "line": 15, "runs_when": "true", "default_on": False, "runs_by_default": None,
+               "declaration": {"file": "Reporter.kt", "line": 12, "text": "boolean need_restore = false;",
+                               "initialiser": "false", "default_on": False, "resolution": "local"}}
+  loc = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([local_off]), _answers(0.9), "test")
+  _check("consent_local_guard_does_not_veto", loc["severity"] == "CRITICAL"
+         and loc["decision_trace"]["consent"]["corroboration"] == "model_only"
+         and loc["decision_trace"]["consent"]["guard_defaults"] == []
+         and "[guard need_restore default=false @Reporter.kt:L12]" in loc["evidence"], str(loc["decision_trace"]["consent"]))
+  loc_low = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([local_off]), _answers(0.1), "test")
+  _check("consent_local_guard_does_not_lower", loc_low["severity"] == "IMPORTANT"
+         and loc_low["decision_trace"]["consent"]["corroboration"] == "uncorroborated")
+  loc_and_field = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([local_off, on_guard]), _answers(0.9), "test")
+  _check("consent_evidence_prefers_non_local", "[guard ps.crashReportsEnabled default=true @settings/PersistentState.kt:L4]"
+         in loc_and_field["evidence"] and loc_and_field["decision_trace"]["consent"]["corroboration"] == "guard_default_on",
+         loc_and_field["evidence"])
   # No lower without the deterministic half ...
   uncorr = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([unknown_guard]), _answers(0.1), "test")
   _check("consent_no_lower_without_guard", uncorr["severity"] == "IMPORTANT"

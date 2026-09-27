@@ -385,16 +385,16 @@ class HeuristicJevClient(JevClient):
     """Offline stand-in for the ``consent_default_on`` Noul (WP8).
 
     Reads the deterministic ``guards`` list that ``context.build_file_state``
-    attaches to the state: any guard whose declaration resolves to
-    ``default_on == False`` -> lean opt-in (0.15); any guard resolving to
-    ``True`` -> lean default-on (0.85); guards with unknown defaults -> 0.5;
-    no guards at all -> the code path is unconditional, so default-on (0.85).
-    This is a heuristic for hermetic runs, not a judgement of the toggle text.
+    attaches to the state: any guard with ``runs_by_default == False`` -> lean
+    opt-in (0.15); any guard with ``True`` -> lean default-on (0.85); guards
+    with unknown defaults -> 0.5; no guards at all -> the code path is
+    unconditional, so default-on (0.85). This is a heuristic for hermetic
+    runs, not a judgement of the toggle text.
     """
     guards = state.get("guards") or []
     if not guards:
       return 0.85
-    defaults = [g.get("default_on") for g in guards if isinstance(g, dict)]
+    defaults = [g.get("runs_by_default") for g in guards if isinstance(g, dict)]
     if any(d is False for d in defaults):
       return 0.15
     if any(d is True for d in defaults):

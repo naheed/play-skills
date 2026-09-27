@@ -1485,8 +1485,23 @@ def destination_hints(
 # their declarations deterministically; the model receives them as priors.
 # ---------------------------------------------------------------------------
 
-#: Condition heads whose parenthesised (or bare, Kotlin/Python) expression is a guard.
-_CONDITION_HEAD_RE = re.compile(r"\b(?:if|else\s+if|elif|while|when)\b\s*(\(|)")
+#: Condition heads whose parenthesised (or bare, Kotlin/Python) expression is a
+#: boolean guard. ``when (subject)`` is a switch, not a boolean condition, and
+#: is deliberately absent.
+_CONDITION_HEAD_RE = re.compile(r"\b(?:if|else\s+if|elif|while)\b\s*(\(|)")
+#: A statement that leaves the enclosing block: an ``if (x) { return }`` guard
+#: gates the code *after* it, so the flag's effective sense is inverted.
+_EARLY_EXIT_RE = re.compile(r"^(?:return|throw|break|continue)\b")
+#: Member names of language / platform standard-library predicates that are
+#: never a user-facing setting (emptiness, blankness, nullness, file-system
+#: results, lifecycle state). Conditions on them are control flow, not
+#: consent, and would otherwise crowd out real flags under the state cap.
+_NON_SETTING_MEMBERS = frozenset({
+    "isEmpty", "isNotEmpty", "isNullOrEmpty", "isNullOrBlank", "isBlank", "isNotBlank",
+    "isNull", "isNotNull", "isPresent", "hasNext", "exists", "delete", "mkdir", "mkdirs",
+    "createNewFile", "canRead", "canWrite", "isDirectory", "isFile", "isFinishing",
+    "isDestroyed", "isCancelled", "isActive", "isCompleted", "isAlive", "isInterrupted",
+})
 #: Splits a condition into clauses at boolean operators.
 _BOOL_OP_RE = re.compile(r"\s*(?:&&|\|\||\band\b|\bor\b)\s*")
 #: A clause that is a bare (possibly negated, possibly dotted) identifier.
@@ -1511,10 +1526,16 @@ class GuardFlag:
       (``persistentState.crashReportsEnabled``, ``uploadEnabled``, or the
       preference key for a ``getBoolean`` read).
     line: 0-based line of the condition.
-    negated: True when the guarded code runs while the flag is *false*.
+    negated: True when the *guarded transfer code* runs while the flag is
+      false. Already folds in ``early_exit``: ``if (!enabled) return`` is
+      recorded as ``negated=False`` because the code after the guard runs
+      when ``enabled`` is true.
     inline_default: The literal default of an inline ``getBoolean(key,
       default)`` read (None otherwise).
     call: True when the flag is a no-argument member call (``isEnabled()``).
+    early_exit: True when the condition's body leaves the block (``return`` /
+      ``throw`` / ``break`` / ``continue``), i.e. the guard protects the code
+      *after* it rather than the code inside it.
   """
 
   identifier: str
@@ -1522,6 +1543,7 @@ class GuardFlag:
   negated: bool = False
   inline_default: Optional[bool] = None
   call: bool = False
+  early_exit: bool = False
 
   @property
   def name(self) -> str:
@@ -1548,7 +1570,9 @@ class Declaration:
       initialiser (``= true``, ``booleanPreference(false)``, ``getBoolean(k,
       true)``), else None.
     resolution: ``same_file`` / ``receiver_type`` (one first-party hop) /
-      ``inline`` (a ``getBoolean`` default written at the guard).
+      ``inline`` (a ``getBoolean`` default written at the guard) / ``local``
+      (rewritten by ``context.anchor_guards`` when a same-file declaration
+      lies inside the anchor's own scope: a local variable, not a setting).
   """
 
   relpath: str
@@ -1564,52 +1588,109 @@ class Declaration:
             "resolution": self.resolution}
 
 
-def _condition_text(lines: Sequence[str], i: int) -> str:
-  """The condition expression of a control-flow head on line ``i`` ('' when none).
+def _condition_span(lines: Sequence[str], i: int) -> Tuple[str, str]:
+  """``(condition, body_head)`` of a control-flow head on line ``i`` (``('', '')`` when none).
 
   A parenthesised condition is read to its matching ``)``, continuing onto
   following lines for multi-line conditions (bounded to 4 lines). A bare
-  Kotlin/Python condition (``if x:``, ``when`` subject) is the rest of the
-  line up to ``:`` / ``{`` / ``->``.
+  Kotlin/Python condition (``if x:``, ``if x {``) is the rest of the line up
+  to ``:`` / ``{`` / ``->``. ``body_head`` is the source text that follows the
+  condition on its last line (``{ return }``, ``return``, ``:``) -- what
+  :func:`_is_early_exit` inspects.
   """
   line = lines[i]
   m = _CONDITION_HEAD_RE.search(line)
   if not m:
-    return ""
+    return "", ""
   if m.group(1) == "(":
     depth, buf = 0, []
     text = line[m.end() - 1:]
     for k in range(i, min(len(lines), i + 4)):
       seg = text if k == i else lines[k]
-      for ch in seg:
+      for pos, ch in enumerate(seg):
         if ch == "(":
           depth += 1
         elif ch == ")":
           depth -= 1
           if depth == 0:
             buf.append(ch)
-            return "".join(buf)[1:-1]
+            return "".join(buf)[1:-1], seg[pos + 1:]
         buf.append(ch)
       buf.append(" ")
-    return ""
+    return "", ""
   rest = line[m.end():]
+  body_head = ""
+  cut = len(rest)
   for stop in (":", "{", "->"):
     idx = rest.find(stop)
-    if idx >= 0:
-      rest = rest[:idx]
-  return rest.strip()
+    if 0 <= idx < cut:
+      cut = idx
+  if cut < len(rest):
+    body_head = rest[cut:]
+  return rest[:cut].strip(), body_head
+
+
+def _condition_text(lines: Sequence[str], i: int) -> str:
+  """The condition expression of a control-flow head on line ``i`` ('' when none)."""
+  return _condition_span(lines, i)[0]
+
+
+def _is_early_exit(lines: Sequence[str], i: int, body_head: str) -> bool:
+  """True when the body of the condition on line ``i`` leaves the enclosing block.
+
+  Reads the statements of the body -- the rest of the condition's line after
+  ``)`` / ``:`` / ``{`` and, for a braced or indented block, up to 4 further
+  lines until the block closes -- and reports whether one of them is a bare
+  ``return`` / ``throw`` / ``break`` / ``continue``. A guard whose body exits
+  gates the code *after* it, so the caller inverts the flag's sense.
+  """
+  head = body_head.strip()
+  if head.startswith("{"):
+    head = head[1:]
+  elif head.startswith(":"):
+    head = head[1:]
+  statements: List[str] = []
+  # Statements on the head line itself (``if (x) { return }`` / ``if (x) return``).
+  for part in head.split("}")[0].split(";"):
+    part = part.strip()
+    if part:
+      statements.append(part)
+  # Following lines of the block, bounded; the block is over at its closing
+  # brace or at a dedent back to the head's indentation (Python, brace-less
+  # Kotlin). An Allman-style ``{`` on its own line is skipped.
+  head_indent = len(lines[i]) - len(lines[i].lstrip())
+  for k in range(i + 1, min(len(lines), i + 5)):
+    raw = lines[k]
+    stripped = raw.strip()
+    if not stripped or stripped == "{" or stripped.startswith(_COMMENT_PREFIXES):
+      continue
+    if stripped.startswith("}") or len(raw) - len(raw.lstrip()) <= head_indent:
+      break
+    for part in stripped.split("}")[0].split(";"):
+      part = part.strip()
+      if part:
+        statements.append(part)
+    if "}" in stripped:
+      break
+  return any(_EARLY_EXIT_RE.match(s) for s in statements)
 
 
 def guard_flags(lines: Sequence[str], scope: Tuple[int, int]) -> List[GuardFlag]:
   """Boolean flags guarding the lines in ``[scope[0], scope[1])``.
 
   Reads every control-flow condition inside the scope (``if`` / ``else if`` /
-  ``elif`` / ``while`` / ``when``, single- or multi-line), splits it at
-  ``&&`` / ``||`` / ``and`` / ``or``, and keeps the clauses that are a bare
-  identifier (``!enabled``, ``prefs.uploadOn``), a no-argument member call
+  ``elif`` / ``while``, single- or multi-line), splits it at ``&&`` / ``||``
+  / ``and`` / ``or``, and keeps the clauses that are a bare identifier
+  (``!enabled``, ``prefs.uploadOn``), a no-argument member call
   (``settings.isEnabled()``) or an inline preference read with a literal
-  default (``prefs.getBoolean("k", true)``). Comparisons, arithmetic and
-  calls with arguments are not guards (they are not a boolean *flag*).
+  default (``prefs.getBoolean("k", true)``). Comparisons, arithmetic, calls
+  with arguments and literals are not guards (they are not a boolean
+  *flag*); neither are standard-library predicates on collections, strings,
+  nullness, files or lifecycle (``isEmpty()``, ``isNullOrBlank()``,
+  ``exists()``, ``isFinishing`` -- :data:`_NON_SETTING_MEMBERS`), which are
+  control flow rather than a setting. ``when (subject)`` is a switch and is
+  not read. A guard whose body leaves the block (``if (!enabled) return``)
+  protects the code *after* it, so its sense is inverted (``early_exit``).
   Comments and imports are skipped. Deduplicated by identifier, first
   occurrence wins, at most ``MAX_GUARDS_IN_STATE`` (nearest to the scope
   start first, i.e. the outermost guards).
@@ -1621,9 +1702,10 @@ def guard_flags(lines: Sequence[str], scope: Tuple[int, int]) -> List[GuardFlag]
     stripped = lines[i].strip()
     if not stripped or stripped.startswith(_COMMENT_PREFIXES) or stripped.startswith(_IMPORT_PREFIXES):
       continue
-    cond = _condition_text(lines, i)
+    cond, body_head = _condition_span(lines, i)
     if not cond:
       continue
+    early_exit = _is_early_exit(lines, i, body_head)
     for clause in _BOOL_OP_RE.split(cond):
       clause = clause.strip()
       while clause.startswith("(") and clause.endswith(")"):
@@ -1638,13 +1720,17 @@ def guard_flags(lines: Sequence[str], scope: Tuple[int, int]) -> List[GuardFlag]
                          inline_default=(pm.group("default") == "true"))
       elif fm:
         ident = fm.group("ident")
-        if ident in _GUARD_KEYWORDS or ident.rsplit(".", 1)[-1] in _GUARD_KEYWORDS:
+        member = ident.rsplit(".", 1)[-1]
+        if ident in _GUARD_KEYWORDS or member in _GUARD_KEYWORDS or member in _NON_SETTING_MEMBERS:
           continue
-        if not any(ch.isalpha() for ch in ident.rsplit(".", 1)[-1]):
+        if not any(ch.isalpha() for ch in member):
           continue
         flag = GuardFlag(ident, i, bool(fm.group("neg")), call=bool(_FLAG_CALL_RE.match(clause)))
       else:
         continue
+      if early_exit:
+        flag.negated = not flag.negated
+        flag.early_exit = True
       if flag.identifier in seen:
         continue
       seen.add(flag.identifier)
@@ -1654,7 +1740,7 @@ def guard_flags(lines: Sequence[str], scope: Tuple[int, int]) -> List[GuardFlag]
         return out
   if out:
     log.debug("guard_flags in lines %d-%d: %s", start + 1, end,
-              [(g.identifier, g.line + 1, g.negated, g.inline_default) for g in out])
+              [(g.identifier, g.line + 1, g.negated, g.inline_default, g.early_exit) for g in out])
   return out
 
 

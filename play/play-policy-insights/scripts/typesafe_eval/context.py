@@ -309,10 +309,32 @@ def disclosure_symbols(
 
 @dataclasses.dataclass
 class GuardState:
-  """A guard flag of an anchor scope plus its located declaration (WP8)."""
+  """A guard flag of an anchor scope plus its located declaration (WP8).
+
+  ``runs_by_default`` is the fact the composer acts on: whether the guarded
+  transfer code runs when the flag keeps its declared default. It folds the
+  flag's sense (``runs_when``, early-exit already inverted by
+  :func:`structure.guard_flags`) into the declared literal: a flag declared
+  ``true`` guarding ``if (flag) send()`` runs by default; the same flag
+  guarding ``if (!flag) send()`` does not. None when the default is unknown
+  and None for a *local* declaration (``resolution == "local"``: a boolean
+  declared inside the anchor's own scope is control-flow state, not a
+  persisted setting, so it never corroborates or vetoes; the model still
+  sees it with its literal).
+  """
 
   flag: structure.GuardFlag
   declaration: Optional[structure.Declaration]
+
+  @property
+  def is_local(self) -> bool:
+    return self.declaration is not None and self.declaration.resolution == "local"
+
+  @property
+  def runs_by_default(self) -> Optional[bool]:
+    if self.declaration is None or self.declaration.default_on is None or self.is_local:
+      return None
+    return self.declaration.default_on == (not self.flag.negated)
 
   def to_state(self) -> Dict[str, Any]:
     out: Dict[str, Any] = {
@@ -320,12 +342,15 @@ class GuardState:
         "line": self.flag.line + 1,
         "runs_when": "false" if self.flag.negated else "true",
     }
+    if self.flag.early_exit:
+      out["early_exit"] = True
     if self.declaration is not None:
       out["declaration"] = self.declaration.to_state()
       out["default_on"] = self.declaration.default_on
     else:
       out["declaration"] = None
       out["default_on"] = None
+    out["runs_by_default"] = self.runs_by_default
     return out
 
 
@@ -333,15 +358,24 @@ def anchor_guards(
     fs: structure.FileStructure, scope: Tuple[int, int],
     index: Optional[structure.FirstPartyIndex] = None, app_dir: str = "",
 ) -> List[GuardState]:
-  """Guard flags of ``scope`` with their declarations resolved (WP8)."""
+  """Guard flags of ``scope`` with their declarations resolved (WP8).
+
+  A declaration found in the same file *inside* ``scope`` is a local variable
+  of the anchor's own function; its resolution is rewritten to ``local`` so
+  the composer ignores its literal (see :class:`GuardState`).
+  """
   out: List[GuardState] = []
   for flag in structure.guard_flags(fs.lines, scope):
     decl = structure.declaration_of(flag, fs, index, app_dir)
+    if (decl is not None and decl.resolution == "same_file" and decl.relpath == fs.relpath
+        and scope[0] <= decl.line < scope[1]):
+      decl = dataclasses.replace(decl, resolution="local")
     out.append(GuardState(flag, decl))
   if out:
     log.info("guards in %s L%d-%d: %s", fs.relpath, scope[0] + 1, scope[1],
-             [(g.flag.identifier, g.declaration.default_on if g.declaration else None,
-               g.declaration.resolution if g.declaration else "unresolved") for g in out])
+             [(g.flag.identifier, "runs_by_default=%s" % g.runs_by_default,
+               g.declaration.resolution if g.declaration else "unresolved",
+               "early_exit" if g.flag.early_exit else "") for g in out])
   return out
 
 
@@ -403,8 +437,8 @@ class Anchor:
 
   @property
   def guard_defaults(self) -> List[Optional[bool]]:
-    """The ``default_on`` of every guard with a located declaration (WP8)."""
-    return [g.declaration.default_on for g in self.guards if g.declaration is not None]
+    """``runs_by_default`` of every guard with a located declaration (WP8)."""
+    return [g.runs_by_default for g in self.guards if g.declaration is not None]
 
   @property
   def callee_capabilities(self) -> List[str]:

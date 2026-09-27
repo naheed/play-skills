@@ -207,13 +207,15 @@ def consent_default_question(subject: str) -> Dict[str, Any]:
           f"Is the transfer of {subject} in `code_snippet` ENABLED BY DEFAULT, "
           "i.e. does it happen unless the user has turned it off? `guards`, when "
           "present, lists the boolean flags that gate the snippet: `flag`, the "
-          "condition line, `runs_when` (the flag value under which the guarded "
-          "code runs) and, when the evaluator found the declaration, "
-          "`declaration.initialiser` and `default_on` (true = the flag starts "
-          "on). A guard whose effective default lets the code run means default-"
-          "on; a guard that starts off (the user must enable a setting) means "
-          "opt-in; an unconditional transfer is default-on. `default_on: null` "
-          "means the default could not be read from the code."
+          "condition line, `runs_when` (the flag value under which the transfer "
+          "code runs; an `early_exit` guard such as `if (!flag) return` protects "
+          "the code after it) and, when the evaluator found the declaration, "
+          "`declaration.initialiser`, `default_on` (true = the flag starts on) "
+          "and `runs_by_default` (true = the transfer runs when the flag keeps "
+          "its declared default). `runs_by_default: true` or no guard at all "
+          "means default-on; `runs_by_default: false` (the user must enable a "
+          "setting) means opt-in. `null` means the default could not be read "
+          "from the code -- then judge from the initialiser text and the snippet."
       ),
       yes="The transfer is on by default (unconditional, or gated by a flag that starts enabled).",
       no="The user must opt in first (gated by a flag that starts disabled, or by an explicit consent step).",

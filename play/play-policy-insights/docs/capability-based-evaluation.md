@@ -529,14 +529,21 @@ rather than a Critical. Nothing in the snippet or the battery carried that fact;
 questions also saw `R.string.crash_consent_body` instead of the sentence the user reads.
 
 - **Guards are found and resolved in code.** `structure.guard_flags(lines, scope)` reads every
-  control-flow condition inside the anchor's scope (`if` / `else if` / `elif` / `while` /
-  `when`, single- or multi-line, Kotlin/Java/Python heads), splits it at `&&` / `||` / `and`
-  / `or` and keeps the clauses that are a boolean *flag*: a bare, possibly negated, possibly
-  dotted identifier (`!BuildConfig.DEBUG`, `ps.crashReportsEnabled`), a no-argument member call
-  (`settings.isTelemetryOn()`) or an inline preference read with a literal default
-  (`prefs.getBoolean("share_stats", true)`). Comparisons, arithmetic, calls with arguments and
-  literals are not flags; comment and import lines are skipped; at most `MAX_GUARDS_IN_STATE =
-  6` per anchor, outermost first. `structure.declaration_of(flag, fs, index, app_dir)` then
+  control-flow condition inside the anchor's scope (`if` / `else if` / `elif` / `while`,
+  single- or multi-line, Kotlin/Java/Python heads; `when (subject)` is a switch and is not
+  read), splits it at `&&` / `||` / `and` / `or` and keeps the clauses that are a boolean
+  *flag*: a bare, possibly negated, possibly dotted identifier (`!BuildConfig.DEBUG`,
+  `ps.crashReportsEnabled`), a no-argument member call (`settings.isTelemetryOn()`) or an
+  inline preference read with a literal default (`prefs.getBoolean("share_stats", true)`).
+  Comparisons, arithmetic, calls with arguments and literals are not flags, and neither are
+  standard-library predicates on collections, strings, nullness, files or lifecycle
+  (`isEmpty()`, `isNullOrBlank()`, `exists()`, `isFinishing` — `structure._NON_SETTING_MEMBERS`;
+  the first live run showed them crowding real flags out of the state cap). A guard whose body
+  leaves the block (`if (!enabled) { log(); return }`, `if (optedOut) return`, `throw`,
+  `break`, `continue`) protects the code *after* it, so its sense is inverted and recorded
+  (`early_exit: true`; App A's crash-report initializer is exactly this shape). Comment and
+  import lines are skipped; at most `MAX_GUARDS_IN_STATE = 6` per anchor, outermost first.
+  `structure.declaration_of(flag, fs, index, app_dir)` then
   locates the flag's declaration and its initialiser: the inline `getBoolean` default is its own
   declaration (`resolution: inline`); else the flag's own file (`same_file`); else, for a dotted
   flag, the receiver's declared type (`val ps: PersistentState`, `inject<PersistentState>()`,
@@ -544,14 +551,22 @@ questions also saw `R.string.crash_consent_body` instead of the sentence the use
   searched — one hop, `MAX_GUARD_DECLARATION_HOPS = 1` (`receiver_type`). `default_on` is
   True/False only when the initialiser holds exactly one boolean literal (`= true`,
   `booleanPref(false)`, `getBoolean(k, true)`), otherwise None: the evaluator never guesses a
-  default it could not read. Test source sets are never indexed, so a test double cannot
-  supply the default.
-- **The model sees the guards, the composer sees the defaults.** `context.build_file_state`
-  attaches `state["guards"]` — one flat list across the file's asks, tagged `data_type`, each
-  entry `{flag, line, runs_when, declaration{file,line,text,initialiser,default_on,resolution},
-  default_on}` — only when at least one guard was found, so guard-free states are byte-identical
-  to M2 (cache-friendly). The mini-state anchor carries `guard_defaults` (the `default_on` of
-  every located declaration) and the decision trace records it under `anchor.guard_defaults`.
+  default it could not read. A default computed from an expression — App A's
+  `booleanPref("firebase_error_reporting").withDefault<Boolean>(Utilities.isPlayStoreFlavour())`
+  — is therefore `unknown`; the initialiser text still reaches the model and is quoted in the
+  evidence (`default=unknown init="…isPlayStoreFlavour()"`) so a reviewer sees what the default
+  depends on. Test source sets are never indexed, so a test double cannot supply the default.
+- **The model sees the guards, the composer sees `runs_by_default`.** `context.GuardState`
+  folds the flag's sense into the declared literal: `runs_by_default` is True when the transfer
+  runs while the flag keeps its declared default (`if (flag) send()` with `flag = true`;
+  `if (!flag) return` with `flag = true`), False for an opt-in (`if (flag) send()` with `flag =
+  false`, or `if (!optedIn) send()` with `optedIn = true`), None when the default is unknown.
+  `context.build_file_state` attaches `state["guards"]` — one flat list across the file's asks,
+  tagged `data_type`, each entry `{flag, line, runs_when, early_exit?, declaration{file, line,
+  text, initialiser, default_on, resolution}, default_on, runs_by_default}` — only when at least
+  one guard was found, so guard-free states are byte-identical to M2 (cache-friendly). The
+  mini-state anchor carries `guard_defaults` (the `runs_by_default` of every located
+  declaration) and the decision trace records it under `anchor.guard_defaults`.
 - **One new Noul, `consent_default_on`**, sits in the data-safety battery between
   `user_initiated` and `destination_class`: "does the transfer happen unless the user has turned
   it off?". Its instructions explain the `guards` block (`runs_when`, `default_on: null` =
@@ -560,27 +575,34 @@ questions also saw `R.string.crash_consent_body` instead of the sentence the use
   with WP10's question change, as M2 did for WP6/WP7).
 - **Asymmetric composition (`evaluate.compose_consent`).** Only an undisclosed transfer
   (`transmits` and `disclosure_status == MISSING`, and not a destination already applied as
-  inventory) is affected. *Raise* IMPORTANT → CRITICAL when `p >= T_CONSENT_DEFAULT_ON = 0.60`
-  and no guard is declared default-off; the corroboration names the deterministic fact that
-  agrees — `guard_default_on`, `unconditional` (no guard at all) or `model_only` (only
-  unresolved guards; raising is the recall direction and the finding is already undisclosed).
-  A guard declared default-off *vetoes* the model's default-on claim: severity unchanged,
+  inventory) is affected. *Raise* IMPORTANT → CRITICAL — TRANSMITS decisions only — when `p >=
+  T_CONSENT_DEFAULT_ON = 0.60` and no guard keeps the transfer off by default; the
+  corroboration names the deterministic fact that agrees — `guard_default_on`, `unconditional`
+  (no guard at all) or `model_only` (only unresolved guards; severity already derives from the
+  model's booleans and the finding is undisclosed). An UNCERTAIN decision is capped at
+  IMPORTANT by `derive_data_safety_severity` ("the evaluator does not assert a Critical it
+  cannot support"), so the default-on answer is recorded (`consent_default_on: true`,
+  `band_capped: true`, note "severity stays capped at IMPORTANT") and the severity stands — the
+  first live run raised 17 UNCERTAIN findings on App A before this cap was enforced. A guard
+  with `runs_by_default == False` *vetoes* the model's default-on claim: severity unchanged,
   `corroboration: vetoed_by_guard`, review flag, summary suffix `[consent default unclear: model
-  default-on vs guard default-off; verify]`. *Lower* to SUGGESTION only through a double gate:
-  `p <= 1 - CONF_CONSENT_ACT` (0.25) **and** a guard declared default-off
-  (`guard_default_off`); the finding keeps `prominent_disclosure_policy` and
+  default-on vs guard default-off; verify]`. *Lower* to SUGGESTION (either band) only through
+  a double gate: `p <= 1 - CONF_CONSENT_ACT` (0.25) **and** a guard with `runs_by_default ==
+  False` (`guard_default_off`); the finding keeps `prominent_disclosure_policy` and
   `prominent_disclosure_status: MISSING` because an opt-in toggle is not a prominent
-  disclosure, is review-flagged and suffixed `[opt-in: <flag> default=false; verify toggle
-  text]`. A confident "opt-in" with no default-off guard is `uncorroborated`, a mid-band answer
+  disclosure, is review-flagged and suffixed `[opt-in: <flag> off by default; verify toggle
+  text]`. A confident "opt-in" with no such guard is `uncorroborated`, a mid-band answer
   `low_confidence`; neither changes anything. A sensitive type that is already CRITICAL keeps
   its severity (`action: none`) but still records `consent_default_on: true`.
 - **Evidence and trace.** When guards exist the evidence line gains ` [guard <flag>
-  default=<true|false|unknown> @<file>:L<n>]` for the first located declaration, and
-  `evidence_flow.guards` lists them all. The finding gains `consent_default_on`
-  (True/False/None); `decision_trace.consent` records `p_default_on`, `guards` (with
-  `declaration` as `file:Ln`), `guard_defaults`, `default_on`, `action`, `corroboration` and
-  `enabled`; `consent_note` explains any change in one sentence; `thresholds` gains
-  `T_CONSENT_DEFAULT_ON` and `CONF_CONSENT_ACT`.
+  default=<true|false|unknown> @<file>:L<n>]` for the deciding guard (the first that keeps the
+  transfer off, else the first located declaration), with `init="…"` when the default is not a
+  literal and `runs when false` when the flag's sense is inverted; `evidence_flow.guards` lists
+  them all with `runs_when`, `default_on` and `runs_by_default`. The finding gains
+  `consent_default_on` (True/False/None); `decision_trace.consent` records `p_default_on`,
+  `guards` (with `declaration` as `file:Ln`), `guard_defaults`, `default_on`, `action`,
+  `corroboration`, `band_capped` and `enabled`; `consent_note` explains any change in one
+  sentence; `thresholds` gains `T_CONSENT_DEFAULT_ON` and `CONF_CONSENT_ACT`.
 - **String resources reach the disclosure questions.** `context.resolved_strings` resolves
   every `R.string.<name>` on the anchor scope's lines and on the file's disclosure-symbol lines
   through the profile's default-locale `resources.ResourceIndex` into `state["strings"]`
@@ -596,8 +618,8 @@ questions also saw `R.string.crash_consent_body` instead of the sentence the use
   trace's `permission` / `service`) and on permission-goal code findings through
   `constants.POLICY_PERMISSIONS` (location / contacts / audio), so a reviewer sees "this only
   affects the Play flavour" without reading the manifests.
-- **Stand-in client.** `HeuristicJevClient._consent_prior` answers from the guard defaults in the
-  state (any default-off → 0.15, any default-on or no guard → 0.85, else 0.5); labelled as a
+- **Stand-in client.** `HeuristicJevClient._consent_prior` answers from `runs_by_default` of the
+  guards in the state (any False → 0.15, any True or no guard → 0.85, else 0.5); labelled as a
   stand-in, never used in a live run.
 - Rollback: `CONSENT_DEFAULT_ENABLED = False` keeps the question, traces the Noul and guards,
   and composes exactly as M2 did; `GUARDS_ENABLED = False` omits `guards` from the state (the

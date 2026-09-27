@@ -318,16 +318,22 @@ DESTINATION_HINTS_ENABLED = True
 #   * ``consent_default_on`` Noul: "does the transfer happen unless the user
 #     turns it off?".
 #
+# The composer acts on each guard's ``runs_by_default`` -- the declared
+# literal folded with the flag's sense (``if (!enabled) return`` protects the
+# code *after* it, so the transfer runs by default when ``enabled`` starts
+# true) -- never on the raw literal.
 # Composition (``evaluate.compose_consent``) is asymmetric like WP7's:
 #   raise  IMPORTANT -> CRITICAL for an undisclosed TRANSMITS when the Noul is
-#          at/above T_CONSENT_DEFAULT_ON *and* no guard is declared default-off
-#          (a deterministic default-off guard vetoes the model's claim);
+#          at/above T_CONSENT_DEFAULT_ON *and* no guard keeps the transfer off
+#          by default (such a guard vetoes the model's claim). An UNCERTAIN
+#          decision is never raised: it is capped at IMPORTANT by design and
+#          the default-on answer is only recorded (``band_capped``);
 #   lower  to SUGGESTION + review for an undisclosed transfer only behind the
 #          double gate: the Noul is confidently *negative* (<= 1 -
-#          CONF_CONSENT_ACT) *and* a guard with ``default_on == False`` was
-#          found in code (the user had to opt in). A toggle is not a prominent
-#          disclosure, so the disclosure status stays MISSING and the finding
-#          says "verify the toggle text".
+#          CONF_CONSENT_ACT) *and* a guard with ``runs_by_default == False``
+#          was found in code (the user had to opt in). A toggle is not a
+#          prominent disclosure, so the disclosure status stays MISSING and
+#          the finding says "verify the toggle text".
 # ``manifest_sources`` on a finding lists the source sets that declare the
 # permission / component the finding rests on when they are a strict subset
 # of the shipped build (a flavour-only permission), so a reviewer knows which
