@@ -294,6 +294,68 @@ NON_COLLECTION_DESTINATION_CLASSES = ("user_chosen_destination", "platform_compo
 # computed only when this is on; they ride in the state as
 # ``destination_hints`` and in the trace, never as a decision.
 DESTINATION_HINTS_ENABLED = True
+
+# ---------------------------------------------------------------------------
+# WP8: consent defaults, string resources, flavour attribution.
+#
+# The legacy skill's strongest Critical on App A was "crash reports upload by
+# default"; the hybrid evaluator could see the upload but not the *default*,
+# because the boolean that gates the call is declared in another file with
+# its initialiser. WP8 adds three deterministic facts to the state and one
+# Noul to the data-safety battery:
+#
+#   * ``guards`` -- the boolean flags guarding the anchor's scope (``if
+#     (prefs.crashReportsEnabled)``), each with the declaration line and the
+#     initialiser found in the same file or one hop away through the
+#     first-party index (``structure.guard_flags`` / ``declaration_of``).
+#     ``default_on`` is read from the initialiser (``= true``, ``getBoolean(k,
+#     true)``, ``booleanPreference(false)``) and is None when no literal is
+#     found. Priors, not decisions.
+#   * ``strings`` -- ``R.string.<name>`` references in the anchor scope and
+#     on disclosure lines resolved to the default-locale text
+#     (``resources.ResourceIndex``), so disclosure questions are answered
+#     against what the user actually reads instead of a resource id.
+#   * ``consent_default_on`` Noul: "does the transfer happen unless the user
+#     turns it off?".
+#
+# Composition (``evaluate.compose_consent``) is asymmetric like WP7's:
+#   raise  IMPORTANT -> CRITICAL for an undisclosed TRANSMITS when the Noul is
+#          at/above T_CONSENT_DEFAULT_ON *and* no guard is declared default-off
+#          (a deterministic default-off guard vetoes the model's claim);
+#   lower  to SUGGESTION + review for an undisclosed transfer only behind the
+#          double gate: the Noul is confidently *negative* (<= 1 -
+#          CONF_CONSENT_ACT) *and* a guard with ``default_on == False`` was
+#          found in code (the user had to opt in). A toggle is not a prominent
+#          disclosure, so the disclosure status stays MISSING and the finding
+#          says "verify the toggle text".
+# ``manifest_sources`` on a finding lists the source sets that declare the
+# permission / component the finding rests on when they are a strict subset
+# of the shipped build (a flavour-only permission), so a reviewer knows which
+# build variant is affected. Rollback: CONSENT_DEFAULT_ENABLED = False keeps
+# the question (traced) but never changes a severity; STRING_RESOLUTION_ENABLED
+# / GUARDS_ENABLED / PERMISSION_ATTRIBUTION_ENABLED drop the corresponding
+# state or finding field.
+# ---------------------------------------------------------------------------
+CONSENT_DEFAULT_ENABLED = True
+GUARDS_ENABLED = True
+STRING_RESOLUTION_ENABLED = True
+PERMISSION_ATTRIBUTION_ENABLED = True
+T_CONSENT_DEFAULT_ON = 0.60   # Noul mass for "enabled by default" (raise direction)
+CONF_CONSENT_ACT = 0.75       # confident opt-in needed to lower (1 - this on the Noul)
+MAX_GUARDS_IN_STATE = 6       # per anchor scope; nearest to the anchor first
+MAX_STRINGS_IN_STATE = 8      # resolved string resources per state
+MAX_GUARD_DECLARATION_HOPS = 1  # same file, then one first-party hop via the receiver's type
+# Android platform permissions each permission-goal policy rests on, used only
+# to attribute a code finding to the source sets that declare the permission.
+POLICY_PERMISSIONS = {
+    "location_access_policy": (
+        "android.permission.ACCESS_FINE_LOCATION", "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_BACKGROUND_LOCATION"),
+    "contacts_access_policy": (
+        "android.permission.READ_CONTACTS", "android.permission.WRITE_CONTACTS",
+        "android.permission.GET_ACCOUNTS"),
+    "audio_recording_policy": ("android.permission.RECORD_AUDIO",),
+}
 T_ACCOUNT_DELETION = 0.60   # deterministic gate: snippet really deletes an account
 T_DECLARATION_COVERS = 0.50  # play_declaration: declaration covers a detected type
 

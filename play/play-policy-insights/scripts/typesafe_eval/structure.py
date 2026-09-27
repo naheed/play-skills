@@ -56,6 +56,7 @@ import dataclasses
 import logging
 import os
 import re
+from typing import Any
 from typing import Dict
 from typing import Iterable
 from typing import List
@@ -1470,6 +1471,317 @@ def destination_hints(
   if out:
     log.debug("destination hints in lines %d-%d: %s", start + 1, end,
               [(h.kind, h.line + 1, h.detail) for h in out])
+  return out
+
+
+# ---------------------------------------------------------------------------
+# Guard flags, declarations and string references (WP8).
+#
+# A transfer that runs only when a boolean is set is "opt-in" or "default-on"
+# depending on that boolean's declared default. The default lives at the
+# declaration (``var crashReports by booleanPref(true)``,
+# ``private boolean upload = false;``, ``prefs.getBoolean("upload", true)``),
+# often in another file. These helpers find the flags that guard a scope and
+# their declarations deterministically; the model receives them as priors.
+# ---------------------------------------------------------------------------
+
+#: Condition heads whose parenthesised (or bare, Kotlin/Python) expression is a guard.
+_CONDITION_HEAD_RE = re.compile(r"\b(?:if|else\s+if|elif|while|when)\b\s*(\(|)")
+#: Splits a condition into clauses at boolean operators.
+_BOOL_OP_RE = re.compile(r"\s*(?:&&|\|\||\band\b|\bor\b)\s*")
+#: A clause that is a bare (possibly negated, possibly dotted) identifier.
+_FLAG_CLAUSE_RE = re.compile(r"^(?P<neg>!|not\s+)?\s*(?P<ident>[A-Za-z_][\w.]*)\s*$")
+#: A clause that is a boolean-returning member call: ``x.isEnabled()``, ``settings.uploadAllowed()``.
+_FLAG_CALL_RE = re.compile(r"^(?P<neg>!|not\s+)?\s*(?P<ident>[A-Za-z_][\w.]*)\(\s*\)\s*$")
+#: A preference read with an inline default: ``prefs.getBoolean("k", true)``.
+_PREF_BOOL_RE = re.compile(
+    r"^(?P<neg>!|not\s+)?\s*(?P<recv>[A-Za-z_][\w.]*)\.getBoolean\(\s*(?P<key>[^,]+?)\s*,\s*(?P<default>true|false)\s*\)\s*$")
+_GUARD_KEYWORDS = frozenset({"true", "false", "null", "this", "it", "self", "None", "True", "False"})
+_DECL_KEYWORDS = ("val", "var", "boolean", "Boolean", "bool", "let", "const", "final", "private", "public",
+                  "protected", "internal", "static", "lateinit", "open", "override")
+_BOOL_LITERAL_RE = re.compile(r"\b(true|false|True|False)\b")
+
+
+@dataclasses.dataclass
+class GuardFlag:
+  """One boolean flag that guards a scope.
+
+  Attributes:
+    identifier: The flag as written, dotted receiver included
+      (``persistentState.crashReportsEnabled``, ``uploadEnabled``, or the
+      preference key for a ``getBoolean`` read).
+    line: 0-based line of the condition.
+    negated: True when the guarded code runs while the flag is *false*.
+    inline_default: The literal default of an inline ``getBoolean(key,
+      default)`` read (None otherwise).
+    call: True when the flag is a no-argument member call (``isEnabled()``).
+  """
+
+  identifier: str
+  line: int
+  negated: bool = False
+  inline_default: Optional[bool] = None
+  call: bool = False
+
+  @property
+  def name(self) -> str:
+    """The last identifier segment (the member/property name)."""
+    return self.identifier.rsplit(".", 1)[-1]
+
+  @property
+  def receiver(self) -> str:
+    """The dotted receiver before the last segment ('' when none)."""
+    return self.identifier.rsplit(".", 1)[0] if "." in self.identifier else ""
+
+
+@dataclasses.dataclass
+class Declaration:
+  """Where a flag is declared and what it is initialised to.
+
+  Attributes:
+    relpath: File of the declaration (the caller's own file or a first-party
+      callee reached in one hop).
+    line: 0-based line.
+    text: The declaration line, stripped and truncated.
+    initialiser: The right-hand side (after ``=`` or ``by``), if any.
+    default_on: True/False when exactly one boolean literal appears in the
+      initialiser (``= true``, ``booleanPreference(false)``, ``getBoolean(k,
+      true)``), else None.
+    resolution: ``same_file`` / ``receiver_type`` (one first-party hop) /
+      ``inline`` (a ``getBoolean`` default written at the guard).
+  """
+
+  relpath: str
+  line: int
+  text: str
+  initialiser: str
+  default_on: Optional[bool]
+  resolution: str
+
+  def to_state(self) -> Dict[str, Any]:
+    return {"file": self.relpath, "line": self.line + 1, "text": self.text,
+            "initialiser": self.initialiser, "default_on": self.default_on,
+            "resolution": self.resolution}
+
+
+def _condition_text(lines: Sequence[str], i: int) -> str:
+  """The condition expression of a control-flow head on line ``i`` ('' when none).
+
+  A parenthesised condition is read to its matching ``)``, continuing onto
+  following lines for multi-line conditions (bounded to 4 lines). A bare
+  Kotlin/Python condition (``if x:``, ``when`` subject) is the rest of the
+  line up to ``:`` / ``{`` / ``->``.
+  """
+  line = lines[i]
+  m = _CONDITION_HEAD_RE.search(line)
+  if not m:
+    return ""
+  if m.group(1) == "(":
+    depth, buf = 0, []
+    text = line[m.end() - 1:]
+    for k in range(i, min(len(lines), i + 4)):
+      seg = text if k == i else lines[k]
+      for ch in seg:
+        if ch == "(":
+          depth += 1
+        elif ch == ")":
+          depth -= 1
+          if depth == 0:
+            buf.append(ch)
+            return "".join(buf)[1:-1]
+        buf.append(ch)
+      buf.append(" ")
+    return ""
+  rest = line[m.end():]
+  for stop in (":", "{", "->"):
+    idx = rest.find(stop)
+    if idx >= 0:
+      rest = rest[:idx]
+  return rest.strip()
+
+
+def guard_flags(lines: Sequence[str], scope: Tuple[int, int]) -> List[GuardFlag]:
+  """Boolean flags guarding the lines in ``[scope[0], scope[1])``.
+
+  Reads every control-flow condition inside the scope (``if`` / ``else if`` /
+  ``elif`` / ``while`` / ``when``, single- or multi-line), splits it at
+  ``&&`` / ``||`` / ``and`` / ``or``, and keeps the clauses that are a bare
+  identifier (``!enabled``, ``prefs.uploadOn``), a no-argument member call
+  (``settings.isEnabled()``) or an inline preference read with a literal
+  default (``prefs.getBoolean("k", true)``). Comparisons, arithmetic and
+  calls with arguments are not guards (they are not a boolean *flag*).
+  Comments and imports are skipped. Deduplicated by identifier, first
+  occurrence wins, at most ``MAX_GUARDS_IN_STATE`` (nearest to the scope
+  start first, i.e. the outermost guards).
+  """
+  out: List[GuardFlag] = []
+  seen: set = set()
+  start, end = max(0, scope[0]), min(len(lines), scope[1])
+  for i in range(start, end):
+    stripped = lines[i].strip()
+    if not stripped or stripped.startswith(_COMMENT_PREFIXES) or stripped.startswith(_IMPORT_PREFIXES):
+      continue
+    cond = _condition_text(lines, i)
+    if not cond:
+      continue
+    for clause in _BOOL_OP_RE.split(cond):
+      clause = clause.strip()
+      while clause.startswith("(") and clause.endswith(")"):
+        clause = clause[1:-1].strip()
+      if not clause:
+        continue
+      pm = _PREF_BOOL_RE.match(clause)
+      fm = _FLAG_CLAUSE_RE.match(clause) or _FLAG_CALL_RE.match(clause)
+      if pm:
+        key = pm.group("key").strip().strip("\"'")
+        flag = GuardFlag(f"{pm.group('recv')}.getBoolean({key})", i, bool(pm.group("neg")),
+                         inline_default=(pm.group("default") == "true"))
+      elif fm:
+        ident = fm.group("ident")
+        if ident in _GUARD_KEYWORDS or ident.rsplit(".", 1)[-1] in _GUARD_KEYWORDS:
+          continue
+        if not any(ch.isalpha() for ch in ident.rsplit(".", 1)[-1]):
+          continue
+        flag = GuardFlag(ident, i, bool(fm.group("neg")), call=bool(_FLAG_CALL_RE.match(clause)))
+      else:
+        continue
+      if flag.identifier in seen:
+        continue
+      seen.add(flag.identifier)
+      out.append(flag)
+      if len(out) >= constants.MAX_GUARDS_IN_STATE:
+        log.debug("guard_flags: cap %d reached in lines %d-%d", constants.MAX_GUARDS_IN_STATE, start + 1, end)
+        return out
+  if out:
+    log.debug("guard_flags in lines %d-%d: %s", start + 1, end,
+              [(g.identifier, g.line + 1, g.negated, g.inline_default) for g in out])
+  return out
+
+
+def _default_from_initialiser(initialiser: str) -> Optional[bool]:
+  literals = _BOOL_LITERAL_RE.findall(initialiser)
+  if len(literals) != 1:
+    return None
+  return literals[0].lower() == "true"
+
+
+def _declaration_in_lines(lines: Sequence[str], name: str) -> Optional[Tuple[int, str, str]]:
+  """``(line, text, initialiser)`` of the first declaration of ``name`` in ``lines``.
+
+  A declaration line starts (after modifiers) with a declaration keyword or a
+  boolean type, names ``name`` at an identifier boundary before any ``=`` /
+  ``by``, and is not a control-flow line. Kotlin ``val``/``var`` (with ``by``
+  delegates), Java/C# ``boolean``/``bool``/``Boolean`` fields, Python
+  assignments at class/module level (``NAME = True``) are recognised.
+  """
+  name_re = re.compile(rf"(?<![\w.]){re.escape(name)}(?!\w)")
+  for i, raw in enumerate(lines):
+    line = raw.strip()
+    if not line or line.startswith(_COMMENT_PREFIXES) or line.startswith(_IMPORT_PREFIXES):
+      continue
+    if _CONDITION_HEAD_RE.search(line):
+      continue
+    head, sep, tail = line.partition("=")
+    if not sep:
+      m = re.match(r"^(.*?)\bby\b(.*)$", line)
+      if not m:
+        continue
+      head, tail = m.group(1), m.group(2)
+    if "==" in line[:len(head) + 2] or head.rstrip().endswith(("!", "<", ">")):
+      continue
+    if not name_re.search(head):
+      continue
+    first = head.strip().split()
+    if not first:
+      continue
+    has_kw = any(tok in _DECL_KEYWORDS for tok in first) or first[0] == name
+    if not has_kw:
+      continue
+    initialiser = tail.strip().rstrip(";").strip()
+    return i, line[:160], initialiser
+  return None
+
+
+def _receiver_type(lines: Sequence[str], receiver: str) -> Optional[str]:
+  """The declared type name of a receiver variable in ``lines`` (``val ps: PersistentState``,
+  ``private val ps by inject<PersistentState>()``, ``PersistentState ps = ...``,
+  ``val ps = PersistentState(...)``). A capitalised receiver is its own type.
+  Returns None when not found."""
+  base = receiver.split(".")[0]
+  if base[:1].isupper():
+    return base
+  pats = [
+      rf"\b{re.escape(base)}\s*:\s*([A-Z]\w*)",
+      rf"\b{re.escape(base)}\b[^=\n]*\binject<([A-Z]\w*)>",
+      rf"\b([A-Z]\w*)\s+{re.escape(base)}\s*[=;]",
+      rf"\b{re.escape(base)}\s*=\s*([A-Z]\w*)\s*\(",
+  ]
+  for raw in lines:
+    line = raw.strip()
+    if not line or line.startswith(_COMMENT_PREFIXES):
+      continue
+    for pat in pats:
+      m = re.search(pat, line)
+      if m:
+        return m.group(1)
+  return None
+
+
+def declaration_of(
+    flag: GuardFlag, fs: FileStructure, index: Optional["FirstPartyIndex"] = None, app_dir: str = "",
+) -> Optional[Declaration]:
+  """Finds where a guard flag is declared and its initialiser.
+
+  Order: an inline ``getBoolean`` default is the declaration
+  (``resolution: inline``); then the flag's own file (``same_file``); then,
+  when the flag has a receiver, the receiver's declared type is resolved
+  through the first-party ``index`` (``FirstPartyIndex.resolve``) and that
+  file is searched (``receiver_type``; one hop, bounded by
+  ``MAX_GUARD_DECLARATION_HOPS``). A member call (``isEnabled()``) is looked
+  up by its member name. Returns None when nothing is found -- the model then
+  sees the flag without a default, which is exactly the uncertainty.
+  """
+  if flag.inline_default is not None:
+    return Declaration(fs.relpath, flag.line, fs.lines[flag.line].strip()[:160],
+                       f"getBoolean(default={str(flag.inline_default).lower()})", flag.inline_default, "inline")
+  found = _declaration_in_lines(fs.lines, flag.name)
+  if found:
+    i, text, init = found
+    return Declaration(fs.relpath, i, text, init, _default_from_initialiser(init), "same_file")
+  if not flag.receiver or index is None or not app_dir or constants.MAX_GUARD_DECLARATION_HOPS < 1:
+    return None
+  type_name = _receiver_type(fs.lines, flag.receiver)
+  if not type_name:
+    log.debug("declaration_of %s: receiver type of %r not found in %s", flag.identifier, flag.receiver, fs.relpath)
+    return None
+  ref = index.resolve(type_name, fs)
+  if ref is None:
+    log.debug("declaration_of %s: type %s not first-party", flag.identifier, type_name)
+    return None
+  try:
+    callee_lines = _read(os.path.join(app_dir, ref.relpath)).splitlines()
+  except OSError as exc:
+    log.warning("declaration_of %s: cannot read %s: %s", flag.identifier, ref.relpath, exc)
+    return None
+  found = _declaration_in_lines(callee_lines, flag.name)
+  if not found:
+    log.debug("declaration_of %s: no declaration of %s in %s", flag.identifier, flag.name, ref.relpath)
+    return None
+  i, text, init = found
+  return Declaration(ref.relpath, i, text, init, _default_from_initialiser(init), "receiver_type")
+
+
+_R_STRING_REF_RE = re.compile(r"\bR\.string\.(\w+)")
+
+
+def string_references(lines: Sequence[str], line_numbers: Sequence[int]) -> List[str]:
+  """Distinct ``R.string.<name>`` names on the given 0-based lines, in order of appearance."""
+  out: List[str] = []
+  for i in line_numbers:
+    if 0 <= i < len(lines):
+      for name in _R_STRING_REF_RE.findall(lines[i]):
+        if name not in out:
+          out.append(name)
   return out
 
 

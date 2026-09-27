@@ -1394,6 +1394,379 @@ def _test_app_purpose() -> None:
            and triage5["app_purpose"]["source"] == "model", json.dumps(triage5.get("app_purpose")))
 
 
+def _test_consent_defaults() -> None:
+  """WP8: consent defaults (guards), string resources and flavour attribution.
+
+  Covers: guard-flag parsing (bare / negated / dotted / member call /
+  ``getBoolean`` inline default / multi-line condition; comparisons and
+  literals are not guards; cap), declaration lookup (``inline`` /
+  ``same_file`` / ``receiver_type`` one hop through the first-party index;
+  test source never resolves), the ``consent_default_on`` battery question,
+  the state blocks (``guards`` and ``strings`` present only when non-empty,
+  disclosure-line strings included), the heuristic client's prior, the
+  composition (raise / lower double gate / guard veto / low confidence /
+  uncorroborated / disabled / not for applied destinations), the evidence
+  suffix, ``AppProfile.partial_sources`` and ``engine._attribute_sources``.
+  """
+  from typesafe_eval import android_manifest as am
+  from typesafe_eval import capabilities as caps
+  from typesafe_eval import client as clientmod
+  from typesafe_eval import constants
+  from typesafe_eval import context
+  from typesafe_eval import engine
+  from typesafe_eval import resources
+  from typesafe_eval import structure
+  from typesafe_eval.client import JevAnswer
+
+  # --- structure: guard flags -------------------------------------------------
+  src = (
+      "package com.w8.ui\n"
+      "import java.net.URL\n"
+      "import com.w8.settings.PersistentState\n"
+      "class Reporter(private val ps: PersistentState) {\n"
+      "  private var allow = true\n"
+      "  var uploadEnabled: Boolean = false\n"
+      "  // if (commentedOut) { never a guard }\n"
+      "  fun send(report: String) {\n"
+      "    if (!BuildConfig.DEBUG && ps.crashReportsEnabled) {\n"
+      "      if (allow || count > 3) {\n"
+      "        if (settings.isTelemetryOn()\n"
+      "            && prefs.getBoolean(\"share_stats\", true)) {\n"
+      "          URL(\"https://crash.example.com\").openConnection()\n"
+      "        }\n"
+      "      }\n"
+      "    }\n"
+      "    if (uploadEnabled) { post(report) }\n"
+      "    if (report.isEmpty() || true || x == null) { return }\n"
+      "  }\n"
+      "  fun disclose() { dialog.setMessage(R.string.crash_consent_body); title(R.string.crash_consent_title) }\n"
+      "}\n"
+  ).splitlines()
+  flags = structure.guard_flags(src, (7, 19))
+  by_id = {f.identifier: f for f in flags}
+  _check("guard_flags_found",
+         set(by_id) >= {"BuildConfig.DEBUG", "ps.crashReportsEnabled", "allow", "settings.isTelemetryOn",
+                        "prefs.getBoolean(share_stats)", "uploadEnabled"},
+         str(sorted(by_id)))
+  _check("guard_flags_negation", by_id["BuildConfig.DEBUG"].negated is True and by_id["allow"].negated is False)
+  _check("guard_flags_call", by_id["settings.isTelemetryOn"].call is True and by_id["allow"].call is False)
+  _check("guard_flags_inline_default", by_id["prefs.getBoolean(share_stats)"].inline_default is True)
+  _check("guard_flags_multiline_condition", by_id["prefs.getBoolean(share_stats)"].line == 10, str(by_id["prefs.getBoolean(share_stats)"]))
+  _check("guard_flags_not_comparisons_or_literals",
+         not any(k in by_id for k in ("count", "report.isEmpty", "true", "x", "null")), str(sorted(by_id)))
+  _check("guard_flags_skips_comments", "commentedOut" not in by_id)
+  _check("guard_flags_receiver_name", by_id["ps.crashReportsEnabled"].receiver == "ps"
+         and by_id["ps.crashReportsEnabled"].name == "crashReportsEnabled")
+  _check("guard_flags_cap", len(flags) <= constants.MAX_GUARDS_IN_STATE)
+  _check("guard_flags_empty_scope", structure.guard_flags(src, (19, 21)) == [])
+  # Python / bare Kotlin heads.
+  py = ["if not self.upload_enabled:", "    send()", "elif telemetry and not debug:", "    pass"]
+  py_ids = {(f.identifier, f.negated) for f in structure.guard_flags(py, (0, 4))}
+  _check("guard_flags_python_heads", py_ids >= {("self.upload_enabled", True), ("telemetry", False), ("debug", True)}, str(py_ids))
+
+  # --- structure: declarations ----------------------------------------------
+  with tempfile.TemporaryDirectory() as d:
+    def write(rel, text):
+      full = os.path.join(d, rel)
+      os.makedirs(os.path.dirname(full), exist_ok=True)
+      with open(full, "w", encoding="utf-8") as f:
+        f.write(text)
+
+    main_src = "app/src/main/java/com/w8"
+    write(f"{main_src}/settings/PersistentState.kt",
+          "package com.w8.settings\nclass PersistentState {\n"
+          "  // crashReportsEnabled is documented here\n"
+          "  var crashReportsEnabled by booleanPref(true)\n"
+          "  var telemetry: Boolean = false\n}\n")
+    write("app/src/test/java/com/w8/settings/PersistentState.kt",
+          "package com.w8.settings\nclass PersistentState { var crashReportsEnabled = false }\n")
+    caller_rel = f"{main_src}/ui/Reporter.kt"
+    write(caller_rel, "\n".join(src) + "\n")
+    index = structure.build_first_party_index(d)
+    fs = structure.analyze_file(d, caller_rel)
+
+    same = structure.declaration_of(by_id["allow"], fs, index, d)
+    _check("decl_same_file_true", same is not None and same.resolution == "same_file" and same.default_on is True
+           and same.line == 4, str(same))
+    off = structure.declaration_of(by_id["uploadEnabled"], fs, index, d)
+    _check("decl_same_file_false_typed", off is not None and off.default_on is False and off.initialiser == "false", str(off))
+    inline = structure.declaration_of(by_id["prefs.getBoolean(share_stats)"], fs, index, d)
+    _check("decl_inline", inline is not None and inline.resolution == "inline" and inline.default_on is True
+           and inline.line == 10, str(inline))
+    hop = structure.declaration_of(by_id["ps.crashReportsEnabled"], fs, index, d)
+    _check("decl_receiver_type_one_hop",
+           hop is not None and hop.resolution == "receiver_type" and hop.default_on is True
+           and hop.relpath == f"{main_src}/settings/PersistentState.kt" and hop.line == 3
+           and "by booleanPref(true)" in hop.text, str(hop))
+    _check("decl_unresolved_platform_receiver",
+           structure.declaration_of(by_id["settings.isTelemetryOn"], fs, index, d) is None)
+    _check("decl_capitalised_receiver_not_first_party",
+           structure.declaration_of(by_id["BuildConfig.DEBUG"], fs, index, d) is None)
+    _check("decl_no_hop_without_index", structure.declaration_of(by_id["ps.crashReportsEnabled"], fs, None, "") is None)
+    _check("decl_default_two_literals_none",
+           structure._default_from_initialiser("if (a) true else false") is None  # pylint: disable=protected-access
+           and structure._default_from_initialiser("getBoolean(k, false)") is False)  # pylint: disable=protected-access
+    java = ["public class S {", "  private boolean upload = false;", "  int uploadCount = 3;",
+            "  if (upload == true) {}", "}"]
+    jd = structure._declaration_in_lines(java, "upload")  # pylint: disable=protected-access
+    _check("decl_java_field", jd is not None and jd[0] == 1 and jd[2] == "false", str(jd))
+    _check("decl_java_not_prefix_match", structure._declaration_in_lines(java, "uploadC") is None)  # pylint: disable=protected-access
+
+    # --- context: guards + strings in the state --------------------------------
+    net = caps.CapabilityProfile("java.net.URL", "import", {"NETWORK_EGRESS": 0.9}, ["NETWORK_EGRESS"], "model", "m")
+    profiles = {"java.net.URL": net}
+    res = resources.ResourceIndex(strings={"crash_consent_title": "Send crash reports?",
+                                           "crash_consent_body": "Help us fix bugs by sending anonymous reports."})
+    state, per_ask = context.build_file_state(
+        fs, [("CRASH_LOGS", "report")], profiles, {"package": "com.w8"}, d,
+        first_party_index=index, resources=res)
+    guards = state.get("guards") or []
+    gflags = {g["flag"]: g for g in guards}
+    _check("state_guards_present", guards and all(g["data_type"] == "CRASH_LOGS" for g in guards)
+           and set(gflags) >= {"ps.crashReportsEnabled"}, str(sorted(gflags)))
+    crash_guard = gflags.get("ps.crashReportsEnabled", {})
+    _check("state_guard_declaration_shape",
+           crash_guard.get("default_on") is True and crash_guard.get("runs_when") == "true"
+           and (crash_guard.get("declaration") or {}).get("resolution") == "receiver_type"
+           and crash_guard["declaration"]["line"] == 4
+           and set(crash_guard["declaration"]) == {"file", "line", "text", "initialiser", "default_on", "resolution"},
+           str(crash_guard))
+    _check("state_mini_guard_defaults", True in per_ask[0]["anchor"]["guard_defaults"] and per_ask[0].get("guards"),
+           str(per_ask[0]["anchor"]))
+    strings = state.get("strings") or {}
+    _check("state_strings_from_scope_or_disclosure_lines",
+           strings.get("crash_consent_title") == "Send crash reports?" or strings == {} or "crash_consent_body" in strings,
+           str(strings))
+    # Strings on the anchor lines resolve; unknown names map to None.
+    fs_str = structure.FileStructure("D.kt", "kotlin",
+                                     ["import java.net.URL", "fun f() {", "  show(R.string.crash_consent_title, R.string.missing_one)",
+                                      "  URL(x).openStream()", "}"], ["java.net.URL"],
+                                     structure.symbol_references(["import java.net.URL", "fun f() {", "  show()", "  URL(x).openStream()", "}"],
+                                                                 ["java.net.URL"]), "com.w8")
+    st2, pa2 = context.build_file_state(fs_str, [("CRASH_LOGS", "show(")], profiles, {"package": "com.w8"}, resources=res)
+    _check("state_strings_resolved_and_unknown",
+           st2.get("strings") == {"crash_consent_title": "Send crash reports?", "missing_one": None}
+           and pa2[0].get("strings") == st2["strings"], str(st2.get("strings")))
+    _check("state_strings_absent_without_resources",
+           "strings" not in context.build_file_state(fs_str, [("CRASH_LOGS", "show(")], profiles, {"package": "com.w8"})[0])
+    plain = ["import java.net.URL", "fun f() {", "  val r = report()", "  URL(x).openStream()", "}"]
+    fs_plain = structure.FileStructure("P.kt", "kotlin", plain, ["java.net.URL"],
+                                       structure.symbol_references(plain, ["java.net.URL"]), "com.w8")
+    st3, pa3 = context.build_file_state(fs_plain, [("CRASH_LOGS", "report()")], profiles, {"package": "com.w8"}, resources=res)
+    _check("state_guards_absent_without_conditions",
+           "guards" not in st3 and "guards" not in pa3[0] and pa3[0]["anchor"]["guard_defaults"] == []
+           and "strings" not in st3, str(st3.keys()))
+
+  # --- questions -------------------------------------------------------------
+  battery = q.data_safety_battery("CRASH_LOGS", "crash logs")
+  _check("consent_battery_has_question", battery["consent_default_on"]["type"] == "noul"
+         and "guards" in battery["consent_default_on"]["instructions"]
+         and list(battery).index("consent_default_on") < list(battery).index("destination_class"))
+  _check("consent_disclosure_questions_name_strings",
+         "strings" in battery["has_prominent_disclosure"]["instructions"]
+         and "strings" in battery["disclosure_status"]["instructions"])
+
+  # --- heuristic client prior --------------------------------------------------
+  prior = clientmod.HeuristicJevClient._consent_prior  # pylint: disable=protected-access
+  _check("consent_prior_no_guards_default_on", prior({}) == 0.85)
+  _check("consent_prior_any_off_wins", prior({"guards": [{"default_on": True}, {"default_on": False}]}) == 0.15)
+  _check("consent_prior_unknown_half", prior({"guards": [{"default_on": None}]}) == 0.5)
+  hc = clientmod.HeuristicJevClient()
+  ans = hc.system_one({"signal": {"data_type": "CRASH_LOGS"}, "guards": [{"default_on": False}], "app": {}},
+                      {"consent_default_on": battery["consent_default_on"]})
+  _check("consent_prior_wired", abs(ans["consent_default_on"].noul - 0.15) < 1e-9, str(ans))
+
+  # --- evaluate: composition ---------------------------------------------------
+  def _answers(p_consent, p_transmit=0.95, status="MISSING", cls="developer_backend"):
+    n = len(q.DESTINATION_CLASS_OPTIONS)
+    probs = {o: (0.9 if o == cls else 0.1 / (n - 1)) for o in q.DESTINATION_CLASS_OPTIONS}
+    a = {
+        "signal_relevant": JevAnswer("noul", noul=0.9),
+        "transmits_offdevice": JevAnswer("noul", noul=p_transmit),
+        "user_initiated": JevAnswer("noul", noul=0.2),
+        "destination_class": JevAnswer("choice", choice=cls, probabilities=probs, confidence=0.9),
+        "has_prominent_disclosure": JevAnswer("noul", noul=0.9 if status == "DISCLOSED" else 0.1),
+        "disclosure_status": JevAnswer("choice", choice=status),
+        "severity": JevAnswer("score", score=0.6),
+    }
+    if p_consent is not None:
+      a["consent_default_on"] = JevAnswer("noul", noul=p_consent)
+    return a
+
+  def _state(guards):
+    s = {
+        "signal": {"data_type": "CRASH_LOGS", "matched_pattern": "report", "file": "Reporter.kt",
+                   "line": 13, "matched_line": "URL(...)", "all_lines": [13]},
+        "code_snippet": "L13: URL(...)",
+        "sinks": [{"symbol": "URL", "capabilities": ["NETWORK_EGRESS"], "lines": [13]}],
+        "anchor": {"scope": [8, 19], "proximity": 0, "sink_in_scope": True, "tier": 0,
+                   "scope_capabilities": ["NETWORK_EGRESS"], "destination_hints": [],
+                   "guard_defaults": [g.get("default_on") for g in guards if g.get("declaration")]},
+        "app": {},
+    }
+    if guards:
+      s["guards"] = guards
+    return s
+
+  on_guard = {"flag": "ps.crashReportsEnabled", "line": 9, "runs_when": "true", "default_on": True,
+              "declaration": {"file": "settings/PersistentState.kt", "line": 4, "text": "var crashReportsEnabled by booleanPref(true)",
+                              "initialiser": "booleanPref(true)", "default_on": True, "resolution": "receiver_type"}}
+  off_guard = {"flag": "uploadEnabled", "line": 17, "runs_when": "true", "default_on": False,
+               "declaration": {"file": "Reporter.kt", "line": 6, "text": "var uploadEnabled: Boolean = false",
+                               "initialiser": "false", "default_on": False, "resolution": "same_file"}}
+  unknown_guard = {"flag": "settings.isTelemetryOn", "line": 11, "runs_when": "true", "default_on": None, "declaration": None}
+  compose = evaluate._compose_data_safety_finding  # pylint: disable=protected-access
+  # CRASH_LOGS is not a sensitive type: an undisclosed transfer starts IMPORTANT.
+  base_f = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([]), _answers(None), "test")
+  _check("consent_not_asked_no_change", base_f["severity"] == "IMPORTANT" and base_f["consent_default_on"] is None
+         and base_f["decision_trace"]["consent"]["action"] == "none"
+         and base_f["decision_trace"]["consent"]["corroboration"] == "not_applicable", str(base_f["decision_trace"]["consent"]))
+  # Raise: default-on with a corroborating guard.
+  raised = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([on_guard]), _answers(0.9), "test")
+  _check("consent_raise_guard_default_on",
+         raised["severity"] == "CRITICAL" and raised["consent_default_on"] is True
+         and raised["decision_trace"]["consent"]["action"] == "raise"
+         and raised["decision_trace"]["consent"]["corroboration"] == "guard_default_on"
+         and raised["issue_summary"].endswith("[enabled by default]")
+         and raised.get("needs_manual_review") is None
+         and raised["policy_id"] == "prominent_disclosure_policy",
+         str((raised["severity"], raised["issue_summary"], raised["decision_trace"]["consent"])))
+  _check("consent_evidence_suffix",
+         "[guard ps.crashReportsEnabled default=true @settings/PersistentState.kt:L4]" in raised["evidence"]
+         and raised["evidence_flow"]["guards"][0]["flag"] == "ps.crashReportsEnabled", raised["evidence"])
+  _check("consent_trace_shape",
+         set(raised["decision_trace"]["consent"]) >= {"p_default_on", "guards", "guard_defaults", "default_on", "action", "corroboration", "enabled"}
+         and raised["decision_trace"]["consent"]["guards"][0]["declaration"] == "settings/PersistentState.kt:L4"
+         and raised["decision_trace"]["anchor"]["guard_defaults"] == [True]
+         and raised["decision_trace"]["thresholds"]["T_CONSENT_DEFAULT_ON"] == constants.T_CONSENT_DEFAULT_ON,
+         str(raised["decision_trace"]["consent"]))
+  # Raise: unconditional (no guards) and model-only (unresolved guard).
+  uncond = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([]), _answers(0.7), "test")
+  _check("consent_raise_unconditional", uncond["severity"] == "CRITICAL"
+         and uncond["decision_trace"]["consent"]["corroboration"] == "unconditional")
+  model_only = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([unknown_guard]), _answers(0.7), "test")
+  _check("consent_raise_model_only", model_only["severity"] == "CRITICAL"
+         and model_only["decision_trace"]["consent"]["corroboration"] == "model_only"
+         and "[guard settings.isTelemetryOn default=unknown]" in model_only["evidence"], model_only["evidence"])
+  # Veto: model says default-on but a guard is declared default-off -> unchanged, review.
+  veto = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([off_guard]), _answers(0.9), "test")
+  _check("consent_vetoed_by_guard", veto["severity"] == "IMPORTANT" and veto["consent_default_on"] is None
+         and veto["decision_trace"]["consent"]["corroboration"] == "vetoed_by_guard"
+         and veto.get("needs_manual_review") is True
+         and "[consent default unclear: model default-on vs guard default-off; verify]" in veto["issue_summary"],
+         str((veto["severity"], veto["issue_summary"])))
+  # Lower: double gate (confident opt-in AND a default-off guard).
+  lowered = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([off_guard]), _answers(0.1), "test")
+  _check("consent_lower_double_gate",
+         lowered["severity"] == "SUGGESTION" and lowered["consent_default_on"] is False
+         and lowered["decision_trace"]["consent"]["action"] == "lower"
+         and lowered.get("needs_manual_review") is True
+         and lowered["prominent_disclosure_status"] == "MISSING"
+         and "[opt-in: uploadEnabled default=false; verify toggle text]" in lowered["issue_summary"],
+         str((lowered["severity"], lowered["issue_summary"])))
+  # No lower without the deterministic half ...
+  uncorr = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([unknown_guard]), _answers(0.1), "test")
+  _check("consent_no_lower_without_guard", uncorr["severity"] == "IMPORTANT"
+         and uncorr["decision_trace"]["consent"]["corroboration"] == "uncorroborated"
+         and uncorr["consent_default_on"] is None)
+  no_guard_low = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([]), _answers(0.1), "test")
+  _check("consent_no_lower_unconditional", no_guard_low["severity"] == "IMPORTANT")
+  # ... nor with a mid-band answer (low confidence either way).
+  mid = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([off_guard]), _answers(0.4), "test")
+  _check("consent_low_confidence_no_change", mid["severity"] == "IMPORTANT"
+         and mid["decision_trace"]["consent"]["corroboration"] == "low_confidence")
+  # Mixed guards: any default-off vetoes the raise.
+  mixed = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([on_guard, off_guard]), _answers(0.9), "test")
+  _check("consent_mixed_guards_veto", mixed["severity"] == "IMPORTANT"
+         and mixed["decision_trace"]["consent"]["corroboration"] == "vetoed_by_guard")
+  # Not applicable: disclosed transfer, local-only, and an applied non-collection destination.
+  disclosed = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([on_guard]), _answers(0.9, status="DISCLOSED"), "test")
+  _check("consent_not_for_disclosed", disclosed["severity"] == "SUGGESTION"
+         and disclosed["decision_trace"]["consent"]["action"] == "none")
+  local = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([on_guard]), _answers(0.9, p_transmit=0.05), "test")
+  _check("consent_not_for_local", local["severity"] == "SUGGESTION" and local["decision_trace"]["consent"]["action"] == "none")
+  applied_state = _state([on_guard])
+  applied_state["anchor"]["destination_hints"] = ["USER_CHOSEN_DESTINATION"]
+  applied_state["destination_hints"] = [{"hint": "USER_CHOSEN_DESTINATION", "line": 9, "detail": "chooser", "evidence": "x"}]
+  applied = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", applied_state,
+                    _answers(0.9, cls="user_chosen_destination"), "test")
+  _check("consent_not_for_applied_destination", applied["severity"] == "SUGGESTION"
+         and applied["decision_trace"]["consent"]["action"] == "none", str(applied["decision_trace"]["destination"]))
+  # Sensitive type already CRITICAL: raise is a no-op on severity, still traced as default-on.
+  sens_state = _state([on_guard])
+  sens_state["signal"]["data_type"] = "EMAILS"
+  sens = compose("EMAILS", "Reporter.kt (Pattern: report)", sens_state, _answers(0.9), "test")
+  _check("consent_sensitive_already_critical", sens["severity"] == "CRITICAL" and sens["consent_default_on"] is True
+         and sens["decision_trace"]["consent"]["action"] == "none")
+  # Rollback flag.
+  saved = constants.CONSENT_DEFAULT_ENABLED
+  try:
+    constants.CONSENT_DEFAULT_ENABLED = False
+    off_f = compose("CRASH_LOGS", "Reporter.kt (Pattern: report)", _state([on_guard]), _answers(0.9), "test")
+    _check("consent_disabled_traced_only", off_f["severity"] == "IMPORTANT" and off_f["consent_default_on"] is None
+           and off_f["decision_trace"]["consent"]["enabled"] is False
+           and off_f["decision_trace"]["consent"]["p_default_on"] == 0.9)
+  finally:
+    constants.CONSENT_DEFAULT_ENABLED = saved
+
+  # --- android_manifest: partial_sources ---------------------------------------
+  profile = am.AppProfile(source_sets=["main", "play", "fdroid"])
+  profile.permissions = {
+      "android.permission.ACCESS_FINE_LOCATION": am.Permission("android.permission.ACCESS_FINE_LOCATION", sources=["play"]),
+      "android.permission.RECORD_AUDIO": am.Permission("android.permission.RECORD_AUDIO", sources=["main"]),
+      "android.permission.READ_CONTACTS": am.Permission("android.permission.READ_CONTACTS", sources=["main", "play"]),
+      "android.permission.INTERNET": am.Permission("android.permission.INTERNET"),
+      "android.permission.GET_ACCOUNTS": am.Permission("android.permission.GET_ACCOUNTS", sources=["fdroid"]),
+  }
+  ps = profile.partial_sources
+  _check("partial_sources_flavour_only", ps(profile.permissions["android.permission.ACCESS_FINE_LOCATION"]) == ["play"])
+  _check("partial_sources_main_none", ps(profile.permissions["android.permission.RECORD_AUDIO"]) is None
+         and ps(profile.permissions["android.permission.READ_CONTACTS"]) is None)
+  _check("partial_sources_no_sources_none", ps(profile.permissions["android.permission.INTERNET"]) is None)
+  _check("partial_sources_unshipped_flavour_none", ps(profile.permissions["android.permission.GET_ACCOUNTS"]) is None)
+  no_play = am.AppProfile(source_sets=["main", "foss"])
+  _check("partial_sources_all_shipped_none",
+         no_play.partial_sources(am.Permission("x", sources=["main", "foss"])) is None
+         and no_play.partial_sources(am.Permission("x", sources=["foss"])) == ["foss"])
+  svc = am.Component("service", "com.w8.Svc", sources=["play"])
+  profile.components = [svc]
+  _check("partial_sources_component", ps(svc) == ["play"])
+
+  # --- engine: attribution ------------------------------------------------------
+  ctx = engine.RunContext(temp_dir="", app_dir="", app_facts={}, manifest={}, profile=profile)
+  f_perm = {"policy_id": "x", "files_involved": ["AndroidManifest.xml"],
+            "decision_trace": {"permission": "android.permission.ACCESS_FINE_LOCATION"}}
+  engine._attribute_sources(ctx, f_perm, "x")  # pylint: disable=protected-access
+  _check("attribute_sources_manifest_permission", f_perm.get("manifest_sources") == ["play"]
+         and f_perm["decision_trace"]["manifest_sources"] == ["play"]
+         and ctx.counters.get("manifest_sources_attributed") == 1, str(f_perm))
+  f_svc = {"policy_id": "fgs", "decision_trace": {"service": "com.w8.Svc"}}
+  engine._attribute_sources(ctx, f_svc, "fgs")  # pylint: disable=protected-access
+  _check("attribute_sources_service", f_svc.get("manifest_sources") == ["play"])
+  f_code = {"policy_id": "location_access_policy", "files_involved": ["a/B.kt"], "decision_trace": {}}
+  engine._attribute_sources(ctx, f_code, "location_access_policy")  # pylint: disable=protected-access
+  _check("attribute_sources_policy_permissions", f_code.get("manifest_sources") == ["play"], str(f_code))
+  f_main = {"policy_id": "audio_recording_policy", "decision_trace": {}}
+  engine._attribute_sources(ctx, f_main, "audio_recording_policy")  # pylint: disable=protected-access
+  _check("attribute_sources_main_untouched", "manifest_sources" not in f_main
+         and "manifest_sources" not in f_main["decision_trace"])
+  f_other = {"policy_id": "photo_video_policy", "decision_trace": {}}
+  engine._attribute_sources(ctx, f_other, "photo_video_policy")  # pylint: disable=protected-access
+  _check("attribute_sources_unmapped_policy_untouched", "manifest_sources" not in f_other)
+  ctx_none = engine.RunContext(temp_dir="", app_dir="", app_facts={}, manifest={})
+  f_np = {"decision_trace": {"permission": "android.permission.ACCESS_FINE_LOCATION"}}
+  engine._attribute_sources(ctx_none, f_np, "x")  # pylint: disable=protected-access
+  _check("attribute_sources_no_profile_noop", "manifest_sources" not in f_np)
+  saved_attr = constants.PERMISSION_ATTRIBUTION_ENABLED
+  try:
+    constants.PERMISSION_ATTRIBUTION_ENABLED = False
+    f_off = {"decision_trace": {"permission": "android.permission.ACCESS_FINE_LOCATION"}}
+    engine._attribute_sources(ctx, f_off, "x")  # pylint: disable=protected-access
+    _check("attribute_sources_disabled_noop", "manifest_sources" not in f_off)
+  finally:
+    constants.PERMISSION_ATTRIBUTION_ENABLED = saved_attr
+
+
 def _test_callee_resolution() -> None:
   """WP6: one-hop first-party callee resolution (index, state, ranking, evidence, engine)."""
   from typesafe_eval import capabilities as capsmod
@@ -2432,6 +2805,7 @@ def main() -> int:
   _test_app_purpose()
   _test_callee_resolution()
   _test_destination_class()
+  _test_consent_defaults()
   _test_relevance_token_embedded()
   print()
   if _FAILURES:

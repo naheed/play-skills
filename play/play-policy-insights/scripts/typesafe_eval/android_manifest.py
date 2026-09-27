@@ -359,6 +359,24 @@ class AppProfile:
       return [s for s in self.source_sets if s in constants.PRIORITIZED_FLAVORS]
     return list(self.source_sets)
 
+  def partial_sources(self, entry: Any) -> Optional[List[str]]:
+    """The shipped source sets that declare ``entry`` when they are a strict subset (WP8).
+
+    A permission or component declared only by a flavour (``play`` but not
+    ``main``) affects one build variant; a reviewer needs to know which.
+    Returns the declaring shipped source sets in merge order, or None when the
+    entry is declared in every shipped source set, in ``main`` (which every
+    variant merges), or has no source attribution at all (fallback profile).
+    """
+    sources = list(getattr(entry, "sources", None) or [])
+    if not sources or "main" in sources:
+      return None
+    shipped = self.prioritized_source_sets()
+    declaring = [s for s in shipped if s in sources]
+    if not declaring or len(declaring) >= len(shipped):
+      return None
+    return declaring
+
   def ships_in_play_build(self, entry: Any) -> bool:
     """True when a :class:`Component` / :class:`Permission` is in the Play build.
 

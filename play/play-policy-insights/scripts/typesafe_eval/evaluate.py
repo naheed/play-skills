@@ -158,6 +158,8 @@ def _decision_trace(
           "T_DISCLOSURE": constants.T_DISCLOSURE,
           "T_THIRD_PARTY": constants.T_THIRD_PARTY,
           "T_SHARING_MASS": constants.T_SHARING_MASS,
+          "T_CONSENT_DEFAULT_ON": constants.T_CONSENT_DEFAULT_ON,
+          "CONF_CONSENT_ACT": constants.CONF_CONSENT_ACT,
           "CONF_DESTINATION_ACT": constants.CONF_DESTINATION_ACT,
           "DESTINATION_CLASS_ENABLED": constants.DESTINATION_CLASS_ENABLED,
           "provenance": constants.THRESHOLD_PROVENANCE,
@@ -174,6 +176,9 @@ def _decision_trace(
           "callee_in_scope": anchor.get("callee_in_scope"),
           "callee_capabilities": anchor.get("callee_capabilities"),
           "destination_hints": anchor.get("destination_hints"),
+          # WP8: declared defaults of the boolean guards around the anchor
+          # (``{flag: True|False|None}``); None when no guard was found.
+          "guard_defaults": anchor.get("guard_defaults"),
       },
       # WP7: the deterministic destination priors read from the anchor scope
       # (kind, line, why, source line). Empty when none was found.
@@ -495,6 +500,116 @@ def compose_destination(
             cls, confidence, sharing_mass, hints, sharing, confirmed, corroboration)
   return Destination(cls, confidence, probabilities, hints, sharing, confirmed, corroboration,
                      legacy, sharing_mass=sharing_mass)
+
+
+class Consent:
+  """How a transfer is enabled: by default or by the user opting in (WP8).
+
+  Attributes:
+    p_default_on: The ``consent_default_on`` Noul (None when not asked).
+    guards: The anchor scope's guard states (``state["guards"]``), trace only.
+    guard_defaults: ``default_on`` of every guard with a located declaration.
+    default_on: The composed answer -- True (raise applied or eligible), False
+      (opt-in confirmed), None (not decided).
+    action: ``raise`` / ``lower`` / ``none`` -- what the composition did.
+    corroboration: Why (``guard_default_on`` / ``unconditional`` /
+      ``guard_default_off`` / ``vetoed_by_guard`` / ``low_confidence`` /
+      ``not_applicable``).
+  """
+
+  def __init__(self, p_default_on: Optional[float], guards: List[Dict[str, Any]]):
+    self.p_default_on = p_default_on
+    self.guards = guards
+    self.guard_defaults: List[Optional[bool]] = [g.get("default_on") for g in guards if g.get("declaration")]
+    self.default_on: Optional[bool] = None
+    self.action = "none"
+    self.corroboration = "not_applicable"
+
+  @property
+  def first_declared(self) -> Optional[Dict[str, Any]]:
+    """The first guard with a located declaration (for the evidence line)."""
+    for g in self.guards:
+      if g.get("declaration"):
+        return g
+    return None
+
+  def to_trace(self) -> Dict[str, Any]:
+    return {
+        "p_default_on": None if self.p_default_on is None else round(self.p_default_on, 4),
+        "guards": [{"flag": g.get("flag"), "line": g.get("line"), "runs_when": g.get("runs_when"),
+                    "default_on": g.get("default_on"),
+                    "declaration": (g.get("declaration") or {}).get("file") and
+                    f"{g['declaration']['file']}:L{g['declaration']['line']}"} for g in self.guards],
+        "guard_defaults": self.guard_defaults,
+        "default_on": self.default_on,
+        "action": self.action,
+        "corroboration": self.corroboration,
+        "enabled": constants.CONSENT_DEFAULT_ENABLED,
+    }
+
+
+def _state_guards(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+  return list(state.get("guards") or [])
+
+
+def compose_consent(
+    state: Dict[str, Any], answers: Dict[str, JevAnswer], transmits: bool,
+    disclosure_status: str, severity: str,
+) -> Tuple[Consent, str]:
+  """Composes the consent default and returns ``(consent, severity)`` (WP8).
+
+  Only an undisclosed transfer (``transmits`` and ``disclosure_status ==
+  "MISSING"``) is affected; everything else is traced with ``action: none``.
+
+  Raise (IMPORTANT -> CRITICAL): the Noul is at/above ``T_CONSENT_DEFAULT_ON``
+  and no guard is declared default-off. A deterministic default-off guard
+  vetoes the model's default-on claim (``vetoed_by_guard``). The
+  corroboration names the deterministic fact that agrees: a guard declared
+  default-on, or no guard at all (``unconditional``); with only unresolved
+  guards the raise still applies on the model's answer (``model_only``) --
+  raising is the recall direction and the finding is already undisclosed.
+
+  Lower (-> SUGGESTION + review): the Noul is confidently negative (<= 1 -
+  ``CONF_CONSENT_ACT``) *and* a guard is declared default-off. Both halves
+  are required: this is a judgement lowering a severity. The disclosure
+  status is left MISSING because an opt-in toggle is not a prominent
+  disclosure; the finding says to verify the toggle text.
+
+  With ``CONSENT_DEFAULT_ENABLED`` off the Noul and guards are traced and
+  nothing changes.
+  """
+  a = answers.get("consent_default_on")
+  p = None if a is None or a.noul is None else float(a.noul)
+  consent = Consent(p, _state_guards(state))
+  if not constants.CONSENT_DEFAULT_ENABLED or not transmits or disclosure_status != "MISSING" or p is None:
+    return consent, severity
+  any_off = any(d is False for d in consent.guard_defaults)
+  any_on = any(d is True for d in consent.guard_defaults)
+  if p >= constants.T_CONSENT_DEFAULT_ON:
+    if any_off:
+      consent.corroboration = "vetoed_by_guard"
+    else:
+      consent.default_on = True
+      consent.corroboration = ("guard_default_on" if any_on
+                               else "unconditional" if not consent.guards else "model_only")
+      if severity == "IMPORTANT":
+        severity = "CRITICAL"
+        consent.action = "raise"
+  elif p <= 1.0 - constants.CONF_CONSENT_ACT:
+    if any_off:
+      consent.default_on = False
+      consent.corroboration = "guard_default_off"
+      if severity in ("CRITICAL", "IMPORTANT"):
+        severity = "SUGGESTION"
+        consent.action = "lower"
+    else:
+      consent.corroboration = "uncorroborated"
+  else:
+    consent.corroboration = "low_confidence"
+  log.debug("consent for %s in %s: p=%.2f guards=%s -> default_on=%s action=%s (%s)",
+            (state.get("signal") or {}).get("data_type"), (state.get("signal") or {}).get("file"),
+            p, consent.guard_defaults, consent.default_on, consent.action, consent.corroboration)
+  return consent, severity
 
 
 def relevance_is_low(verdict: str) -> bool:
@@ -865,6 +980,24 @@ def _compose_data_safety_finding(
   else:
     policy_id = "data_safety_section"
 
+  # WP8: default-on raises an undisclosed transfer to CRITICAL; a confirmed
+  # opt-in (double gate) lowers it to a review SUGGESTION. Never for a
+  # destination that was already composed as inventory.
+  consent, severity = compose_consent(
+      state, answers, transmits and not destination.applied, disclosure_status, severity)
+  consent_note: Optional[str] = None
+  if consent.action == "raise":
+    consent_note = (f"enabled by default (p={consent.p_default_on:.2f}, {consent.corroboration}); "
+                    "undisclosed transfer raised to CRITICAL")
+  elif consent.action == "lower":
+    consent_note = (f"opt-in (p={consent.p_default_on:.2f}, guard declared default-off); "
+                    "lowered to SUGGESTION, verify the toggle text meets the disclosure requirement")
+  elif consent.corroboration == "vetoed_by_guard":
+    consent_note = (f"model says default-on (p={consent.p_default_on:.2f}) but a guard is declared "
+                    "default-off; severity unchanged, kept for review")
+  if consent_note:
+    log.info("consent for %s in %s: %s", data_type, state["signal"]["file"], consent_note)
+
   # Unresolved destinations on a transfer: the class is a judgement, so an
   # unconfirmed non-collection answer or ``unknown`` never lowers anything --
   # it adds a review flag and a note (charter: review, do not suppress).
@@ -911,6 +1044,13 @@ def _compose_data_safety_finding(
   elif destination_review:
     summary = (f"{summary} [destination {destination.cls.replace('_', ' ')} unconfirmed: "
                f"conf={destination.confidence:.2f}; verify]")
+  if consent.action == "raise":
+    summary = f"{summary} [enabled by default]"
+  elif consent.action == "lower":
+    first = consent.first_declared or {}
+    summary = f"{summary} [opt-in: {first.get('flag', 'guard')} default=false; verify toggle text]"
+  elif consent.corroboration == "vetoed_by_guard":
+    summary = f"{summary} [consent default unclear: model default-on vs guard default-off; verify]"
   if relevance_low:
     summary = f"{summary} [data-type match uncertain: p={p_relevant or 0.0:.2f}; verify]"
     if severity == "CRITICAL":
@@ -950,6 +1090,7 @@ def _compose_data_safety_finding(
       # Fields the critic and the trace consume; downstream ignores unknown keys.
       "transfer_decision": decision,
       "destination_class": destination.cls,
+      "consent_default_on": consent.default_on,
       "claim": claim,
       "claim_kind": "transfer",
       "sinks": [{"symbol": s["symbol"], "capabilities": s["capabilities"]} for s in sinks],
@@ -961,12 +1102,36 @@ def _compose_data_safety_finding(
            "relevance": relevance_trace(verdict),
            "disclosure_reconciled": disclosure_note,
            "destination": destination.to_trace(),
-           "destination_note": destination_note},
+           "destination_note": destination_note,
+           "consent": consent.to_trace(),
+           "consent_note": consent_note},
       ),
   }
-  if decision == UNCERTAIN or relevance_low or disclosure_note or destination_review:
+  if consent.guards:
+    finding["evidence"] = _with_guard_evidence(finding["evidence"], consent)
+    finding["evidence_flow"]["guards"] = [
+        {"flag": g.get("flag"), "line": g.get("line"), "default_on": g.get("default_on"),
+         "declaration": g.get("declaration")} for g in consent.guards]
+  if (decision == UNCERTAIN or relevance_low or disclosure_note or destination_review
+      or consent.action == "lower" or consent.corroboration == "vetoed_by_guard"):
     finding["needs_manual_review"] = True
   return finding
+
+
+def _with_guard_evidence(evidence: str, consent: Consent) -> str:
+  """Appends the guarding flag and its declared default to the evidence line (WP8).
+
+  ``... [guard <flag> default=<true|false|unknown> @<file>:L<n>]`` for the
+  first guard whose declaration was located, else ``[guard <flag> default=unknown]``.
+  """
+  g = consent.first_declared or (consent.guards[0] if consent.guards else None)
+  if not g:
+    return evidence
+  default = g.get("default_on")
+  default_txt = "unknown" if default is None else str(default).lower()
+  decl = g.get("declaration") or {}
+  where = f" @{decl['file']}:L{decl['line']}" if decl.get("file") else ""
+  return f"{evidence} [guard {g.get('flag')} default={default_txt}{where}]".replace("|", "¦")
 
 
 def _compose_permission_finding(

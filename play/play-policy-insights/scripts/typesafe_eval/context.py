@@ -308,6 +308,65 @@ def disclosure_symbols(
 
 
 @dataclasses.dataclass
+class GuardState:
+  """A guard flag of an anchor scope plus its located declaration (WP8)."""
+
+  flag: structure.GuardFlag
+  declaration: Optional[structure.Declaration]
+
+  def to_state(self) -> Dict[str, Any]:
+    out: Dict[str, Any] = {
+        "flag": self.flag.identifier,
+        "line": self.flag.line + 1,
+        "runs_when": "false" if self.flag.negated else "true",
+    }
+    if self.declaration is not None:
+      out["declaration"] = self.declaration.to_state()
+      out["default_on"] = self.declaration.default_on
+    else:
+      out["declaration"] = None
+      out["default_on"] = None
+    return out
+
+
+def anchor_guards(
+    fs: structure.FileStructure, scope: Tuple[int, int],
+    index: Optional[structure.FirstPartyIndex] = None, app_dir: str = "",
+) -> List[GuardState]:
+  """Guard flags of ``scope`` with their declarations resolved (WP8)."""
+  out: List[GuardState] = []
+  for flag in structure.guard_flags(fs.lines, scope):
+    decl = structure.declaration_of(flag, fs, index, app_dir)
+    out.append(GuardState(flag, decl))
+  if out:
+    log.info("guards in %s L%d-%d: %s", fs.relpath, scope[0] + 1, scope[1],
+             [(g.flag.identifier, g.declaration.default_on if g.declaration else None,
+               g.declaration.resolution if g.declaration else "unresolved") for g in out])
+  return out
+
+
+def resolved_strings(
+    fs: structure.FileStructure, line_numbers: Sequence[int], resources: Any,
+) -> Dict[str, Optional[str]]:
+  """``R.string.<name>`` references on ``line_numbers`` resolved to default-locale text (WP8).
+
+  ``resources`` is a ``resources.ResourceIndex`` (duck-typed: ``strings`` dict);
+  a referenced name missing from the index maps to None so the model sees the
+  reference exists but its text is unknown (a localisation-only or generated
+  string). Capped at ``MAX_STRINGS_IN_STATE`` in order of appearance.
+  """
+  if resources is None:
+    return {}
+  names = structure.string_references(fs.lines, line_numbers)[: constants.MAX_STRINGS_IN_STATE]
+  table = getattr(resources, "strings", {}) or {}
+  out = {n: table.get(n) for n in names}
+  if out:
+    log.info("strings in %s: %d resolved, %d unresolved", fs.relpath,
+             sum(1 for v in out.values() if v is not None), sum(1 for v in out.values() if v is None))
+  return out
+
+
+@dataclasses.dataclass
 class Anchor:
   """Where a data-type signal is anchored in the file after occurrence selection."""
 
@@ -332,11 +391,20 @@ class Anchor:
   # for the chosen occurrence only; sent to the model as
   # ``destination_hints`` and recorded in the trace.
   destination_hints: List[structure.DestinationHint] = dataclasses.field(default_factory=list)
+  # WP8: boolean flags guarding the chosen scope with their declarations
+  # (``structure.guard_flags`` / ``declaration_of``). Priors for the
+  # ``consent_default_on`` Noul and the deterministic half of its double gate.
+  guards: List["GuardState"] = dataclasses.field(default_factory=list)
 
   @property
   def destination_hint_kinds(self) -> List[str]:
     """Distinct hint kinds in the chosen scope (WP7), e.g. ``["USER_CHOSEN_DESTINATION"]``."""
     return sorted({h.kind for h in self.destination_hints})
+
+  @property
+  def guard_defaults(self) -> List[Optional[bool]]:
+    """The ``default_on`` of every guard with a located declaration (WP8)."""
+    return [g.declaration.default_on for g in self.guards if g.declaration is not None]
 
   @property
   def callee_capabilities(self) -> List[str]:
@@ -573,6 +641,8 @@ def build_file_state(
     app_facts: Dict[str, Any],
     app_dir: str = "",
     callees: Sequence[Callee] = (),
+    first_party_index: Optional[structure.FirstPartyIndex] = None,
+    resources: Any = None,
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
   """One shared state for a file plus one mini-state per ask.
 
@@ -585,6 +655,11 @@ def build_file_state(
     callees: First-party files referenced from this file with their own
       sinks (WP6, :func:`file_callees`). Only those referenced inside an
       anchor's scope are attached to that anchor and rendered.
+    first_party_index: The app's class-name index (WP6); used by WP8 to find
+      a guard flag's declaration one hop away through its receiver's type.
+    resources: The default-locale ``resources.ResourceIndex`` (WP8); when
+      given, ``R.string`` references in anchor scopes and on disclosure
+      lines are resolved into ``state["strings"]``.
 
   Returns:
     ``(state, per_ask)`` where ``state`` is sent to the model and each
@@ -603,6 +678,11 @@ def build_file_state(
     for a in anchors:
       if a.chosen is not None:
         a.destination_hints = structure.destination_hints(fs.lines, a.scope, dev_domains)
+  # WP8: guards of the chosen scope with their declared defaults.
+  if constants.GUARDS_ENABLED:
+    for a in anchors:
+      if a.chosen is not None:
+        a.guards = anchor_guards(fs, a.scope, first_party_index, app_dir)
   code, related = _render_snippet(fs, anchors, sinks)
   callee_section, callee_snippets = _render_callees(anchors)
   code += callee_section
@@ -660,6 +740,24 @@ def build_file_state(
     state["destination_hints"] = hint_states
     log.info("state for %s: %d destination hint(s): %s", fs.relpath, len(hint_states),
              sorted({(h["data_type"], h["hint"], h["detail"]) for h in hint_states}))
+  # WP8: guards (flat, tagged by data type) and resolved string resources.
+  # Both present only when non-empty so unaffected states stay byte-identical.
+  guard_states = [{"data_type": a.data_type, **g.to_state()} for a in anchors for g in a.guards]
+  if guard_states:
+    state["guards"] = guard_states
+  strings: Dict[str, Optional[str]] = {}
+  if constants.STRING_RESOLUTION_ENABLED and resources is not None:
+    scope_lines: List[int] = []
+    for a in anchors:
+      if a.chosen is not None:
+        scope_lines.extend(range(a.scope[0], a.scope[1]))
+    # ``fs.references`` is keyed by import module; disclosure symbols are simple names.
+    disclosure_set = set(disclosure)
+    disclosure_lines = [i for module, refs in fs.references.items()
+                        if structure.simple_name(module) in disclosure_set for i in refs]
+    strings = resolved_strings(fs, scope_lines + disclosure_lines, resources)
+    if strings:
+      state["strings"] = strings
 
   per_ask: List[Dict[str, Any]] = []
   for a in anchors:
@@ -692,6 +790,7 @@ def build_file_state(
             "callee_in_scope": a.callee_in_scope,
             "callee_capabilities": a.callee_capabilities,
             "destination_hints": a.destination_hint_kinds,
+            "guard_defaults": a.guard_defaults,
         },
         "callees": own_callees,
         "app": app_facts,
@@ -699,6 +798,10 @@ def build_file_state(
     }
     if a.destination_hints:
       mini["destination_hints"] = [h.to_state() for h in a.destination_hints]
+    if a.guards:
+      mini["guards"] = [g.to_state() for g in a.guards]
+    if strings:
+      mini["strings"] = strings
     per_ask.append(mini)
   log.debug("state for %s: %d asks, %d sinks, %d callees, %d snippet chars",
             fs.relpath, len(asks), len(sinks), len(all_callee_states), len(code))

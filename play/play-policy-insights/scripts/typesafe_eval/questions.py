@@ -95,7 +95,11 @@ def _disclosure_status(subject: str) -> Dict[str, Any]:
       "type": "choice",
       "instructions": (
           f"Classify the prominent-disclosure state for {subject} in "
-          "`code_snippet`, considering `co_located_signals.disclosure`."
+          "`code_snippet`, considering `co_located_signals.disclosure` and, "
+          "when present, `strings` (the user-visible text behind the "
+          "`R.string` references in the snippet and on disclosure lines): a "
+          "disclosure counts only if the text a user reads describes the data "
+          "collected and its purpose."
       ),
       "criteria": {
           "DISCLOSED": (
@@ -186,15 +190,45 @@ def destination_class_question(subject: str) -> Dict[str, Any]:
   }
 
 
+def consent_default_question(subject: str) -> Dict[str, Any]:
+  """The ``consent_default_on`` Noul for one data type (WP8).
+
+  Asked with the data-safety battery; ``evaluate.compose_consent`` reads it
+  only for a transfer at/above ``T_TRANSMIT_LOW``. The instructions explain
+  the deterministic ``guards`` block: the boolean flags gating the snippet,
+  each with its declaration and ``default_on`` (the literal the flag is
+  initialised to) when the evaluator located it. A guard whose default is
+  false means the user must opt in; true or no guard means the transfer
+  happens unless the user turns it off. Guards are evidence to weigh, not the
+  answer -- the model still reads the code.
+  """
+  return _noul(
+      instructions=(
+          f"Is the transfer of {subject} in `code_snippet` ENABLED BY DEFAULT, "
+          "i.e. does it happen unless the user has turned it off? `guards`, when "
+          "present, lists the boolean flags that gate the snippet: `flag`, the "
+          "condition line, `runs_when` (the flag value under which the guarded "
+          "code runs) and, when the evaluator found the declaration, "
+          "`declaration.initialiser` and `default_on` (true = the flag starts "
+          "on). A guard whose effective default lets the code run means default-"
+          "on; a guard that starts off (the user must enable a setting) means "
+          "opt-in; an unconditional transfer is default-on. `default_on: null` "
+          "means the default could not be read from the code."
+      ),
+      yes="The transfer is on by default (unconditional, or gated by a flag that starts enabled).",
+      no="The user must opt in first (gated by a flag that starts disabled, or by an explicit consent step).",
+  )
+
+
 def data_safety_battery(
     data_type: str, description: str, token: str = ""
 ) -> Dict[str, Dict[str, Any]]:
   """Battery for a single data-safety finding (one detected data type).
 
   Produces the typed inputs the existing ``worker_<goal>.json`` schema expects:
-  the data-safety Nouls (relevance, transfer, user-initiated, disclosure), the
-  ``destination_class`` Choice (WP7; ``is_third_party`` is derived from it in
-  code), a disclosure-status choice, and a severity score. Instructions embed the literal data type (and the scanner token that
+  the data-safety Nouls (relevance, transfer, user-initiated, consent default
+  (WP8), disclosure), the ``destination_class`` Choice (WP7; ``is_third_party``
+  is derived from it in code), a disclosure-status choice, and a severity score. Instructions embed the literal data type (and the scanner token that
   anchored the signal, when given) so the battery works whether the state holds
   one signal or a whole file's worth (see request batching).
   """
@@ -226,11 +260,13 @@ def data_safety_battery(
           yes="An explicit user action triggers the transfer.",
           no="The transfer happens automatically without a user action.",
       ),
+      "consent_default_on": consent_default_question(subject),
       "destination_class": destination_class_question(subject),
       "has_prominent_disclosure": _noul(
           instructions=(
               f"For {subject}, does `code_snippet` (with "
-              "`co_located_signals.disclosure`) show a prominent disclosure or "
+              "`co_located_signals.disclosure` and the resolved text in "
+              "`strings`, when present) show a prominent disclosure or "
               "consent dialog BEFORE the data is accessed, that the user must "
               "accept to continue?"
           ),

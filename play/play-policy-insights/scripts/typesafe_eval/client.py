@@ -346,6 +346,7 @@ class HeuristicJevClient(JevClient):
         gate in (co.get("disclosure") or []) for gate in self._DISCLOSURE_GATES
     )
     destination = self._destination_prior(state) if isinstance(state, dict) else "unknown"
+    consent_prior = self._consent_prior(state) if isinstance(state, dict) else 0.5
     category = str(app.get("store_category", "")).strip().lower()
 
     core_categories = self._CORE_BY_CATEGORY.get(data_type, set())
@@ -375,8 +376,30 @@ class HeuristicJevClient(JevClient):
           snippet=snippet,
           signal=signal,
           destination=destination,
+          consent_prior=consent_prior,
       )
     return answers
+
+  @staticmethod
+  def _consent_prior(state: Dict[str, Any]) -> float:
+    """Offline stand-in for the ``consent_default_on`` Noul (WP8).
+
+    Reads the deterministic ``guards`` list that ``context.build_file_state``
+    attaches to the state: any guard whose declaration resolves to
+    ``default_on == False`` -> lean opt-in (0.15); any guard resolving to
+    ``True`` -> lean default-on (0.85); guards with unknown defaults -> 0.5;
+    no guards at all -> the code path is unconditional, so default-on (0.85).
+    This is a heuristic for hermetic runs, not a judgement of the toggle text.
+    """
+    guards = state.get("guards") or []
+    if not guards:
+      return 0.85
+    defaults = [g.get("default_on") for g in guards if isinstance(g, dict)]
+    if any(d is False for d in defaults):
+      return 0.15
+    if any(d is True for d in defaults):
+      return 0.85
+    return 0.5
 
   @staticmethod
   def _destination_prior(state: Dict[str, Any]) -> str:
@@ -416,6 +439,7 @@ class HeuristicJevClient(JevClient):
       snippet: str,
       signal: Dict[str, Any],
       destination: str = "unknown",
+      consent_prior: float = 0.5,
   ) -> JevAnswer:
     qtype = question.get("type")
 
@@ -429,6 +453,7 @@ class HeuristicJevClient(JevClient):
               is_core=is_core,
               snippet=snippet,
               signal=signal,
+              consent_prior=consent_prior,
           ),
       )
 
@@ -512,9 +537,13 @@ class HeuristicJevClient(JevClient):
       is_core: bool,
       snippet: str,
       signal: Dict[str, Any],
+      consent_prior: float = 0.5,
   ) -> float:
     if qid == "transmits_offdevice":
       return 0.9 if has_network else 0.1
+    if qid == "consent_default_on":
+      # WP8 stand-in: derived from the deterministic guard defaults in state.
+      return consent_prior
     if qid == "signal_relevant":
       # The stand-in cannot judge semantics; lean relevant (recall-safe).
       return 0.8

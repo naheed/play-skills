@@ -948,6 +948,8 @@ def _run_manifest(ctx: RunContext, findings_by_goal) -> None:
   for spec in registry.manifest_specs():
     try:
       found = spec.compose_manifest(inputs) if spec.compose_manifest else []
+      for f in found:
+        _attribute_sources(ctx, f, spec.policy_id)
       log.info("manifest policy %s: %d finding(s) %s", spec.policy_id, len(found),
                sorted(f.get("severity", "?") for f in found))
     except Exception as exc:  # pylint: disable=broad-exception-caught
@@ -966,8 +968,52 @@ def _run_manifest(ctx: RunContext, findings_by_goal) -> None:
 def _file_state(ctx: RunContext, relpath: str, file_tasks: Sequence[Task]):
   fs = ctx.files.get(relpath) or structure.analyze_file(ctx.app_dir, relpath)
   asks = [(t.data_type, t.pattern) for t in file_tasks]
+  # WP8: the first-party index locates guard declarations one hop away; the
+  # profile's default-locale resource index resolves ``R.string`` references.
+  resources = ctx.profile.resource_index if ctx.profile is not None else None
   return context.build_file_state(fs, asks, ctx.profiles, ctx.app_facts, ctx.app_dir,
-                                  callees=_file_callees(ctx, relpath))
+                                  callees=_file_callees(ctx, relpath),
+                                  first_party_index=ctx.first_party_index,
+                                  resources=resources if constants.STRING_RESOLUTION_ENABLED else None)
+
+
+def _attribute_sources(ctx: RunContext, finding: Dict[str, Any], policy_id: str) -> None:
+  """Adds ``manifest_sources`` to a finding whose permission / component is flavour-only (WP8).
+
+  Manifest findings name their subject in the trace (``permission`` or
+  ``service``); permission-goal code findings are attributed through
+  ``constants.POLICY_PERMISSIONS``. The field is set only when the declaring
+  shipped source sets are a strict subset of the build
+  (``AppProfile.partial_sources``), so most findings are unchanged.
+  """
+  if not constants.PERMISSION_ATTRIBUTION_ENABLED or ctx.profile is None or not finding:
+    return
+  profile = ctx.profile
+  trace = finding.get("decision_trace") or {}
+  entries: List[Any] = []
+  if trace.get("permission"):
+    perm = profile.permission(str(trace["permission"]))
+    if perm is not None:
+      entries.append(perm)
+  if trace.get("service"):
+    entries.extend(c for c in profile.components if c.kind == "service" and c.name == trace["service"])
+  for name in constants.POLICY_PERMISSIONS.get(policy_id, ()):
+    perm = profile.permission(name)
+    if perm is not None and profile.ships_in_play_build(perm):
+      entries.append(perm)
+  sources: List[str] = []
+  for entry in entries:
+    partial = profile.partial_sources(entry)
+    if partial:
+      for src in partial:
+        if src not in sources:
+          sources.append(src)
+  if sources:
+    finding["manifest_sources"] = sources
+    finding.setdefault("decision_trace", {})["manifest_sources"] = sources
+    ctx.counters["manifest_sources_attributed"] = ctx.counters.get("manifest_sources_attributed", 0) + 1
+    log.info("finding %s in %s attributed to source sets %s", policy_id,
+             (finding.get("files_involved") or ["?"])[0], sources)
 
 
 def _run_batched(ctx: RunContext, tasks: Sequence[Task], client: JevClient,
@@ -999,6 +1045,7 @@ def _run_batched(ctx: RunContext, tasks: Sequence[Task], client: JevClient,
         sub = {qid[len(prefix):]: a for qid, a in answers.items() if qid.startswith(prefix)}
         finding = _compose_task(task, per_task[i], sub, client.name)
         if finding:
+          _attribute_sources(ctx, finding, task.spec.policy_id)
           findings_by_goal[task.spec.goal].append(finding)
         else:
           _drop(ctx, task.data_type, task.finding_str,
@@ -1022,6 +1069,7 @@ def _run_per_finding(ctx: RunContext, tasks: Sequence[Task], client: JevClient,
       continue
     finding = _compose_task(task, state, answers, client.name)
     if finding:
+      _attribute_sources(ctx, finding, task.spec.policy_id)
       findings_by_goal[task.spec.goal].append(finding)
     else:
       _drop(ctx, task.data_type, task.finding_str,
