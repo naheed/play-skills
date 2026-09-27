@@ -42,7 +42,7 @@ DEFAULT_MODEL = "jev-1.13.0"
 
 PRIORITIZED_FLAVORS = ("main", "play")
 MAX_PER_FILE_PER_TYPE = 2   # at most N findings of one data type from one file
-MAX_FINDINGS_PER_TYPE = 8   # global cap per data type, after ranking (see below)
+MAX_FINDINGS_PER_TYPE = 12  # global cap per data type, after ranking (see below)
 
 # Cascade (two-stage triage). Stage 1 is deterministic and cheap: every raw
 # signal (up to MAX_CANDIDATES_PER_TYPE, a pure cost bound) is ranked by the
@@ -52,8 +52,28 @@ MAX_FINDINGS_PER_TYPE = 8   # global cap per data type, after ranking (see below
 # in scanner order" cap, which dropped real sinks in favour of log lines.
 # MAX_FINDINGS_PER_TYPE was raised from 4 to 8 after live runs measured the
 # whole battery stage at well under a minute per app: recall is the charter's
-# first priority and the cost lever is cheap.
+# first priority and the cost lever is cheap. Raised again to 12 in WP2: once
+# anchors rank *every* occurrence, candidates whose transfer happens one callee
+# hop away (a protocol class whose ``login`` writes through ``sendCommand``)
+# rank below UI files with an IPC sink in scope; until WP6 resolves callees,
+# the cap is the only thing standing between such a labelled transfer and a
+# silent drop (``calibrate --rejoin`` caught two at cap 8).
+# The per-type cap is a *cost* control and therefore only trims candidates
+# whose own scope has no capability-labelled sink (tier 3). A candidate with a
+# sink in its function (tier 0-2) is the exact situation the evaluator exists
+# to check, so it is never dropped for cost; MAX_CANDIDATES_PER_TYPE and
+# MAX_PER_FILE_PER_TYPE still bound the total. Rollback: set to False.
+CAP_EXEMPTS_SINK_IN_SCOPE = True
 MAX_CANDIDATES_PER_TYPE = 40
+# ``symbol_references`` lists every line that uses an imported sink symbol
+# (bounded only by this). The previous default of 12 lines per symbol silently
+# hid every later call site, so an ``Intent`` used 14 times in an activity had
+# its last two ``startActivity`` sites invisible to scope/proximity ranking
+# (a labelled MIME-sharing transfer ranked tier 3 for exactly this reason).
+# What the *model* sees is bounded separately (MAX_SINK_LINES_IN_STATE,
+# MAX_SINK_REF_LINES_IN_STATE).
+MAX_SYMBOL_REFERENCE_LINES = 400
+MAX_SINK_REF_LINES_IN_STATE = 20   # per-sink ``lines`` listed in the state (nearest the anchors)
 SINK_SCOPE_BONUS_LINES = 0     # proximity 0 == sink reference inside the hit's own scope
 MAX_ASKS_PER_REQUEST = 6       # batched mode: asks (data types) per file request
 
@@ -77,6 +97,33 @@ EVALUATOR_VERSION = "2.0.0-capability"
 # Test source sets (unit and instrumentation) are excluded too: they are not
 # compiled into the shipped artifact, so a transfer there is not app behaviour.
 EXCLUDED_PATH_SUBSTRINGS = ("/res/values", "/src/test/", "/src/androidTest/", "/src/testDebug/")
+# Localisation catalogs outside ``res/values*`` (gettext, Flutter ARB, Apple
+# ``.strings``): pure UI text, same rationale as above (WP2).
+EXCLUDED_PATH_SUFFIXES = (".po", ".pot", ".arb", ".strings", ".xliff", ".xlf")
+
+# ---------------------------------------------------------------------------
+# Lexical pre-gate (WP2, lesson L1). Scanner patterns are raw substrings, so
+# ``record`` fires on ``LogRecord``, ``dob`` on a Croatian verb stem, ``race``
+# on ``grace``. Before any model call the structure layer checks whether the
+# pattern occurs as an identifier *word* (camelCase / snake_case / kebab / dot
+# boundary; English affixes such as ``recorder`` / ``relogin`` still count).
+# Candidates whose file contains only mid-word substring hits are dropped with
+# a recorded reason. Rollback: set LEXICAL_PREGATE_ENABLED = False.
+# ---------------------------------------------------------------------------
+LEXICAL_PREGATE_ENABLED = True
+# Hits that occur only in *type* positions (class header, generic argument,
+# declared type) are a weaker signal than value uses, but a file that declares
+# a field of the API type (``: AudioRecord``) and drives it through the field
+# name is a real use. Dropping type-only candidates is therefore OFF by
+# default; the verdict is still recorded on the anchor and in triage so the
+# effect can be measured on a labelled set before enabling it.
+LEXICAL_TYPE_ONLY_DROP = False
+# Anchor selection ranks *every* occurrence (up to this bound) by sink tier and
+# proximity; only MAX_HIT_LINES_IN_STATE of them are listed in the model state.
+# Capping before ranking lost a labelled clipboard transfer whose only sink-
+# adjacent occurrence was the sixth in file order (WP2 recall check).
+MAX_OCCURRENCES_RANKED = 60
+MAX_HIT_LINES_IN_STATE = 5
 
 # Documented System One evaluation endpoint.
 DEFAULT_ENDPOINT = "https://api.typesafe.ai/v1/systemone"
@@ -125,6 +172,19 @@ T_TRANSMIT_HIGH = 0.70
 T_TRANSMIT = T_TRANSMIT_HIGH  # backwards-compatible alias used by the eval harness
 
 T_RELEVANCE = 0.30         # drop a signal when P(snippet handles this data type) < this
+# WP2: below T_RELEVANCE the model may suppress a finding only when the anchor
+# scope has no capability-labelled egress/IPC sink (rank tier 2-3). With a sink
+# in scope the finding is kept, capped at IMPORTANT and routed to manual
+# review (charter: never suppress by judgement alone). Rollback flag.
+RELEVANCE_SOFT_GATE_ENABLED = True
+# The soft gate exists for *uncertain* data-type matches. Below this floor the
+# model is confidently negative (>= 90% "not this data type") and a sink in
+# scope no longer justifies a review item: on the dev apps every keep under
+# 0.10 was a lexical coincidence ("track" -> MUSIC, "record" -> AUDIO,
+# "PowerManager" -> PERFORMANCE_DIAGNOSTICS) while the nearest genuine
+# transfer sat at p=0.12 (MIME "video/*" -> VIDEOS). Applies only when the
+# soft gate is enabled; below the floor the finding is dropped as before.
+T_RELEVANCE_FLOOR = 0.10
 T_DISCLOSURE = 0.50        # a prominent disclosure gate is present
 T_CORE_FUNCTION = 0.60     # the access is core to the app's stated purpose
 T_USER_INITIATED = 0.60    # the transfer is triggered by an explicit user action

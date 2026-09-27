@@ -97,6 +97,7 @@ class Candidate:
   pattern: str
   order: int                                 # position in scanner output
   anchor: Optional[context.Anchor] = None    # filled by triage
+  lexical: Optional[structure.LexicalHits] = None   # filled by the pre-gate (WP2)
 
 
 @dataclasses.dataclass
@@ -124,6 +125,10 @@ class RunContext:
   # are unchanged by its presence.
   profile: Optional[android_manifest.AppProfile] = None
   files: Dict[str, structure.FileStructure] = dataclasses.field(default_factory=dict)
+  # Files whose every candidate the lexical pre-gate dropped (WP2). Kept apart
+  # so their declared packages still count as first-party, while their imports
+  # are not sent for capability classification.
+  pruned_files: Dict[str, structure.FileStructure] = dataclasses.field(default_factory=dict)
   profiles: Dict[str, caps.CapabilityProfile] = dataclasses.field(default_factory=dict)
   dependency_profiles: Dict[str, caps.CapabilityProfile] = dataclasses.field(default_factory=dict)
   counters: Dict[str, Any] = dataclasses.field(default_factory=dict)
@@ -224,6 +229,10 @@ def _filter_candidates(
       if any(frag in path for frag in constants.EXCLUDED_PATH_SUBSTRINGS):
         _drop(ctx, data_type, f, "excluded path (string-catalog resource or test source set)")
         continue
+      relpath_only, _ = snippets.parse_finding(f)
+      if (relpath_only or f).lower().endswith(constants.EXCLUDED_PATH_SUFFIXES):
+        _drop(ctx, data_type, f, "excluded path (localisation catalog)")
+        continue
       if len(kept) >= constants.MAX_CANDIDATES_PER_TYPE:
         _drop(ctx, data_type, f, f"over MAX_CANDIDATES_PER_TYPE={constants.MAX_CANDIDATES_PER_TYPE}")
         continue
@@ -287,6 +296,92 @@ def _analyze_files(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> N
            len(relpaths), ctx.counters["files_unreadable"])
 
 
+def _lexical_pregate(
+    ctx: RunContext, candidates: Dict[str, List[Candidate]]
+) -> Dict[str, List[Candidate]]:
+  """Stage 3b (WP2): drops candidates whose pattern never occurs as an identifier.
+
+  Deterministic and free. For every identifier-shaped pattern the structure
+  layer classifies each occurrence in the file as a value use, a type-position
+  use, a mid-word substring (``recorder`` is a value use, ``dobiti`` is a
+  substring) or a comment/import mention. A candidate survives when the file
+  has at least one value or type use; a candidate whose file has only mid-word
+  substring hits is dropped with the reason ``no identifier-boundary match``
+  and one example line, so recall can be audited from ``typesafe_triage.json``.
+
+  Non-identifier patterns (MIME types, paths) and unreadable files are never
+  dropped here: there is nothing lexical to decide. Files left with no
+  surviving candidate move to ``ctx.pruned_files`` so their imports are not
+  classified (the model-call saving this WP is measured by).
+  """
+  if not constants.LEXICAL_PREGATE_ENABLED:
+    ctx.counters["lexical_pregate"] = {"enabled": False}
+    return candidates
+  out: Dict[str, List[Candidate]] = {}
+  stats = {"enabled": True, "checked": 0, "kept_value": 0, "kept_type_only": 0,
+           "kept_non_identifier": 0, "kept_unreadable": 0, "kept_demoted_only": 0,
+           "kept_no_occurrence": 0, "dropped_substring_only": 0, "dropped_type_only": 0}
+  for data_type, cands in candidates.items():
+    kept: List[Candidate] = []
+    for c in cands:
+      fs = ctx.files.get(c.relpath)
+      if fs is None or not fs.lines:
+        stats["kept_unreadable"] += 1
+        kept.append(c)
+        continue
+      if not structure.is_identifier_pattern(c.pattern):
+        stats["kept_non_identifier"] += 1
+        kept.append(c)
+        continue
+      stats["checked"] += 1
+      lex = structure.lexical_hits(fs.lines, c.pattern)
+      c.lexical = lex
+      verdict = lex.verdict
+      if verdict == "value":
+        stats["kept_value"] += 1
+        kept.append(c)
+      elif verdict == "type_only":
+        if constants.LEXICAL_TYPE_ONLY_DROP:
+          stats["dropped_type_only"] += 1
+          _drop(ctx, data_type, c.finding_str, "type position only",
+                example=lex.examples.get("type"), lines=lex.type_lines[:5])
+        else:
+          stats["kept_type_only"] += 1
+          kept.append(c)
+      elif verdict == "substring_only":
+        stats["dropped_substring_only"] += 1
+        _drop(ctx, data_type, c.finding_str, "no identifier-boundary match",
+              example=lex.examples.get("substring"), lines=lex.substring_lines[:5])
+      elif verdict == "demoted_only":
+        # Only comments / imports mention it. The scanner strips comments, so
+        # this is normally an import of a type with the word in its name; the
+        # old anchor logic already fell back to these lines. Keep (recall).
+        stats["kept_demoted_only"] += 1
+        kept.append(c)
+      else:
+        # The scanner saw the pattern but this reader did not (encoding or
+        # line-splitting difference). Keep and let the model see the file.
+        stats["kept_no_occurrence"] += 1
+        kept.append(c)
+    if kept:
+      out[data_type] = kept
+
+  active = {c.relpath for cs in out.values() for c in cs}
+  for rp in list(ctx.files):
+    if rp not in active:
+      ctx.pruned_files[rp] = ctx.files.pop(rp)
+  stats["files_pruned"] = len(ctx.pruned_files)
+  stats["candidates_after"] = sum(len(v) for v in out.values())
+  ctx.counters["lexical_pregate"] = stats
+  log.info("lexical pre-gate: %d identifier candidates checked; kept value=%d type_only=%d "
+           "demoted_only=%d; dropped substring_only=%d type_only=%d; %d non-identifier and "
+           "%d unreadable passed through; %d files pruned before classification",
+           stats["checked"], stats["kept_value"], stats["kept_type_only"],
+           stats["kept_demoted_only"], stats["dropped_substring_only"], stats["dropped_type_only"],
+           stats["kept_non_identifier"], stats["kept_unreadable"], stats["files_pruned"])
+  return out
+
+
 def _classify_semantics(
     ctx: RunContext,
     client: JevClient,
@@ -301,7 +396,7 @@ def _classify_semantics(
   capable or UNKNOWN are refined to class level, where the profile actually
   drives sink detection and proximity ranking.
   """
-  first_party = _first_party_packages(ctx.manifest, ctx.files)
+  first_party = _first_party_packages(ctx.manifest, {**ctx.pruned_files, **ctx.files})
   imports: List[str] = []
   skipped_first_party = 0
   for fs in ctx.files.values():
@@ -377,12 +472,21 @@ def _triage(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> Dict[str
   first, then nearest sink distance, then scanner order. Per-file and per-type
   caps then apply. Dropped candidates are recorded with their rank so a reviewer
   can see exactly what was not evaluated and why.
+
+  The per-type cap (``MAX_FINDINGS_PER_TYPE``) is a cost control. With
+  ``CAP_EXEMPTS_SINK_IN_SCOPE`` (default on) it only trims candidates whose own
+  scope has *no* capability-labelled sink (tier 3): a hit whose function calls
+  an egress/IPC/unknown-labelled symbol is exactly what the model is for and is
+  kept regardless of how many siblings of the same data type precede it. The
+  number of such exemptions is counted (``cap_exempt_sink_in_scope``) so the
+  cost effect is visible in triage.
   """
   sinks_by_file: Dict[str, List[context.Sink]] = {}
   for rp, fs in ctx.files.items():
     sinks_by_file[rp] = context.file_sinks(fs, ctx.profiles)
 
   kept: Dict[str, List[Candidate]] = {}
+  exempt_total = 0
   for data_type, cands in candidates.items():
     for c in cands:
       fs = ctx.files[c.relpath]
@@ -392,7 +496,9 @@ def _triage(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> Dict[str
     out: List[Candidate] = []
     for rank, c in enumerate(ranked):
       why = None
-      if len(out) >= constants.MAX_FINDINGS_PER_TYPE:
+      over_cap = len(out) >= constants.MAX_FINDINGS_PER_TYPE
+      exempt = constants.CAP_EXEMPTS_SINK_IN_SCOPE and c.anchor.sink_in_scope
+      if over_cap and not exempt:
         why = f"over MAX_FINDINGS_PER_TYPE={constants.MAX_FINDINGS_PER_TYPE}"
       elif per_file.get(c.relpath, 0) >= constants.MAX_PER_FILE_PER_TYPE:
         why = f"over MAX_PER_FILE_PER_TYPE={constants.MAX_PER_FILE_PER_TYPE}"
@@ -401,12 +507,17 @@ def _triage(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> Dict[str
               sink_in_scope=c.anchor.sink_in_scope, proximity=c.anchor.proximity,
               scope_capabilities=c.anchor.scope_capabilities)
         continue
+      if over_cap and exempt:
+        exempt_total += 1
+        log.info("triage: %s %s kept over MAX_FINDINGS_PER_TYPE (rank %d, tier %d, sink in scope %s)",
+                 data_type, c.finding_str, rank, c.anchor.tier, c.anchor.scope_capabilities)
       out.append(c)
       per_file[c.relpath] = per_file.get(c.relpath, 0) + 1
     if out:
       kept[data_type] = out
   ctx.counters["kept_per_type"] = {dt: len(v) for dt, v in sorted(kept.items())}
   ctx.counters["kept"] = sum(len(v) for v in kept.values())
+  ctx.counters["cap_exempt_sink_in_scope"] = exempt_total
   ctx.counters["files_with_sinks"] = sum(1 for s in sinks_by_file.values() if s)
   log.info("triage: kept %d of %d candidates (%d files have labelled sinks)",
            ctx.counters["kept"], ctx.counters.get("candidates", 0),
@@ -792,6 +903,7 @@ def run(
 
   candidates = _filter_candidates(data_sources, ctx)
   _analyze_files(ctx, candidates)
+  candidates = _lexical_pregate(ctx, candidates)
   _classify_semantics(ctx, client, capability_cache, model)
   kept = _triage(ctx, candidates)
   tasks = _plan_from_candidates(kept)

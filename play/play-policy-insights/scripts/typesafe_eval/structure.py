@@ -55,6 +55,8 @@ from typing import Optional
 from typing import Sequence
 from typing import Tuple
 
+from typesafe_eval import constants
+
 log = logging.getLogger("typesafe_eval.structure")
 
 # ---------------------------------------------------------------------------
@@ -340,7 +342,7 @@ def simple_name(module_path: str) -> str:
 
 
 def symbol_references(
-    lines: Sequence[str], imports: Sequence[str], max_lines_per_symbol: int = 12
+    lines: Sequence[str], imports: Sequence[str], max_lines_per_symbol: Optional[int] = None
 ) -> Dict[str, List[int]]:
   """Maps each import to the 0-based line indices where its simple name is used.
 
@@ -348,7 +350,15 @@ def symbol_references(
   comment is not a call site). Matching is whole-word so ``Log`` does not match
   ``Logger``. Kotlin/Java wildcard imports have no usable simple name and are
   skipped (their package path is still classified by the semantic layer).
+
+  ``max_lines_per_symbol`` defaults to ``constants.MAX_SYMBOL_REFERENCE_LINES``
+  (a generous bound). Ranking needs *every* call site of a sink symbol: with the
+  old default of 12 a file using ``Intent`` fourteen times had its last two
+  ``startActivity`` sites hidden from scope/proximity ranking. The model-facing
+  lists are bounded separately in :mod:`context`.
   """
+  if max_lines_per_symbol is None:
+    max_lines_per_symbol = constants.MAX_SYMBOL_REFERENCE_LINES
   refs: Dict[str, List[int]] = {}
   for mod in imports:
     name = simple_name(mod)
@@ -378,15 +388,28 @@ _COMMENT_PREFIXES = ("//", "*", "/*", "#", "<!--")
 _IMPORT_PREFIXES = ("import ", "using ", "from ", "package ")
 
 
-def all_occurrences(lines: Sequence[str], pattern: str, cap: int = 5) -> List[int]:
+def all_occurrences(lines: Sequence[str], pattern: str, cap: int = 5,
+                    prefer_boundary: bool = True) -> List[int]:
   """0-based indices of every line containing ``pattern``, up to ``cap``.
 
   Comment-only and import lines are demoted (kept only if nothing else matches)
   because the first mention of an API in a file is very often its import or its
   documentation, neither of which is where data flows.
+
+  With ``prefer_boundary`` (WP2) and an identifier-shaped pattern, lines where
+  the pattern sits at an *identifier boundary* in a value position rank first,
+  then boundary hits in a type position, then raw substring hits, then the
+  demoted lines. This makes the anchor land on ``audio_record`` rather than
+  ``recorder`` when both exist, without changing which lines are eligible.
   """
   if not pattern:
     return []
+  if prefer_boundary and is_identifier_pattern(pattern):
+    lex = lexical_hits(lines, pattern)
+    ordered = lex.ranked_lines()
+    if ordered:
+      return ordered[:cap]
+    return lex.demoted_lines[:cap]
   code_hits: List[int] = []
   demoted_hits: List[int] = []
   for i, line in enumerate(lines):
@@ -400,11 +423,304 @@ def all_occurrences(lines: Sequence[str], pattern: str, cap: int = 5) -> List[in
   return hits[:cap]
 
 
+# ---------------------------------------------------------------------------
+# Identifier-boundary lexical pre-gate (WP2, lesson L1)
+# ---------------------------------------------------------------------------
+#
+# Scanner patterns are matched as raw substrings, so ``record`` fires on
+# ``recorder``/``LogRecord``, ``dob`` on a Croatian verb stem, ``race`` on
+# ``grace``, ``imap`` on ``HashMultimap``. Each of those used to cost a model
+# call before the relevance gate dismissed it. The helpers below decide, with no
+# policy knowledge, whether a pattern occurs as an identifier *word* -- at a
+# camelCase / snake_case / kebab-case / dot boundary on both sides -- and
+# whether that word sits in a *type* position (class header, generic argument,
+# declared type, supertype) rather than a *value* position (call, field,
+# parameter, constructor). Only identifier-shaped patterns are subject to this;
+# MIME types (``audio/*``) and other punctuation-bearing patterns keep raw
+# substring semantics because they are not identifiers.
+
+_IDENTIFIER_PATTERN_RE = re.compile(r"^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*$")
+_IDENT_CHARS_RE = re.compile(r"[\w.]")
+
+# English derivational affixes glued to a word in lower case are still *that
+# word* for the scanner's purpose: ``recorder``, ``recording``, ``tracker``,
+# ``logins``, ``relogin`` all name the concept ``record`` / ``track`` / ``login``.
+# A foreign stem (``dobiti``, ``gráfico``) or an unrelated container word
+# (``HashMultimap`` for ``imap``, ``grace`` for ``race``) does not carry one of
+# these affixes and is rejected. Deliberately short lists: every entry widens
+# what survives to the (model) relevance gate, never what is dropped.
+_ENGLISH_SUFFIXES = ("s", "es", "ed", "er", "ers", "or", "ors", "ing", "ings", "ion", "ions", "able", "y")
+_ENGLISH_PREFIXES = ("re", "un", "pre", "de", "auto", "non", "sub", "mis", "multi", "co")
+
+# Keywords that make the *following* identifier a type. Language-agnostic
+# superset for Kotlin / Java / Dart / Swift / TypeScript / C#. ``new`` is
+# absent on purpose: ``new Foo(`` creates a value.
+_TYPE_LEADING_KEYWORDS = (
+    "class", "interface", "object", "enum", "typealias", "extends", "implements",
+    "instanceof", "is", "as", "throws", "struct", "protocol", "typedef",
+)
+_TYPE_LEADING_RE = re.compile(
+    r"(?:^|[\s(<,])(" + "|".join(_TYPE_LEADING_KEYWORDS) + r")\s*$")
+# Java/C#/Dart-style declaration: ``Type name =``, ``Type name;``, ``Type name)``,
+# ``Type name,``, ``Type name(`` (method return type) -- after optional generics/array.
+_DECLARED_TYPE_TAIL_RE = re.compile(r"^(?:<[^<>]*(?:<[^<>]*>[^<>]*)*>)?(?:\[\])*\s+[A-Za-z_]\w*\s*[=;,)(:{]")
+_DECL_MODIFIERS = (
+    "public", "private", "protected", "static", "final", "val", "var", "override",
+    "internal", "lateinit", "const", "readonly", "abstract", "synchronized", "volatile",
+    "transient", "native", "default", "late", "open", "inline", "suspend", "external",
+)
+
+
+@dataclasses.dataclass
+class LexicalHits:
+  """Per-file classification of where an identifier pattern occurs.
+
+  Attributes:
+    value_lines: Boundary hits in a value position (call, field, argument,
+      constructor, parameter name...). A pattern with at least one of these
+      is a genuine identifier use and always survives the pre-gate.
+    type_lines: Boundary hits that occur only in type positions on their line
+      (class header, generic argument, declared type, supertype, ``is``/``as``).
+    substring_lines: Lines where the pattern occurs only *inside* a longer
+      identifier word (``recorder``, ``dobiti``, ``HashMultimap``).
+    demoted_lines: Comment-only and import lines containing the pattern.
+    examples: ``line_index -> stripped line`` for one representative of each
+      non-empty class, for the triage record.
+  """
+
+  value_lines: List[int] = dataclasses.field(default_factory=list)
+  type_lines: List[int] = dataclasses.field(default_factory=list)
+  substring_lines: List[int] = dataclasses.field(default_factory=list)
+  demoted_lines: List[int] = dataclasses.field(default_factory=list)
+  examples: Dict[str, str] = dataclasses.field(default_factory=dict)
+  # Subset of ``value_lines`` where the scanner's exact spelling occurs (as
+  # opposed to the capitalised camelCase variant). Preferred as anchors.
+  exact_value_lines: List[int] = dataclasses.field(default_factory=list)
+
+  def ranked_lines(self) -> List[int]:
+    """Anchor preference order: exact value, variant value, type, substring."""
+    ordered = list(self.exact_value_lines)
+    ordered += [l for l in self.value_lines if l not in ordered]
+    ordered += [l for l in self.type_lines if l not in ordered]
+    ordered += [l for l in self.substring_lines if l not in ordered]
+    return ordered
+
+  @property
+  def verdict(self) -> str:
+    """``value`` / ``type_only`` / ``substring_only`` / ``demoted_only`` / ``none``."""
+    if self.value_lines:
+      return "value"
+    if self.type_lines:
+      return "type_only"
+    if self.substring_lines:
+      return "substring_only"
+    if self.demoted_lines:
+      return "demoted_only"
+    return "none"
+
+
+def is_identifier_pattern(pattern: str) -> bool:
+  """True for ``record``, ``full_name``, ``getDeviceId``, ``MediaStore.Images``."""
+  return bool(pattern) and bool(_IDENTIFIER_PATTERN_RE.match(pattern))
+
+
+def _word_run_before(line: str, start: int) -> str:
+  """The camelCase word immediately preceding ``start``, lower-cased.
+
+  Walks back over lower-case letters and includes the single upper-case
+  letter that opens the word, so ``Relogin`` -> ``re`` and ``autoLogin`` is
+  not reached here (that is a camel boundary already).
+  """
+  lo = start
+  while lo > 0 and line[lo - 1].islower():
+    lo -= 1
+  if lo > 0 and line[lo - 1].isupper():
+    lo -= 1
+  return line[lo:start].lower()
+
+
+def _word_run_after(line: str, end: int) -> str:
+  """Lower-case letters immediately following ``end`` up to the next boundary."""
+  hi = end
+  while hi < len(line) and line[hi].islower():
+    hi += 1
+  return line[end:hi]
+
+
+def _starts_at_boundary(line: str, start: int, token: str) -> bool:
+  if start == 0:
+    return True
+  prev = line[start - 1]
+  if not prev.isalnum():
+    return True                      # ``_``, ``-``, ``.``, space, punctuation
+  first = token[0]
+  if first.isupper() and (prev.islower() or prev.isdigit()):
+    return True                      # camelCase: ``audioRecord``, ``LogRecord``
+  if prev.isdigit():
+    return True                      # ``v2record`` -- digit/letter transition
+  if prev.islower() and first.islower():
+    # ``relogin`` / ``autoupdate``: an English prefix glued to the word is
+    # still the word; ``gráfico`` / ``dobiti`` are not.
+    run = _word_run_before(line, start)
+    return run in _ENGLISH_PREFIXES
+  return False
+
+
+def _ends_at_boundary(line: str, end: int, token: str) -> bool:
+  if end >= len(line):
+    return True
+  nxt = line[end]
+  if not nxt.isalnum():
+    return True                      # ``_``, ``-``, ``.``, ``(``, space...
+  if nxt.isupper() or nxt.isdigit():
+    return True                      # camelCase continuation: ``recordAudio``, ``uid2``
+  # ``recorder`` / ``Recording`` / ``logins``: an English suffix keeps the word;
+  # ``dobiti`` / ``Tracke`` (nonsense) do not.
+  run = _word_run_after(line, end)
+  return run in _ENGLISH_SUFFIXES
+
+
+def boundary_matches(line: str, pattern: str) -> List[Tuple[int, bool]]:
+  """``(start_column, exact_case)`` for every identifier-word occurrence on ``line``.
+
+  Matches the exact pattern, and -- when the pattern is all lower-case -- its
+  capitalised form at a camelCase boundary (``record`` also matches the
+  ``Record`` word in ``AudioRecord`` / ``startRecord``), because the scanner's
+  lower-case pattern names the *word*, not one spelling of it. ``exact_case``
+  is False for the capitalised variant so callers can prefer the spelling the
+  scanner actually matched when ranking anchors.
+  """
+  variants = [(pattern, True)]
+  if pattern.islower() and pattern[0].isalpha():
+    variants.append((pattern[0].upper() + pattern[1:], False))
+  found: Dict[int, bool] = {}
+  for variant, exact in variants:
+    start = line.find(variant)
+    while start != -1:
+      end = start + len(variant)
+      if _starts_at_boundary(line, start, variant) and _ends_at_boundary(line, end, variant):
+        found[start] = found.get(start, False) or exact
+      start = line.find(variant, start + 1)
+  return sorted(found.items())
+
+
+def boundary_columns(line: str, pattern: str) -> List[int]:
+  """Start columns where ``pattern`` occurs as an identifier word on ``line``."""
+  return [c for c, _ in boundary_matches(line, pattern)]
+
+
+def _enclosing_identifier(line: str, col: int, length: int) -> Tuple[int, int]:
+  """Span of the whole ``[\\w.]`` identifier chain containing ``line[col:col+length]``."""
+  lo = col
+  while lo > 0 and _IDENT_CHARS_RE.match(line[lo - 1]):
+    lo -= 1
+  hi = col + length
+  while hi < len(line) and _IDENT_CHARS_RE.match(line[hi]):
+    hi += 1
+  return lo, hi
+
+
+def is_type_position(line: str, col: int, length: int) -> bool:
+  """True when the identifier containing ``line[col:col+length]`` names a type.
+
+  Positions treated as *type*:
+
+  - preceded by a declaration / relation keyword: ``class``, ``interface``,
+    ``object``, ``enum``, ``typealias``, ``extends``, ``implements``,
+    ``instanceof``, ``is``, ``as``, ``throws`` ...
+  - a Kotlin/Swift/TypeScript type annotation or supertype: ``: Type``
+  - a generic argument: ``<Type>``, ``Map<String, Type>``
+  - an annotation: ``@Type``
+  - a Java/C#/Dart declared type followed by a name: ``Type name =``,
+    ``Type name;``, ``Type name)``, ``Type name(``
+
+  ``new Type(...)`` and every other position is a *value* use. A line is
+  never judged as a whole: a declaration line ``AudioRecord r = new AudioRecord()``
+  has one type-position hit and one value-position hit.
+  """
+  lo, hi = _enclosing_identifier(line, col, length)
+  before = line[:lo].rstrip()
+  after = line[hi:]
+  if before.endswith("@"):
+    return True
+  if _TYPE_LEADING_RE.search(before):
+    return True
+  if before.endswith(":") and not before.endswith("::"):
+    return True
+  if before.endswith("<"):
+    return True
+  if before.endswith(",") and before.count("<") > before.count(">"):
+    return True
+  if _DECLARED_TYPE_TAIL_RE.match(after):
+    # ``Type name = ...`` / ``Type name;`` / ``Type method(`` / ``f(Type name,``:
+    # a type when it opens a statement, follows a modifier, or opens a
+    # parameter slot. ``return x foo(`` and ``= x foo(`` are not valid code, so
+    # anything else is treated as a value to stay on the recall side.
+    if not before or before[-1] in "{;}(,":
+      return True
+    if before.split()[-1] in _DECL_MODIFIERS:
+      return True
+  return False
+
+
+def lexical_hits(lines: Sequence[str], pattern: str) -> LexicalHits:
+  """Classifies every occurrence of an identifier pattern (see :class:`LexicalHits`)."""
+  out = LexicalHits()
+  if not is_identifier_pattern(pattern):
+    return out
+  for i, line in enumerate(lines):
+    if pattern not in line and not (
+        pattern.islower() and (pattern[0].upper() + pattern[1:]) in line):
+      continue
+    stripped = line.lstrip()
+    if stripped.startswith(_COMMENT_PREFIXES) or stripped.startswith(_IMPORT_PREFIXES):
+      out.demoted_lines.append(i)
+      out.examples.setdefault("demoted", stripped[:160])
+      continue
+    matches = boundary_matches(line, pattern)
+    if not matches:
+      out.substring_lines.append(i)
+      out.examples.setdefault("substring", stripped[:160])
+      continue
+    value_cols = [c for c, _ in matches if not is_type_position(line, c, len(pattern))]
+    if not value_cols:
+      out.type_lines.append(i)
+      out.examples.setdefault("type", stripped[:160])
+    else:
+      out.value_lines.append(i)
+      out.examples.setdefault("value", stripped[:160])
+      if any(exact for c, exact in matches if c in value_cols):
+        out.exact_value_lines.append(i)
+  return out
+
+
 _DECL_HINT_RE = re.compile(
     r"\b(fun|def|void|public|private|protected|internal|static|override|suspend|"
     r"func|function|async|constructor|init|get|set|class|object|interface)\b"
     r"|=>\s*\{?\s*$|\)\s*(?::\s*[\w<>\[\]?., ]+)?\s*\{?\s*$"
 )
+
+# Control-flow block headers also end in ``) {`` and would otherwise satisfy the
+# last alternative of ``_DECL_HINT_RE``. They are *not* declarations: a hit
+# inside ``switch (x) { ... }`` must still resolve to the enclosing function so
+# that a sink called two lines after the block (``startActivity(intent)``)
+# counts as "in scope". Found on a dev app where a MIME literal inside a
+# ``switch`` lost its IPC sink and the anchor ranked tier 3 (WP2).
+_CONTROL_HEADER_RE = re.compile(
+    r"^\s*\}?\s*(?:else\s+)?"
+    r"(?:if|else|for|while|do|switch|when|case|try|catch|finally|synchronized|"
+    r"with|repeat|foreach|until|unless|lock|using|select)\b"
+)
+# Expression-form control blocks: ``val mime = when (which) {``,
+# ``return if (x) {``, ``= try {`` (Kotlin/Scala/Swift-style).
+_EXPR_CONTROL_RE = re.compile(r"(?:=|\breturn|\bthrow)\s*(?:if|when|try|switch|match)\b")
+
+
+def is_declaration_header(line: str) -> bool:
+  """True when ``line`` opens a function/class/lambda body (not a control block)."""
+  if _CONTROL_HEADER_RE.match(line) or _EXPR_CONTROL_RE.search(line):
+    return False
+  return bool(_DECL_HINT_RE.search(line))
 
 
 def _depth_profile(lines: Sequence[str]) -> List[int]:
@@ -495,11 +811,11 @@ def enclosing_scope(
     if profile[i] < depth_wanted:
       # Line i opens a block enclosing the hit. Is it a declaration?
       header = lines[i]
-      if _DECL_HINT_RE.search(header) and "(" in header:
+      if is_declaration_header(header) and "(" in header:
         start = i
         break
       # A bare "{" on its own line: the header is the previous line.
-      if header.strip() == "{" and i > 0 and _DECL_HINT_RE.search(lines[i - 1]):
+      if header.strip() == "{" and i > 0 and is_declaration_header(lines[i - 1]):
         start = i - 1
         break
       depth_wanted = profile[i]

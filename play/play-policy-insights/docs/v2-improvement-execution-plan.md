@@ -155,6 +155,102 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
   labelled case has no probability). Model-call count on both apps drops
   (report the number); no VERIFIED TRANSMITS lost in `triage-diff`.
 - **Size.** Medium in `structure.py`, small in `engine.py`.
+- **Outcome (done).** Pre-gate as specified plus a run of recall fixes that
+  the new `calibrate --rejoin` check surfaced. Everything is flagged for
+  rollback and traced in `typesafe_triage.json["counters"]["lexical_pregate"]`
+  and on each finding's `decision_trace.anchor.lexical`.
+  - `structure.py`: `boundary_matches` / `boundary_columns` /
+    `is_type_position` / `lexical_hits` → `LexicalHits` with a per-file
+    verdict (`value`, `type_only`, `substring_only`, `demoted_only`, `none`,
+    `non_identifier`). Boundaries are camel/snake/kebab/dot **plus** a small
+    set of English affixes (`re`-prefix, `s/es/ed/er/ing/ion/able/y`
+    suffixes, capitalised opener) so `Relogin`, `records`, `tracking` still
+    count; foreign stems (`dob`, `grace`→`race`, `multimap`→`imap`,
+    `fluid`→`uid`, `uuid`→`uid`) do not. Only identifier-shaped patterns are
+    gated; MIME literals and paths (`video/*`) are `non_identifier` and pass.
+  - `engine._lexical_pregate()` runs after `_analyze_files` and before the
+    capability classifier, so files whose only hits are coincidences are
+    pruned from the import inventory too (`files_pruned`: 9 on App A, 11 on
+    App B — fewer capability requests). Drops carry the offending line as
+    `example` plus `lines`. Type-position-only drops are **off**
+    (`LEXICAL_TYPE_ONLY_DROP = False`): a `: AudioRecord` field driven via
+    the field name is a real use; the verdict is recorded so the effect can
+    be measured on a labelled set first. Path exclusion extended with
+    `EXCLUDED_PATH_SUFFIXES` (`.po .pot .arb .strings .xliff .xlf`).
+  - `calibrate --rejoin --worker-dir …` re-joins the frozen labels to a new
+    run and **exits 2** when any labelled transfer has no finding
+    (`missing_positives`). This is the WP's recall-1.0 check and it caught
+    five silent losses in a row, each fixed at its root:
+    1. `all_occurrences` capped hits at 5 *before* ranking — the sink-adjacent
+       occurrence of a clipboard transfer was the sixth in file order.
+       `MAX_OCCURRENCES_RANKED = 60`; the model-facing list is capped
+       separately (`MAX_HIT_LINES_IN_STATE = 5`, chosen line always included);
+       exact-case hits rank before case-folded ones.
+    2. `symbol_references` stopped after **12** lines per symbol, so the
+       `startActivity(Intent.createChooser(…))` that was the 14th `Intent`
+       use in a 2 000-line activity was invisible to scope/proximity ranking
+       (a labelled MIME-sharing transfer ranked tier 3). Bound raised to
+       `MAX_SYMBOL_REFERENCE_LINES = 400`; `Sink.to_state()` lists at most
+       `MAX_SINK_REF_LINES_IN_STATE = 20` lines nearest the anchors and
+       reports `omitted_lines`; `related_lines` are now the sink lines
+       **nearest an anchor**, not the first in file order.
+    3. `enclosing_scope` treated any `… ) {` header as a declaration, so a
+       hit inside `switch (which) { … }` had the *switch block* as its scope
+       and the sink two lines after the block was "out of scope".
+       `is_declaration_header()` now rejects control-flow headers
+       (`if/else/for/while/do/switch/when/case/try/catch/finally/…` and the
+       expression forms `= when (…) {`, `return if (…) {`).
+    4. The per-type cap (`MAX_FINDINGS_PER_TYPE`, raised 8 → 12) dropped
+       tier-2 candidates *with a sink in scope* while keeping tier-3 ones of
+       other types. `CAP_EXEMPTS_SINK_IN_SCOPE = True`: the cap is a cost
+       control and only trims tier-3 candidates; exemptions are counted
+       (`cap_exempt_sink_in_scope`: 2 on App A, 1 on App B).
+    5. The relevance question listed "a MIME type" among *unrelated* uses, so
+       `video/*` inside an `ACTION_VIEW` chooser was answered p=0.09–0.12
+       while its sibling `audio/*`, `image/*`, `text/*` in the same `switch`
+       passed. Reworded: a MIME/picker filter that selects, opens or shares
+       files of that kind *is* handling the data type (sharing via intent is
+       a transfer by policy). Question text is part of the cache key, so only
+       relevance answers were re-asked. **This is a question change and
+       therefore part of the M2 version bump.**
+  - Soft relevance gate (`RELEVANCE_SOFT_GATE_ENABLED`): a `signal_relevant`
+    answer below `T_RELEVANCE` may suppress a finding only when the anchor's
+    scope has no egress/IPC sink (tier 2–3). With a sink in scope the finding
+    is kept, capped at IMPORTANT, `needs_manual_review`, summary suffixed
+    `[data-type match uncertain: p=…; verify]`, trace `relevance: "low"`.
+    Below `T_RELEVANCE_FLOOR = 0.10` the model is confidently negative and
+    the finding is dropped even with a sink (every keep under 0.10 on the dev
+    apps was `track`→MUSIC, `record`→AUDIO, `PowerManager`→DIAGNOSTICS).
+    Soft keeps after the floor: 2 on App A, 6 on App B, all plausible review
+    items.
+  - `evaluate.reconcile_disclosure_status()`: the `disclosure_status` Choice
+    is cross-checked against the battery's own `has_prominent_disclosure`
+    Noul. `DISCLOSED` with p < `T_DISCLOSURE` → `MISSING` + review (a wider
+    scope had flipped four Panels-file media transfers to DISCLOSED at
+    p=0.15–0.18); `EXEMPT` on a non-user-initiated transfer → `MISSING`.
+    Trace: `decision_trace.disclosure_reconciled`.
+  - **Exit measured.** Selftest 233 checks green. `calibrate --rejoin` on
+    both dev apps: exit 0, 48/48 labelled cases rejoined, 0 missing
+    positives (rejoined band `T_LOW 0.30 / T_HIGH 0.60`, ECE 0.28 — used at
+    M2, not applied here). Model calls, measured offline at a **fixed** cap
+    of 8 (heuristic client, same batching): App A 86 → 78 (−9 %), App B
+    43 → 36 (−16 %) — that is the pre-gate's own effect. With the recall
+    fixes (cap 12 + sink-in-scope exemption) the totals are App A 111 /
+    App B 46 offline, 100 / 39 live; the WP therefore **spends** the
+    pre-gate saving on recall, which is the charter's ordering. Pre-gate
+    drops: 41 (App A), 37 (App B), all inspected as genuine coincidences.
+    `triage-diff` vs baseline: App A 60 → 75 findings, TRANSMITS 16 → 17,
+    no TRANSMITS lost (one moved from `prominent_disclosure_policy` to
+    `data_safety_section` because the model now answers `EXEMPT` for the
+    user-initiated share; it stays TRANSMITS and critic-VERIFIED). App B
+    45 → 60, TRANSMITS 4 → 7; two threshold-adjacent flips TRANSMITS →
+    UNCERTAIN (`p` 0.77 → 0.68 and 0.70 → 0.61 against `T_HIGH = 0.70`) —
+    both remain routed to review and one is critic-VERIFIED; the rejoined
+    band (`T_HIGH ≈ 0.60`) would keep both as TRANSMITS and is applied at
+    M2 with the version bump.
+  - Not done here (tracked): `engine._first_party_packages` still reads the
+    orchestrator's `package_name` (WP6 switches to the profile's value with
+    the first-party index).
 
 ### WP3 — Structured evidence (L6)
 
@@ -478,7 +574,7 @@ touching the rest of the cascade.
 
 - [x] WP0 baseline + `triage-diff`
 - [x] WP1 `android_manifest.py` / `AppProfile`
-- [ ] WP2 identifier-boundary pre-gate
+- [x] WP2 identifier-boundary pre-gate
 - [ ] WP3 structured evidence
 - [ ] WP4 `declared_core_purpose` (per-app cache)
 - [ ] WP5 wave 1 policies (FGS fixes, package visibility, all files, exact alarm, target API)

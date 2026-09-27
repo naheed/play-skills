@@ -434,6 +434,55 @@ def _test_structure_layer() -> None:
   _check("occurrences_demote_comment", hits == [6], str(hits))
   scope = structure.enclosing_scope(lines, 6, "kotlin")
   _check("enclosing_scope_method", scope == (5, 9), str(scope))
+  # Control-flow headers end in ") {" like declarations but must not clip the
+  # scope: a hit inside switch/if/for resolves to the enclosing function so a
+  # sink called after the block is still "in scope" (WP2 recall fix).
+  java_ctrl = (
+      "class P {\n"                                   # 0
+      "  public void onClick(int which) {\n"          # 1
+      "    String mime;\n"                            # 2
+      "    switch( which ) {\n"                       # 3
+      "      case 1: mime = \"video/*\"; break;\n"    # 4
+      "      default: mime = \"*/*\";\n"              # 5
+      "    }\n"                                       # 6
+      "    if (mime != null) {\n"                     # 7
+      "      intent.setType(mime);\n"                 # 8
+      "    }\n"                                       # 9
+      "    startActivity(intent);\n"                  # 10
+      "  }\n"                                         # 11
+      "}\n")
+  cl = java_ctrl.splitlines()
+  _check("scope_skips_switch_header", structure.enclosing_scope(cl, 4, "java") == (1, 12),
+         str(structure.enclosing_scope(cl, 4, "java")))
+  _check("scope_skips_if_header", structure.enclosing_scope(cl, 8, "java") == (1, 12),
+         str(structure.enclosing_scope(cl, 8, "java")))
+  kt_ctrl = (
+      "class Q {\n"                                   # 0
+      "  fun pick(which: Int) {\n"                    # 1
+      "    val mime = when (which) {\n"               # 2
+      "      1 -> \"video/*\"\n"                      # 3
+      "      else -> \"*/*\"\n"                       # 4
+      "    }\n"                                       # 5
+      "    for (i in 0 until 3) {\n"                  # 6
+      "      Log.d(TAG, mime)\n"                      # 7
+      "    }\n"                                       # 8
+      "    startActivity(intent)\n"                   # 9
+      "  }\n"                                         # 10
+      "}\n")
+  kl = kt_ctrl.splitlines()
+  _check("scope_skips_when_header", structure.enclosing_scope(kl, 3, "kotlin") == (1, 11),
+         str(structure.enclosing_scope(kl, 3, "kotlin")))
+  _check("scope_skips_for_header", structure.enclosing_scope(kl, 7, "kotlin") == (1, 11),
+         str(structure.enclosing_scope(kl, 7, "kotlin")))
+  _check("decl_header_classifier",
+         structure.is_declaration_header("  public void onClick(int w) {")
+         and structure.is_declaration_header("  fun send(x: String) {")
+         and structure.is_declaration_header("  } else if (x) {") is False
+         and not structure.is_declaration_header("    switch( which ) {")
+         and not structure.is_declaration_header("    while (running) {")
+         and not structure.is_declaration_header("    val m = when (which) {")
+         and not structure.is_declaration_header("    return if (ok) {")
+         and not structure.is_declaration_header("    } catch (Exception e) {"))
   _check("package_of_dotted", structure.package_of("java.net.Socket") == "java.net")
   _check("wildcard_import_kept", structure.import_inventory("import java.net.*;\n", "java") == ["java.net.*"]
          and structure.package_of("java.net.*") == "java.net")
@@ -609,10 +658,73 @@ def _test_three_way_decision() -> None:
   _check("transmits_critical", tx["severity"] == "CRITICAL" and tx["claim_kind"] == "transfer")
   gated = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", state, _answers(0.95, relevant=0.1), "test")  # pylint: disable=protected-access
   _check("relevance_gate_drops", gated is None)
+  # WP2 soft gate: a low relevance answer cannot suppress a finding whose anchor
+  # scope holds an egress/IPC sink; it is kept for review and capped at IMPORTANT.
+  sink_state = {**state, "anchor": {**state["anchor"], "tier": 1}}
+  uncertain_rel = (constants.T_RELEVANCE_FLOOR + constants.T_RELEVANCE) / 2  # inside the soft band
+  soft = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", sink_state, _answers(0.95, relevant=uncertain_rel), "test")  # pylint: disable=protected-access
+  _check("relevance_soft_gate_keeps_with_sink",
+         soft is not None and soft.get("needs_manual_review") is True and soft["severity"] == "IMPORTANT"
+         and soft["decision_trace"].get("relevance") == "low" and "match uncertain" in soft["issue_summary"],
+         str(soft and (soft["severity"], soft["issue_summary"])))
+  no_sink_state = {**state, "anchor": {**state["anchor"], "tier": 3}}
+  _check("relevance_soft_gate_drops_without_sink",
+         evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", no_sink_state, _answers(0.95, relevant=uncertain_rel), "test") is None)  # pylint: disable=protected-access
+  # A confidently negative relevance answer (below the floor) is dropped even
+  # with a sink in scope: the soft band is for uncertain matches only.
+  _check("relevance_soft_gate_floor_drops_confident_negative",
+         evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", sink_state,
+                                               _answers(0.95, relevant=constants.T_RELEVANCE_FLOOR / 2), "test") is None)  # pylint: disable=protected-access
+  _check("relevance_soft_gate_floor_inclusive",
+         evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", sink_state,
+                                               _answers(0.95, relevant=constants.T_RELEVANCE_FLOOR), "test") is not None)  # pylint: disable=protected-access
+  _check("relevance_floor_traced",
+         soft is not None and soft["decision_trace"]["thresholds"].get("T_RELEVANCE_FLOOR") == constants.T_RELEVANCE_FLOOR)
+  constants.RELEVANCE_SOFT_GATE_ENABLED = False
+  try:
+    _check("relevance_soft_gate_flag_off",
+           evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", sink_state, _answers(0.95, relevant=uncertain_rel), "test") is None)  # pylint: disable=protected-access
+  finally:
+    constants.RELEVANCE_SOFT_GATE_ENABLED = True
+  perm_soft = evaluate._compose_permission_finding("PRECISE_LOCATION", "location_access_policy", sink_state, {  # pylint: disable=protected-access
+      **_answers(0.95, relevant=uncertain_rel), "is_core_functionality": JevAnswer("noul", noul=0.1)}, "test")
+  _check("relevance_soft_gate_permission", perm_soft is not None and perm_soft.get("needs_manual_review") is True
+         and perm_soft["severity"] == "IMPORTANT", str(perm_soft and perm_soft["severity"]))
   perm = evaluate._compose_permission_finding("PRECISE_LOCATION", "location_access_policy", state, {  # pylint: disable=protected-access
       **_answers(mid), "is_core_functionality": JevAnswer("noul", noul=0.1)}, "test")
   _check("permission_uncertain_review", perm is not None and perm.get("needs_manual_review") is True
          and perm["claim_kind"] == "generic", str(perm and perm.get("severity")))
+  # WP2: the disclosure Choice is cross-checked against the battery's own Noul.
+  # DISCLOSED with P(disclosure) below T_DISCLOSURE falls back to MISSING and
+  # keeps the prominent-disclosure routing + severity; a consistent DISCLOSED
+  # (high Noul) is honoured; EXEMPT on a non-user-initiated transfer is MISSING.
+  contradict = {**_answers(0.95), "disclosure_status": JevAnswer("choice", choice="DISCLOSED"),
+                "has_prominent_disclosure": JevAnswer("noul", noul=0.18)}
+  rec = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", state, contradict, "test")  # pylint: disable=protected-access
+  _check("disclosure_reconciled_to_missing",
+         rec["prominent_disclosure_status"] == "MISSING" and rec["policy_id"] == "prominent_disclosure_policy"
+         and rec["severity"] == "CRITICAL" and rec.get("needs_manual_review") is True
+         and "DISCLOSED->MISSING" in (rec["decision_trace"].get("disclosure_reconciled") or ""),
+         str((rec["prominent_disclosure_status"], rec["policy_id"], rec["severity"])))
+  consistent = {**contradict, "has_prominent_disclosure": JevAnswer("noul", noul=0.85)}
+  ok = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", state, consistent, "test")  # pylint: disable=protected-access
+  _check("disclosure_consistent_kept",
+         ok["prominent_disclosure_status"] == "DISCLOSED" and ok["policy_id"] == "data_safety_section"
+         and ok["decision_trace"].get("disclosure_reconciled") is None and not ok.get("needs_manual_review"),
+         str((ok["prominent_disclosure_status"], ok["policy_id"])))
+  exempt_bg = {**_answers(0.95), "disclosure_status": JevAnswer("choice", choice="EXEMPT")}
+  bg = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", state, exempt_bg, "test")  # pylint: disable=protected-access
+  _check("exempt_background_transfer_is_missing",
+         bg["prominent_disclosure_status"] == "MISSING" and "EXEMPT->MISSING" in (bg["decision_trace"].get("disclosure_reconciled") or ""),
+         str(bg["prominent_disclosure_status"]))
+  exempt_user = {**exempt_bg, "user_initiated": JevAnswer("noul", noul=0.9)}
+  ui = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", state, exempt_user, "test")  # pylint: disable=protected-access
+  _check("exempt_user_initiated_kept", ui["prominent_disclosure_status"] == "EXEMPT"
+         and ui["decision_trace"].get("disclosure_reconciled") is None, str(ui["prominent_disclosure_status"]))
+  local_disc = {**contradict, "transmits_offdevice": JevAnswer("noul", noul=0.1)}
+  ld = evaluate._compose_data_safety_finding("PRECISE_LOCATION", "A.kt (Pattern: loc)", state, local_disc, "test")  # pylint: disable=protected-access
+  _check("local_stays_exempt_no_reconcile", ld["prominent_disclosure_status"] == "EXEMPT"
+         and ld["decision_trace"].get("disclosure_reconciled") is None)
 
 
 def _test_critic_routing() -> None:
@@ -721,6 +833,82 @@ def _test_triage_ranking() -> None:
     _check("triage_tiers_in_trace", tiers.get(f"app/F{n-1}.kt") == 0 and tiers.get(f"app/F{n-2}.kt") == 1
            and tiers.get("app/F0.kt") == 3, str(tiers))
     _check("triage_declared_caps_key", "dependency_capabilities" in triage)
+
+  # WP2: the per-type cap only trims candidates with no sink in scope. When
+  # more than MAX_FINDINGS_PER_TYPE candidates each have an IPC sink in their
+  # own function, all of them reach the model (bounded by the candidate cap).
+  with tempfile.TemporaryDirectory() as d:
+    os.makedirs(os.path.join(d, "app"))
+    m = cap + 1
+    for i in range(m):
+      body = ("import android.content.Intent\n"
+              "fun f() {\n  val n = user.name\n  startActivity(Intent().putExtra(\"n\", n))\n}\n")
+      with open(os.path.join(d, f"app/S{i}.kt"), "w", encoding="utf-8") as f:
+        f.write(body)
+    scratch = os.path.join(d, ".scratch")
+    _write_scratch(d, scratch, {"NAME": [f"app/S{i}.kt (Pattern: name)" for i in range(m)]})
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    _check("triage_cap_exempts_sink_in_scope",
+           triage["counters"]["kept"] == m and triage["counters"].get("cap_exempt_sink_in_scope") == 1
+           and not [x for x in triage["dropped"] if "MAX_FINDINGS_PER_TYPE" in x["reason"]],
+           str((triage["counters"].get("kept"), triage["counters"].get("cap_exempt_sink_in_scope"))))
+    constants.CAP_EXEMPTS_SINK_IN_SCOPE = False
+    try:
+      scratch2 = os.path.join(d, ".scratch2")
+      _write_scratch(d, scratch2, {"NAME": [f"app/S{i}.kt (Pattern: name)" for i in range(m)]})
+      engine.run(scratch2, HeuristicJevClient(), batched=True)
+      triage2 = json.load(open(os.path.join(scratch2, engine.TRIAGE_FILENAME), encoding="utf-8"))
+      _check("triage_cap_exempt_flag_off", triage2["counters"]["kept"] == cap
+             and triage2["counters"].get("cap_exempt_sink_in_scope") == 0, str(triage2["counters"].get("kept")))
+    finally:
+      constants.CAP_EXEMPTS_SINK_IN_SCOPE = True
+
+
+def _test_sink_visibility() -> None:
+  """Every reference of a sink symbol is visible to ranking; the model view is bounded.
+
+  Regression for a labelled MIME-sharing transfer whose ``startActivity`` was
+  the 14th ``Intent`` reference in a large activity: the old 12-line cap in
+  ``symbol_references`` hid it and the anchor ranked tier 3.
+  """
+  from typesafe_eval import capabilities as capsmod
+  from typesafe_eval import constants
+  from typesafe_eval import context
+  from typesafe_eval import structure
+  n_refs = constants.MAX_SINK_REF_LINES_IN_STATE + 6
+  src = ["import android.content.Intent", "class A {"]
+  for i in range(n_refs - 1):
+    src += [f"  fun early{i}() {{", f"    val i{i} = Intent()", "  }"]
+  src += ["  fun share(which: Int) {",
+          "    var mime = \"\"",
+          "    switch (which) {",
+          "      case 1: mime = \"video/*\"; break;",
+          "    }",
+          "    startActivity(Intent.createChooser(intent, mime))",
+          "  }", "}"]
+  lines = src
+  refs = structure.symbol_references(lines, ["android.content.Intent"])["android.content.Intent"]
+  last = len(lines) - 3  # the startActivity line (0-based)
+  _check("symbol_refs_not_truncated", len(refs) == n_refs and last in refs, str((len(refs), last in refs)))
+  fs = structure.FileStructure("A.kt", "kotlin", lines, ["android.content.Intent"],
+                               {"android.content.Intent": refs}, "a")
+  profiles = {"android.content.Intent": capsmod.CapabilityProfile(
+      "android.content.Intent", "import", {capsmod.IPC_SHARING: 0.9}, [capsmod.IPC_SHARING], "heuristic", None)}
+  sinks = context.file_sinks(fs, profiles)
+  anchor = context.anchor_signal(fs, "video/*", "VIDEOS", sinks)
+  _check("anchor_sees_late_sink", anchor.sink_in_scope and anchor.tier == 1, str((anchor.sink_in_scope, anchor.tier, anchor.scope)))
+  st = sinks[0].to_state(near=[anchor.chosen])
+  _check("sink_state_bounded",
+         len(st["lines"]) == constants.MAX_SINK_REF_LINES_IN_STATE and st.get("omitted_lines") == 6
+         and (last + 1) in st["lines"], str((len(st["lines"]), st.get("omitted_lines"))))
+  _check("sink_state_full_when_small", "omitted_lines" not in context.Sink("S", "m", [], [1, 2]).to_state())
+  state, per_ask = context.build_file_state(fs, [("VIDEOS", "video/*")], profiles, {})
+  _check("related_lines_nearest_anchor",
+         all(r.startswith("L") for r in state["related_lines"])
+         and len(state["related_lines"]) <= constants.MAX_SINK_LINES_IN_STATE
+         and per_ask[0]["anchor"]["sink_in_scope"] is True,
+         str(state["related_lines"][:2]))
 
 
 def _test_identifier_lint() -> None:
@@ -991,9 +1179,182 @@ def _test_app_profile() -> None:
     _check("profile_missing_app_dir", missing.manifests == [] and missing.warnings)
 
 
+def _test_lexical_pregate() -> None:
+  """WP2: identifier-boundary matching, type positions, engine drop + recall check."""
+  from typesafe_eval import structure
+  from typesafe_eval import engine
+  from typesafe_eval import constants
+  from typesafe_eval.client import HeuristicJevClient
+
+  def cols(line, pat):
+    return structure.boundary_columns(line, pat)
+
+  # Legacy false positives (lesson L1): mid-word / foreign stems must NOT match.
+  _check("lex_foreign_stem_dob", cols("val x = dobiti(y)", "dob") == [])
+  _check("lex_foreign_stem_fico", cols('text = "gráfico"', "fico") == [])
+  _check("lex_grace_not_race", cols("val grace = 1", "race") == [])
+  _check("lex_multimap_not_imap", cols("val m = HashMultimap.create()", "imap") == [])
+  _check("lex_trace_not_race", cols("Trace.beginSection(x)", "race") == [])
+  _check("lex_fluid_not_uid", cols("val fluidity = 2", "uid") == [])
+  # Genuine identifier words at every boundary class survive.
+  _check("lex_snake", cols("val full_name = user.name", "full_name") == [4])
+  _check("lex_camel_prefix", cols("audio.startRecord()", "record") == [11])
+  _check("lex_camel_suffix", cols("val recordAudio = true", "record") == [4])
+  _check("lex_pascal_compound", cols("val r = AudioRecord(src)", "record") == [13])
+  _check("lex_kebab", cols('"user-dob-field"', "dob") == [6])
+  _check("lex_dotted", cols("MediaStore.Images.Media.EXTERNAL_CONTENT_URI", "MediaStore.Images") == [0])
+  _check("lex_whole_word", cols("uid = Binder.getCallingUid()", "uid") == [0, 23])
+  _check("lex_camel_uid", cols("val appUid = info.uid", "uid") == [7, 18])
+  # English derivations are still the word (recall side).
+  _check("lex_suffix_er", cols("val mr = MediaRecorder()", "record") == [14])
+  _check("lex_suffix_ing", cols("recorder.startRecording()", "record") == [0, 14])
+  _check("lex_suffix_s", cols("val logins = 3", "login") == [4])
+  _check("lex_prefix_re", cols("relogin()", "login") == [2])
+  _check("lex_prefix_capitalised", cols('menu.add(0, OP_RELOGIN, 0, "Relogin")', "login") == [30])
+  _check("lex_uuid_not_uid", cols("makeUriFromUuid(ctx, id)", "uid") == [])
+  _check("lex_dirsfx_not_sfx", cols("R.string.sz_dirsfx", "sfx") == [])
+  # Type vs value positions.
+  T = structure.is_type_position
+  _check("lex_type_class_header", T("class LogRecordAdapter : Base()", 9, 6))
+  _check("lex_type_kotlin_annotation", T("private val rec: LogRecord? = null", 20, 6))
+  _check("lex_type_generic", T("val items: List<LogRecord> = emptyList()", 19, 6))
+  _check("lex_type_java_decl", T("    LogRecord rec = new LogRecord();", 7, 6))
+  _check("lex_value_java_new", not T("    LogRecord rec = new LogRecord();", 27, 6))
+  _check("lex_value_param_name", not T("fun format(record: LogRecord): String", 11, 6))
+  _check("lex_value_call", not T("audio.record(buffer)", 6, 6))
+  _check("lex_value_ctor", not T("val r = AudioRecord(src)", 13, 6))
+  lines = ["import java.util.logging.LogRecord",
+           "class Fmt : Formatter() {",
+           "  override fun format(record: LogRecord): String = record.message",
+           "}"]
+  lex = structure.lexical_hits(lines, "record")
+  _check("lex_hits_value_and_demoted", lex.verdict == "value" and lex.demoted_lines == [0]
+         and lex.value_lines == [2], str(lex))
+  lex2 = structure.lexical_hits(["val x = dobiti()", "// record here", "val y = dobro"], "dob")
+  _check("lex_hits_substring_only", lex2.verdict == "substring_only" and "substring" in lex2.examples, str(lex2))
+  lex3 = structure.lexical_hits(["private val rec: AudioRecord? = null", "rec?.startRecording()"], "record")
+  _check("lex_hits_type_then_value", lex3.verdict == "value", str(lex3))
+  _check("lex_non_identifier_passthrough", not structure.is_identifier_pattern("audio/*")
+         and structure.is_identifier_pattern("MediaStore.Images"))
+  # all_occurrences prefers boundary value hits for the anchor.
+  occ = structure.all_occurrences(["val grace = 1", "val race = user.race", "// race"], "race")
+  _check("lex_all_occurrences_prefers_boundary", occ[0] == 1 and 0 in occ, str(occ))
+  # ...and the scanner's exact spelling ahead of the capitalised variant.
+  lexe = structure.lexical_hits(["b.aboutStackTrace.setOnClickListener(this)",
+                                 'copyToClipboard("stack_trace", text)'], "trace")
+  _check("lex_exact_case_ranked_first", lexe.exact_value_lines == [1] and lexe.ranked_lines() == [1, 0],
+         str(lexe))
+  # Anchor ranking sees every occurrence: the sink-adjacent one is sixth in file order.
+  from typesafe_eval import context as ctxmod
+  from typesafe_eval import capabilities as capsmod
+  many = ["import okhttp3.OkHttpClient", "class A {"]
+  for i in range(5):
+    many += [f"  fun f{i}() {{", f"    val stackTrace{i} = x", "  }"]
+  many += ["  fun share() {", "    val t = trace_text", "    http.newCall(t).execute()", "  }", "}"]
+  fs = structure.FileStructure("A.kt", "kotlin", many, ["okhttp3.OkHttpClient"],
+                               {"okhttp3.OkHttpClient": [len(many) - 3]})
+  prof = {"okhttp3.OkHttpClient": capsmod.CapabilityProfile(
+      "okhttp3.OkHttpClient", "import", {capsmod.NETWORK_EGRESS: 0.95}, [capsmod.NETWORK_EGRESS],
+      "heuristic", None)}
+  sinks = ctxmod.file_sinks(fs, prof)
+  a = ctxmod.anchor_signal(fs, "trace", "PERFORMANCE_DIAGNOSTICS", sinks)
+  _check("lex_anchor_ranks_all_occurrences", a.chosen == len(many) - 4 and a.sink_in_scope
+         and a.chosen in a.hit_lines and len(a.hit_lines) <= constants.MAX_HIT_LINES_IN_STATE,
+         f"chosen={a.chosen} hits={a.hit_lines}")
+
+  # End to end: the substring-only candidate is dropped with a recorded reason,
+  # the genuine one is evaluated, and the pruned file's imports are not classified.
+  with tempfile.TemporaryDirectory() as d:
+    os.makedirs(os.path.join(d, "app"))
+    with open(os.path.join(d, "app", "Loc.kt"), "w", encoding="utf-8") as f:
+      f.write(_KT_LOCATION_SINK)
+    with open(os.path.join(d, "app", "Noise.kt"), "w", encoding="utf-8") as f:
+      f.write("package com.x.noise\nimport okhttp3.OkHttpClient\n"
+              "fun grace() { val g = HashMultimap.create<String, String>(); dobiti(g) }\n")
+    scratch = os.path.join(d, ".scratch")
+    _write_scratch(d, scratch, {
+        "PRECISE_LOCATION": ["app/Loc.kt (Pattern: FusedLocationProviderClient)"],
+        "RACE_ETHNICITY": ["app/Noise.kt (Pattern: race)"],
+        "EMAILS": ["app/Noise.kt (Pattern: imap)"],
+        "PERSONAL_INFO_OTHER": ["app/Noise.kt (Pattern: dob)"],
+        "FILES_AND_DOCS": ["app/Noise.kt (Pattern: */*)"],
+    })
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    drops = [x for x in triage["dropped"] if x["reason"] == "no identifier-boundary match"]
+    _check("lex_engine_drops_recorded",
+           sorted(x["data_type"] for x in drops) == ["EMAILS", "PERSONAL_INFO_OTHER", "RACE_ETHNICITY"]
+           and all(x.get("example") for x in drops), str(drops))
+    stats = triage["counters"]["lexical_pregate"]
+    _check("lex_engine_counters", stats["dropped_substring_only"] == 3 and stats["kept_value"] == 1
+           and stats["kept_non_identifier"] == 1 and stats["files_pruned"] == 0, str(stats))
+    ds = json.load(open(os.path.join(scratch, "worker_data_safety.json"), encoding="utf-8"))
+    _check("lex_engine_genuine_survives",
+           any(x.get("psl_constant") == "PRECISE_LOCATION" for x in ds["findings"])
+           and not any(x.get("psl_constant") == "RACE_ETHNICITY" for x in ds["findings"]))
+    loc = [x for x in ds["findings"] if x.get("psl_constant") == "PRECISE_LOCATION" and x.get("decision_trace")]
+    _check("lex_trace_has_verdict", bool(loc) and loc[0]["decision_trace"]["anchor"].get("lexical") == "value",
+           str(loc[0]["decision_trace"]["anchor"] if loc else None))
+    # Without the MIME candidate the noise file is pruned entirely.
+    _write_scratch(d, scratch, {
+        "PRECISE_LOCATION": ["app/Loc.kt (Pattern: FusedLocationProviderClient)"],
+        "RACE_ETHNICITY": ["app/Noise.kt (Pattern: race)"],
+    })
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    _check("lex_engine_prunes_file", triage["counters"]["lexical_pregate"]["files_pruned"] == 1
+           and "com.x.noise" in triage["counters"]["first_party_packages"],
+           str(triage["counters"]))
+    # Rollback flag restores the old behaviour.
+    constants.LEXICAL_PREGATE_ENABLED = False
+    try:
+      engine.run(scratch, HeuristicJevClient(), batched=True)
+      triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+      _check("lex_engine_flag_off", triage["counters"]["lexical_pregate"] == {"enabled": False}
+             and not any(x["reason"] == "no identifier-boundary match" for x in triage["dropped"]))
+    finally:
+      constants.LEXICAL_PREGATE_ENABLED = True
+    # Localisation catalogs are excluded by suffix.
+    _write_scratch(d, scratch, {"NAME": ["app/l10n/intl_de.arb (Pattern: full_name)",
+                                         "app/po/de.po (Pattern: full_name)"]})
+    engine.run(scratch, HeuristicJevClient(), batched=True)
+    triage = json.load(open(os.path.join(scratch, engine.TRIAGE_FILENAME), encoding="utf-8"))
+    _check("lex_catalog_suffix_excluded",
+           sum(1 for x in triage["dropped"] if x["reason"] == "excluded path (localisation catalog)") == 2,
+           str(triage["dropped"]))
+
+  # calibrate --rejoin fails when a labelled transfer has no finding.
+  from typesafe_eval import calibrate
+  with tempfile.TemporaryDirectory() as d:
+    with open(os.path.join(d, "worker_x.json"), "w", encoding="utf-8") as f:
+      json.dump({"findings": [{"psl_constant": "NAME", "files_involved": ["a/B.kt"],
+                               "decision_trace": {"scores": {"transmits_offdevice": 0.9}}}]}, f)
+    labels = {"worker_dirs": [d], "cases": [
+        {"file": "B.kt", "data_type": "NAME", "transfers": True, "p_transmit": 0.2},
+        {"file": "Gone.kt", "data_type": "NAME", "transfers": True, "p_transmit": 0.9},
+        {"file": "Neg.kt", "data_type": "NAME", "transfers": False}]}
+    rep = calibrate.calibrate(labels, rejoin=True)
+    _check("calibrate_rejoin_uses_run_probability",
+           rep["metrics"]["n"] == 1 and rep["rejoined"] is True, str(rep["metrics"]))
+    _check("calibrate_rejoin_missing_positive",
+           [u["file"] for u in rep["missing_positives"]] == ["Gone.kt"]
+           and len(rep["unmatched_cases"]) == 2, str(rep["unmatched_cases"]))
+    rep2 = calibrate.calibrate(labels, rejoin=False)
+    _check("calibrate_stored_probabilities_still_default", rep2["metrics"]["n"] == 2
+           and not rep2["missing_positives"], str(rep2["metrics"]))
+    path = os.path.join(d, "labels.json")
+    with open(path, "w", encoding="utf-8") as f:
+      json.dump(labels, f)
+    import io, contextlib
+    with contextlib.redirect_stdout(io.StringIO()):
+      rc = calibrate.main(path, rejoin=True)
+    _check("calibrate_rejoin_exit_code", rc == 2)
+
+
 def main() -> int:
   _test_triage_diff()
   _test_app_profile()
+  _test_lexical_pregate()
   _test_parse_finding()
   _test_snippet_and_colocation()
   _test_templates()
@@ -1014,6 +1375,7 @@ def main() -> int:
   _test_critic_routing()
   _test_manifest_fgs()
   _test_triage_ranking()
+  _test_sink_visibility()
   _test_identifier_lint()
   _test_calibrate()
   _test_relevance_token_embedded()

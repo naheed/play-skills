@@ -88,12 +88,18 @@ Pure Python, no network. Per file it produces a `FileStructure` with the languag
 import inventory, the declared `package`/`namespace`, and helpers over the line array:
 
 - `symbol_references(lines, symbol)` returns the lines that *use* a symbol, skipping import
-  lines and comment lines (a mention in a comment is not a data flow).
+  lines and comment lines (a mention in a comment is not a data flow). Every call site is
+  returned (bounded only by `MAX_SYMBOL_REFERENCE_LINES = 400`); an earlier cap of 12 hid the
+  14th `Intent` use in a large activity from ranking (WP2).
 - `all_occurrences(lines, pattern)` returns scanner-pattern hits with comment and import
-  lines demoted to the end, so an anchor prefers executable code.
-- `enclosing_scope(lines, index)` finds the method or block containing a line using an
+  lines demoted to the end, so an anchor prefers executable code. With the lexical pre-gate
+  on, identifier-boundary hits come first and exact-case hits before case-folded ones.
+- `enclosing_scope(lines, index)` finds the *function* containing a line using an
   indentation/brace depth profile, so the snippet shown to the model is the whole function
-  that performs the operation rather than a fixed window.
+  that performs the operation rather than a fixed window. Control-flow headers
+  (`switch (x) {`, `if (…) {`, `= when (…) {`, …) are not declarations
+  (`is_declaration_header`), so a hit inside a `switch` still sees a sink called two lines
+  after the block.
 - `dependency_inventory(app_dir)` reads Gradle, `pubspec.yaml`, `package.json` and similar
   manifests so build-declared dependencies can be classified even when no import is seen.
 - `package_of(module)` and `declared_package(content)` support first-party detection: an
@@ -146,6 +152,48 @@ once per run, into an `AppProfile` stored on `RunContext.profile`:
 `resources.py` indexes the default-locale `res/values/*.xml` strings and `res/xml/` paths so
 `@string/` labels (and, from WP8, disclosure wording referenced as `R.string.x`) resolve to
 text.
+
+#### 3.1.2 Identifier-boundary lexical pre-gate — added in WP2
+
+The scanner's patterns are substrings, so `race` matches `printStackTrace`, `uid` matches
+`fluid`, `imap` matches `Multimap` and `dob` matches `adobe`. The v1 evaluator paid a model
+call to reject each of these. The pre-gate is a deterministic cascade step that runs after
+file analysis and before the capability classifier, so files whose only hits are
+coincidences also leave the import inventory (fewer classification requests):
+
+- **What counts as a match.** For identifier-shaped patterns only
+  (`^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$`), an occurrence must start and end at an identifier
+  boundary: a non-alphanumeric character, a camelCase transition (`userUid`, `UidCache`), a
+  digit, or a short English affix (`Relogin`, `records`, `tracking`, `tracker`, `trackable`).
+  A capitalised variant of a lowercase pattern counts as a (non-exact) match. MIME literals,
+  paths and other non-identifier patterns are `non_identifier` and always pass.
+- **Type vs value position.** `is_type_position` recognises class/interface headers,
+  `: Type`, `<Type>`, `@Type`, and `Type name =` declarations. A file whose only boundary
+  hits are type positions gets verdict `type_only`; dropping those is **off**
+  (`LEXICAL_TYPE_ONLY_DROP = False`) because a `: AudioRecord` field driven through the field
+  name is a real use. The verdict is recorded so the effect can be measured on labels first.
+- **Verdicts** per (file, pattern): `value`, `type_only`, `substring_only` (dropped, with the
+  offending line as `example`), `demoted_only` (hits only in comments/imports; kept), `none`.
+  They land in `typesafe_triage.json["counters"]["lexical_pregate"]`, in each drop record,
+  and on every finding as `decision_trace.anchor.lexical`.
+- **Rollback.** `LEXICAL_PREGATE_ENABLED = False` restores the previous behaviour exactly.
+
+Measured on the two development apps: 41 and 37 candidates dropped, 9 and 11 files pruned,
+all inspected as genuine coincidences; battery requests at a fixed cap fell 9 % and 16 %.
+
+#### 3.1.3 Recall checks that shaped the cascade — WP2
+
+`calibrate --rejoin` (see §4) re-joins the frozen label set to every new run and fails when a
+labelled transfer has no finding. Running it after each change surfaced five silent recall
+losses that had nothing to do with the model, each fixed at its root rather than by tuning:
+occurrence capping before ranking (`MAX_OCCURRENCES_RANKED`), symbol-reference truncation
+(`MAX_SYMBOL_REFERENCE_LINES`), control-flow headers clipping the anchor scope
+(`is_declaration_header`), the per-type cost cap dropping candidates that had a sink in
+scope (`CAP_EXEMPTS_SINK_IN_SCOPE`), and a relevance question that told the model MIME
+types were coincidences (`questions._relevance`). The rule that emerged: **caps bound cost,
+never evidence** — a candidate whose own function calls an egress/IPC sink is never dropped
+for cost, and every list shown to the model is bounded separately from the list used for
+ranking.
 
 ### 3.2 Semantic layer (`capabilities.py`)
 
@@ -221,9 +269,26 @@ lines (`MAX_SINK_LINES_IN_STATE`), the app facts and declared capabilities. Each
 
 | Question | Type | Used for |
 | --- | --- | --- |
-| `signal_relevant` — does this snippet handle *this* data type (the literal matched token is embedded in the question) | `Noul` | relevance gate at `T_RELEVANCE = 0.30`; drops scanner false positives such as a MIME table matching "record" |
+| `signal_relevant` — does this snippet read, hold, process, select, open or share *this* data type (the literal matched token is embedded; a MIME/picker filter that picks, opens or hands off files of that kind counts) | `Noul` | relevance gate at `T_RELEVANCE = 0.30`; drops semantic false positives such as a database `record` matching AUDIO |
 | `transmits_offdevice` — is the value sent off-device *or handed to another app* | `Noul` | three-way transfer decision |
 | `is_third_party`, `has_prominent_disclosure`, `is_core_functionality`, `user_initiated` | `Noul` | severity composition in code |
+| `disclosure_status` — DISCLOSED / MISSING / EXEMPT | `Choice` | policy routing, after reconciliation with `has_prominent_disclosure` (below) |
+
+**Soft relevance gate** (`evaluate.relevance_verdict`, WP2). A `signal_relevant` answer below
+`T_RELEVANCE` may *suppress* a finding only when the anchor's own scope has no
+capability-labelled egress or IPC sink (rank tier 2–3). With a sink in scope the code
+demonstrably hands data to a transfer channel, so the finding is kept, capped at IMPORTANT,
+marked `needs_manual_review`, suffixed `[data-type match uncertain: p=…; verify]` and traced
+as `relevance: "low"`. Below `T_RELEVANCE_FLOOR = 0.10` the model is confidently negative and
+the finding is dropped regardless (on the dev apps every keep under 0.10 was `track`→MUSIC,
+`record`→AUDIO or `PowerManager`→DIAGNOSTICS). Rollback: `RELEVANCE_SOFT_GATE_ENABLED`.
+
+**Disclosure reconciliation** (`evaluate.reconcile_disclosure_status`, WP2). The battery asks
+about disclosure twice (a Noul and a Choice); when they disagree the Choice is the less stable
+one. `DISCLOSED` with `has_prominent_disclosure < T_DISCLOSURE` becomes `MISSING` + review;
+`EXEMPT` on an off-device transfer that is not user-initiated becomes `MISSING`. The change is
+traced as `decision_trace.disclosure_reconciled`. LOCAL decisions are EXEMPT in code and never
+reconciled.
 
 **Three-way transfer decision** (`evaluate.transfer_decision`):
 
@@ -266,13 +331,16 @@ Findings already marked `needs_manual_review` are routed without a model call.
 
 **Decision trace.** Each finding's `decision_trace` records `scores` (every probability),
 `thresholds` (the values in force), `anchor` (file, line, scope, `scope_capabilities`,
-`rank_tier`, proximity), `sinks`, `model`, `taxonomy_version` and `evaluator_version`.
+`rank_tier`, proximity, `lexical` verdict), `sinks`, `relevance` (`ok`/`low`),
+`disclosure_reconciled`, `model`, `taxonomy_version` and `evaluator_version`.
 
 ### 3.4 Triage file (`typesafe_triage.json`)
 
 Written next to the worker files on every run. Keys: `evaluator_version`, `model`,
 `counters` (raw signals, candidates, kept, files analysed, imports first-party skipped,
-third-party, packages, refined, dependencies, capability-cache hits/misses), `usage`
+third-party, packages, refined, dependencies, capability-cache hits/misses,
+`lexical_pregate{checked, kept_*, dropped_*, files_pruned}`, `cap_exempt_sink_in_scope`),
+`app_profile` (WP1), `usage`
 (requests, tokens), `findings_by_severity`, `transfer_decisions`, `capabilities` (label
 histogram and unknown count), `dependency_capabilities`, `sinks_by_file`, `thresholds`, and
 `dropped` (every candidate not asked, with reason and rank data). This is the observability
@@ -300,6 +368,14 @@ type (max probability). The method:
   `provenance` block ready to paste into `THRESHOLD_PROVENANCE`.
 
 A warning is emitted below `MIN_RECOMMENDED_CASES = 30`.
+
+**Re-join as a recall gate (WP2).** `calibrate <labels> --rejoin --worker-dir A --worker-dir B`
+ignores the frozen `p_transmit` values and re-joins every case to the worker files of a new
+run. A labelled *transfer* with no finding is a recall loss by construction: it is listed in
+`missing_positives`, logged at ERROR, printed as `FAIL`, and the command exits 2. Every work
+package runs this against both development apps before it is committed; the band and
+reliability numbers it reports are recorded but only *applied* to `constants.py` at a
+milestone with the version bump.
 
 ### 4.1 Result on the development set
 

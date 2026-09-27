@@ -150,6 +150,7 @@ def _decision_trace(
           "T_TRANSMIT_LOW": constants.T_TRANSMIT_LOW,
           "T_TRANSMIT_HIGH": constants.T_TRANSMIT_HIGH,
           "T_RELEVANCE": constants.T_RELEVANCE,
+          "T_RELEVANCE_FLOOR": constants.T_RELEVANCE_FLOOR,
           "T_DISCLOSURE": constants.T_DISCLOSURE,
           "T_THIRD_PARTY": constants.T_THIRD_PARTY,
           "provenance": constants.THRESHOLD_PROVENANCE,
@@ -162,6 +163,7 @@ def _decision_trace(
           "sink_in_scope": anchor.get("sink_in_scope"),
           "scope_capabilities": anchor.get("scope_capabilities"),
           "rank_tier": anchor.get("tier"),
+          "lexical": anchor.get("lexical"),
       },
       "sinks": [
           {"symbol": s.get("symbol"), "capabilities": s.get("capabilities")} for s in sinks
@@ -180,6 +182,83 @@ def _relevant(answers: Dict[str, JevAnswer]) -> Tuple[bool, Optional[float]]:
   if a is None or a.noul is None:
     return True, None
   return a.noul >= constants.T_RELEVANCE, a.noul
+
+
+RELEVANT = "relevant"
+RELEVANCE_LOW_WITH_SINK = "low_with_sink"
+RELEVANCE_DROP = "drop"
+
+
+def relevance_verdict(answers: Dict[str, JevAnswer], state: Dict[str, Any]) -> Tuple[str, Optional[float]]:
+  """Soft relevance gate (WP2).
+
+  The lexical pre-gate now removes coincidental substring hits before any model
+  call, so ``signal_relevant`` is left with genuinely semantic questions
+  (``record`` as a database row vs. an audio recording). A model judgement
+  below ``T_RELEVANCE`` is allowed to *suppress* a finding only when the
+  anchor's own scope has no capability-labelled egress or IPC sink (rank tier
+  2 or 3). When such a sink is in scope the code demonstrably hands data to a
+  transfer channel; the finding is kept, capped at IMPORTANT, flagged for
+  manual review and traced as ``relevance="low"``. This follows the charter
+  rule that a finding is never suppressed by judgement alone, and closed two
+  labelled recall losses caused by relevance answers moving with batch
+  composition. Rollback: ``constants.RELEVANCE_SOFT_GATE_ENABLED = False``.
+
+  The soft path applies only to *uncertain* answers: when ``p`` is below
+  ``T_RELEVANCE_FLOOR`` the model is confidently negative and the finding is
+  dropped even with a sink in scope (a database ``record`` next to an HTTP
+  client is not an audio recording). The floor keeps the review queue for
+  genuinely ambiguous matches rather than lexical coincidences.
+
+  Returns ``(verdict, p_relevant)`` with verdict one of :data:`RELEVANT`,
+  :data:`RELEVANCE_LOW_WITH_SINK`, :data:`RELEVANCE_DROP`.
+  """
+  relevant, p = _relevant(answers)
+  if relevant:
+    return RELEVANT, p
+  tier = (state.get("anchor") or {}).get("tier")
+  if (
+      constants.RELEVANCE_SOFT_GATE_ENABLED
+      and tier is not None
+      and tier <= 1
+      and p is not None
+      and p >= constants.T_RELEVANCE_FLOOR
+  ):
+    return RELEVANCE_LOW_WITH_SINK, p
+  return RELEVANCE_DROP, p
+
+
+def reconcile_disclosure_status(
+    status: str, answers: Dict[str, JevAnswer], transmits: bool, user_initiated: bool
+) -> Tuple[str, Optional[str]]:
+  """Cross-checks the ``disclosure_status`` Choice against the battery's own Nouls.
+
+  The battery asks the disclosure question twice in different forms: a Noul
+  ``has_prominent_disclosure`` (P(a gate is shown before the data is used))
+  and a three-way Choice ``disclosure_status``. When the two disagree the
+  Choice is the less reliable of the pair (it moves with snippet composition;
+  a wider anchor scope flipped a labelled media-sharing transfer from
+  ``MISSING`` to ``DISCLOSED`` while ``has_prominent_disclosure`` stayed at
+  0.18), so the composer falls back to the recall-safe reading:
+
+  * ``DISCLOSED`` with ``has_prominent_disclosure < T_DISCLOSURE`` -> ``MISSING``.
+    A disclosure the model itself does not believe exists cannot excuse the
+    transfer; the finding is routed to review instead of being downgraded.
+  * ``EXEMPT`` on an off-device transfer that is *not* user-initiated ->
+    ``MISSING``. The Choice's own criterion for EXEMPT is "stays on-device or
+    obvious core functionality the user initiated"; neither holds.
+
+  Returns ``(status, note)`` where ``note`` is None when nothing changed and
+  otherwise a short trace string (``"DISCLOSED->MISSING (p_disclosure=0.18)"``).
+  ``LOCAL`` decisions never reach this function (they are EXEMPT in code).
+  """
+  a = answers.get("has_prominent_disclosure")
+  p = a.noul if a is not None else None
+  if status == "DISCLOSED" and p is not None and p < constants.T_DISCLOSURE:
+    return "MISSING", f"DISCLOSED->MISSING (p_disclosure={p:.2f} < T_DISCLOSURE={constants.T_DISCLOSURE})"
+  if status == "EXEMPT" and transmits and not user_initiated:
+    return "MISSING", "EXEMPT->MISSING (transfer is not user-initiated)"
+  return status, None
 
 
 def derive_permission_severity(
@@ -251,10 +330,15 @@ def _compose_data_safety_finding(
 
   Decision logic (all in code; the model only supplies calibrated answers):
 
-  1. ``signal_relevant`` < ``T_RELEVANCE`` -> drop (logged as a gate drop).
+  1. ``signal_relevant`` < ``T_RELEVANCE`` -> drop (logged as a gate drop)
+     unless an egress/IPC sink is in the anchor's scope, in which case the
+     finding is kept for manual review (:func:`relevance_verdict`, WP2).
   2. ``transmits_offdevice`` -> three-way :func:`transfer_decision`.
   3. LOCAL: disclosure is EXEMPT by construction (nothing leaves the device).
-     TRANSMITS: disclosure status as answered; severity CRITICAL/IMPORTANT.
+     TRANSMITS: disclosure status as answered, cross-checked against the
+     battery's own ``has_prominent_disclosure`` Noul and the user-initiated
+     answer (:func:`reconcile_disclosure_status`, WP2); severity
+     CRITICAL/IMPORTANT.
      UNCERTAIN: recall-safe — ``is_transferred`` is set True so the shared
      report routes it to review (a False value is treated as "compliant" and
      dropped from review), severity capped at IMPORTANT, ``needs_manual_review``
@@ -267,11 +351,17 @@ def _compose_data_safety_finding(
   category = tax.get("category", "Other")
   name = tax.get("data_type", data_type)
 
-  relevant, p_relevant = _relevant(answers)
-  if not relevant:
-    log.info("relevance gate dropped %s in %s (p=%.2f, token=%r)", data_type,
-             state["signal"]["file"], p_relevant or 0.0, state["signal"].get("matched_pattern"))
+  verdict, p_relevant = relevance_verdict(answers, state)
+  if verdict == RELEVANCE_DROP:
+    log.info("relevance gate dropped %s in %s (p=%.2f, token=%r, tier=%s)", data_type,
+             state["signal"]["file"], p_relevant or 0.0, state["signal"].get("matched_pattern"),
+             (state.get("anchor") or {}).get("tier"))
     return None
+  relevance_low = verdict == RELEVANCE_LOW_WITH_SINK
+  if relevance_low:
+    log.info("relevance low but sink in scope; keeping %s in %s for review (p=%.2f, token=%r)",
+             data_type, state["signal"]["file"], p_relevant or 0.0,
+             state["signal"].get("matched_pattern"))
 
   p_transmit = answers["transmits_offdevice"].noul or 0.0
   decision = transfer_decision(p_transmit)
@@ -290,11 +380,18 @@ def _compose_data_safety_finding(
   ) or (transmits and bool(sharing_in_scope))
 
   disclosure_status = answers["disclosure_status"].choice or "MISSING"
+  disclosure_note: Optional[str] = None
   # Local-only data needs no disclosure by definition, so compose EXEMPT in code
   # rather than relying on the model to infer it (it reads the question literally
   # and reports MISSING when no gate is present, even for on-device data).
   if decision == LOCAL:
     disclosure_status = "EXEMPT"
+  else:
+    disclosure_status, disclosure_note = reconcile_disclosure_status(
+        disclosure_status, answers, transmits, user_initiated)
+    if disclosure_note:
+      log.info("disclosure status reconciled for %s in %s: %s", data_type,
+               state["signal"]["file"], disclosure_note)
   # Severity is derived in code from the atomic booleans, not read off Jev's
   # advisory Score (which is logged for comparison only).
   severity = derive_data_safety_severity(data_type, transmits, disclosure_status, decision)
@@ -318,6 +415,10 @@ def _compose_data_safety_finding(
   summary = templates.issue_summary(policy_id, name, disclosure_status, transmits)
   if decision == UNCERTAIN:
     summary = f"{summary} [transfer uncertain: p={p_transmit:.2f}; verify]"
+  if relevance_low:
+    summary = f"{summary} [data-type match uncertain: p={p_relevant or 0.0:.2f}; verify]"
+    if severity == "CRITICAL":
+      severity = "IMPORTANT"
 
   sink_names = ", ".join(s["symbol"] for s in sinks[:5]) or "no labelled sink in file"
   claim = (
@@ -352,10 +453,12 @@ def _compose_data_safety_finding(
       "typesafe_answers": _answers_log(answers),
       "decision_trace": _decision_trace(
           state, answers, decision,
-          {"sharing_sinks_in_scope": sharing_in_scope, "p_relevant": p_relevant},
+          {"sharing_sinks_in_scope": sharing_in_scope, "p_relevant": p_relevant,
+           "relevance": "low" if relevance_low else "ok",
+           "disclosure_reconciled": disclosure_note},
       ),
   }
-  if decision == UNCERTAIN:
+  if decision == UNCERTAIN or relevance_low or disclosure_note:
     finding["needs_manual_review"] = True
   return finding
 
@@ -375,11 +478,12 @@ def _compose_permission_finding(
   A transfer in the UNCERTAIN band is treated as "may transmit" for the
   high-risk escalation, but the finding is marked for manual review.
   """
-  relevant, p_relevant = _relevant(answers)
-  if not relevant:
-    log.info("relevance gate dropped %s (%s) in %s (p=%.2f)", data_type, policy_id,
-             state["signal"]["file"], p_relevant or 0.0)
+  verdict, p_relevant = relevance_verdict(answers, state)
+  if verdict == RELEVANCE_DROP:
+    log.info("relevance gate dropped %s (%s) in %s (p=%.2f, tier=%s)", data_type, policy_id,
+             state["signal"]["file"], p_relevant or 0.0, (state.get("anchor") or {}).get("tier"))
     return None
+  relevance_low = verdict == RELEVANCE_LOW_WITH_SINK
 
   is_core = (answers["is_core_functionality"].noul or 0.0) >= constants.T_CORE_FUNCTION
   has_disclosure = (
@@ -395,10 +499,15 @@ def _compose_permission_finding(
   )
   if severity is None:
     return None
+  summary = templates.issue_summary(policy_id, data_type)
+  if relevance_low:
+    summary = f"{summary} [data-type match uncertain: p={p_relevant or 0.0:.2f}; verify]"
+    if severity == "CRITICAL":
+      severity = "IMPORTANT"
 
   finding = {
       "policy_id": policy_id,
-      "issue_summary": templates.issue_summary(policy_id, data_type),
+      "issue_summary": summary,
       "severity": severity,
       "files_involved": [state["signal"]["file"]],
       "evidence": _evidence_line(state),
@@ -413,10 +522,11 @@ def _compose_permission_finding(
       "typesafe_answers": _answers_log(answers),
       "decision_trace": _decision_trace(
           state, answers, decision,
-          {"is_core": is_core, "has_disclosure": has_disclosure, "p_relevant": p_relevant},
+          {"is_core": is_core, "has_disclosure": has_disclosure, "p_relevant": p_relevant,
+           "relevance": "low" if relevance_low else "ok"},
       ),
   }
-  if decision == UNCERTAIN and severity != "SUGGESTION":
+  if (decision == UNCERTAIN and severity != "SUGGESTION") or relevance_low:
     finding["needs_manual_review"] = True
   return finding
 

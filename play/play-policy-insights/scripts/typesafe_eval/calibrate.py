@@ -110,18 +110,38 @@ def _index_findings(worker_dirs: List[str]) -> List[Tuple[str, str, float]]:
   return out
 
 
-def join_probabilities(cases: List[Dict[str, Any]], worker_dirs: List[str]) -> List[Dict[str, Any]]:
-  """Fills ``p_transmit`` for cases that lack it from the worker files."""
+def join_probabilities(
+    cases: List[Dict[str, Any]], worker_dirs: List[str], rejoin: bool = False,
+    unmatched: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+  """Fills ``p_transmit`` for cases from the worker files.
+
+  Args:
+    cases: Label cases; those with a stored ``p_transmit`` are used as-is
+      unless ``rejoin`` is set.
+    worker_dirs: Scratch directories holding ``worker_*.json``.
+    rejoin: Ignore stored probabilities and look every case up in
+      ``worker_dirs`` (WP2 recall check against a *new* run).
+    unmatched: When given, cases with no matching finding are appended here
+      (with ``"reason"``) instead of only being logged. A labelled *transfer*
+      with no finding means the pipeline lost a true positive before the
+      model saw it (pre-gate, caps or relevance gate) -- the one regression
+      the charter forbids.
+  """
   index = _index_findings(worker_dirs) if worker_dirs else []
   joined: List[Dict[str, Any]] = []
   for c in cases:
-    if c.get("p_transmit") is not None:
+    if c.get("p_transmit") is not None and not rejoin:
       joined.append(c)
       continue
     match = [p for (f, dt, p) in index
              if dt == c.get("data_type") and f.endswith(c.get("file", "\x00"))]
     if not match:
-      log.warning("no probability found for %s / %s; case skipped", c.get("file"), c.get("data_type"))
+      level = logging.ERROR if c.get("transfers") else logging.WARNING
+      log.log(level, "no probability found for %s / %s (transfers=%s); case skipped",
+              c.get("file"), c.get("data_type"), c.get("transfers"))
+      if unmatched is not None:
+        unmatched.append({**c, "reason": "no finding with a transfer probability in worker_dirs"})
       continue
     joined.append({**c, "p_transmit": max(match)})
   return joined
@@ -220,15 +240,34 @@ def provenance_block(report: Dict[str, Any], description: str, model: str) -> Di
 
 
 def calibrate(labels: Dict[str, Any], min_precision: float = 0.90,
-              model: str = constants.DEFAULT_MODEL) -> Dict[str, Any]:
+              model: str = constants.DEFAULT_MODEL, rejoin: bool = False,
+              worker_dirs: Optional[List[str]] = None) -> Dict[str, Any]:
+  """Builds the calibration report.
+
+  Args:
+    labels: The label set (``description``, ``worker_dirs``, ``cases``).
+    min_precision: Precision target for ``T_TRANSMIT_HIGH``.
+    model: Recorded in the provenance block.
+    rejoin: Re-join every case against the worker files instead of using the
+      probabilities stored in the labels (checks a *new* run against the
+      frozen labels).
+    worker_dirs: Overrides ``labels["worker_dirs"]``.
+  """
   cases = [c for c in labels.get("cases", []) if "transfers" in c]
-  cases = join_probabilities(cases, labels.get("worker_dirs") or [])
+  dirs = list(worker_dirs) if worker_dirs else list(labels.get("worker_dirs") or [])
+  unmatched: List[Dict[str, Any]] = []
+  cases = join_probabilities(cases, dirs, rejoin=rejoin, unmatched=unmatched)
   cases = [{**c, "p_transmit": float(c["p_transmit"]), "transfers": bool(c["transfers"])}
            for c in cases]
   band = derive_band(cases, min_precision)
+  missing_positives = [u for u in unmatched if u.get("transfers")]
   report: Dict[str, Any] = {
       "evaluator_version": constants.EVALUATOR_VERSION,
       "min_precision": min_precision,
+      "rejoined": rejoin,
+      "worker_dirs": dirs,
+      "unmatched_cases": unmatched,
+      "missing_positives": missing_positives,
       "band": band,
       "current_constants": {"T_TRANSMIT_LOW": constants.T_TRANSMIT_LOW,
                             "T_TRANSMIT_HIGH": constants.T_TRANSMIT_HIGH},
@@ -246,13 +285,20 @@ def calibrate(labels: Dict[str, Any], min_precision: float = 0.90,
     report["warnings"].append(
         "precision target unreachable without losing recall; band collapsed to T_LOW "
         "(no abstention). Lower --min-precision or add labels.")
+  if missing_positives:
+    report["warnings"].append(
+        f"{len(missing_positives)} labelled transfer(s) have no finding in the run: "
+        + ", ".join(f"{u.get('file')}/{u.get('data_type')}" for u in missing_positives)
+        + ". Recall is below 1.0 by construction; find the drop reason in typesafe_triage.json.")
   report["provenance"] = provenance_block(report, labels.get("description", ""), model)
   return report
 
 
-def main(labels_path: str, out_path: Optional[str] = None, min_precision: float = 0.90) -> int:
+def main(labels_path: str, out_path: Optional[str] = None, min_precision: float = 0.90,
+         rejoin: bool = False, worker_dirs: Optional[List[str]] = None) -> int:
+  """CLI entry. Returns 2 when a labelled transfer is missing from the run."""
   labels = _load_json(labels_path)
-  report = calibrate(labels, min_precision=min_precision)
+  report = calibrate(labels, min_precision=min_precision, rejoin=rejoin, worker_dirs=worker_dirs)
   text = json.dumps(report, indent=2, sort_keys=True)
   if out_path:
     with open(out_path, "w", encoding="utf-8") as f:
@@ -261,4 +307,7 @@ def main(labels_path: str, out_path: Optional[str] = None, min_precision: float 
   print(text)
   for w in report["warnings"]:
     print(f"WARNING: {w}")
+  if report["missing_positives"]:
+    print(f"FAIL: {len(report['missing_positives'])} labelled transfer(s) not found in the run")
+    return 2
   return 0

@@ -20,7 +20,7 @@ Usage:
                                         [--capability-cache PATH | --no-capability-cache]
                                         [--verbose]
   python -m typesafe_eval critic <temp_dir> [--client heuristic|http]
-  python -m typesafe_eval calibrate <labels.json> [--out PATH]
+  python -m typesafe_eval calibrate <labels.json> [--out PATH] [--rejoin --worker-dir DIR ...]
   python -m typesafe_eval triage-diff <before_dir> <after_dir> [--json PATH]
   python -m typesafe_eval selftest
 
@@ -119,6 +119,13 @@ def main(argv=None) -> int:
   cal_p.add_argument("labels", help="JSON file of labelled findings (see calibrate.py).")
   cal_p.add_argument("--out", default=None, help="Write the calibration report JSON here.")
   cal_p.add_argument("--min-precision", type=float, default=0.90)
+  cal_p.add_argument(
+      "--rejoin", action="store_true",
+      help="Ignore p_transmit values stored in the labels and re-join every case against the "
+           "current worker_dirs. Exits 2 when a labelled transfer has no finding (recall check).")
+  cal_p.add_argument(
+      "--worker-dir", action="append", default=None,
+      help="Override labels.worker_dirs (repeatable). Used with --rejoin to check a new run.")
 
   diff_p = sub.add_parser(
       "triage-diff", help="Diff two run directories (findings, drops, counters, usage)."
@@ -151,7 +158,8 @@ def main(argv=None) -> int:
 
   if args.command == "calibrate":
     from typesafe_eval import calibrate
-    return calibrate.main(args.labels, out_path=args.out, min_precision=args.min_precision)
+    return calibrate.main(args.labels, out_path=args.out, min_precision=args.min_precision,
+                          rejoin=args.rejoin, worker_dirs=args.worker_dir)
 
   if args.command == "triage-diff":
     from typesafe_eval import triage_diff

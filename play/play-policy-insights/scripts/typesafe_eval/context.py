@@ -64,15 +64,32 @@ class Sink:
   symbol: str
   module: str
   capabilities: List[str]
-  lines: List[int]  # 0-based
+  lines: List[int]  # 0-based, every reference in the file (ranking uses all)
 
-  def to_state(self) -> Dict[str, Any]:
-    return {
+  def to_state(self, near: Sequence[int] = ()) -> Dict[str, Any]:
+    """Model-facing view: at most ``MAX_SINK_REF_LINES_IN_STATE`` reference lines.
+
+    ``near`` are the anchor lines (0-based) of the asks in this file; when the
+    sink is referenced more often than the bound, the references closest to an
+    anchor are listed (in file order) and ``omitted_lines`` says how many were
+    left out. Ranking in :func:`anchor_signal` always uses the full list.
+    """
+    bound = constants.MAX_SINK_REF_LINES_IN_STATE
+    shown = list(self.lines)
+    if len(shown) > bound:
+      if near:
+        shown = sorted(sorted(shown, key=lambda ln: min(abs(ln - a) for a in near))[:bound])
+      else:
+        shown = shown[:bound]
+    out: Dict[str, Any] = {
         "symbol": self.symbol,
         "module": self.module,
         "capabilities": self.capabilities,
-        "lines": [i + 1 for i in self.lines],
+        "lines": [i + 1 for i in shown],
     }
+    if len(shown) < len(self.lines):
+      out["omitted_lines"] = len(self.lines) - len(shown)
+    return out
 
 
 def file_sinks(
@@ -118,6 +135,10 @@ class Anchor:
   proximity: Optional[int]      # line distance to nearest sink ref; 0 = inside scope
   sink_in_scope: bool
   scope_capabilities: List[str] = dataclasses.field(default_factory=list)
+  # WP2: how the pattern occurs in the file (``value`` / ``type_only`` /
+  # ``substring_only`` / ``demoted_only`` / ``none`` / ``non_identifier``).
+  # Recorded in the decision trace, never sent to the model.
+  lexical_verdict: str = ""
 
   @property
   def tier(self) -> int:
@@ -152,7 +173,13 @@ def anchor_signal(
   Among occurrences, the one with the strongest sink tier in its own scope
   wins; ties are broken by proximity to the nearest sink reference.
   """
-  hits = structure.all_occurrences(fs.lines, pattern)
+  prefer_boundary = constants.LEXICAL_PREGATE_ENABLED
+  hits = structure.all_occurrences(fs.lines, pattern, cap=constants.MAX_OCCURRENCES_RANKED,
+                                   prefer_boundary=prefer_boundary)
+  if prefer_boundary and structure.is_identifier_pattern(pattern):
+    verdict = structure.lexical_hits(fs.lines, pattern).verdict
+  else:
+    verdict = "non_identifier" if pattern else "none"
   sink_lines = sorted({ln for s in sinks for ln in s.lines})
   caps_by_line: Dict[int, set] = {}
   for s in sinks:
@@ -160,7 +187,7 @@ def anchor_signal(
       caps_by_line.setdefault(ln, set()).update(s.capabilities)
   if not hits:
     return Anchor(data_type, pattern, [], None, (0, min(len(fs.lines), 2 * SHRUNK_WINDOW)),
-                  None, False, [])
+                  None, False, [], lexical_verdict=verdict)
 
   best: Optional[Anchor] = None
   best_key: Optional[Tuple[int, int]] = None
@@ -172,11 +199,17 @@ def anchor_signal(
       prox: Optional[int] = 0
     else:
       prox = structure.sink_proximity([h], sink_lines)
-    candidate = Anchor(data_type, pattern, hits, h, scope, prox, bool(inside), scope_caps)
+    candidate = Anchor(data_type, pattern, hits, h, scope, prox, bool(inside), scope_caps,
+                       lexical_verdict=verdict)
     key = (candidate.tier, prox if prox is not None else 1 << 30)
     if best_key is None or key < best_key:
       best, best_key = candidate, key
   assert best is not None
+  # The model-facing list is bounded; the chosen occurrence is always in it.
+  listed = hits[:constants.MAX_HIT_LINES_IN_STATE]
+  if best.chosen is not None and best.chosen not in listed:
+    listed = listed[:-1] + [best.chosen]
+  best.hit_lines = listed
   return best
 
 
@@ -195,18 +228,24 @@ def _render_snippet(fs: structure.FileStructure, anchors: Sequence[Anchor], sink
       regions.update(range(lo, hi))
   code = structure.render_lines(fs.lines, regions)
 
-  related: List[str] = []
-  seen: set = set()
+  # Sink-reference lines outside the rendered regions, nearest an anchor first
+  # (a sink 3 lines below the hit is worth more to the model than the file's
+  # first ``Intent`` 800 lines earlier), then listed in file order.
+  anchor_lines = [a.chosen for a in anchors if a.chosen is not None]
+  by_line: Dict[int, List[Sink]] = {}
   for s in sinks:
     for ln in s.lines:
-      if ln in regions or ln in seen:
-        continue
-      seen.add(ln)
-      related.append(f"L{ln + 1}: {fs.lines[ln].strip()}  // sink: {s.symbol} {s.capabilities}")
-      if len(related) >= constants.MAX_SINK_LINES_IN_STATE:
-        break
-    if len(related) >= constants.MAX_SINK_LINES_IN_STATE:
-      break
+      if ln not in regions:
+        by_line.setdefault(ln, []).append(s)
+
+  def _distance(ln: int) -> int:
+    return min((abs(ln - a) for a in anchor_lines), default=ln)
+
+  chosen_lines = sorted(sorted(by_line, key=_distance)[:constants.MAX_SINK_LINES_IN_STATE])
+  related: List[str] = []
+  for ln in chosen_lines:
+    tags = "; ".join(f"{s.symbol} {s.capabilities}" for s in by_line[ln])
+    related.append(f"L{ln + 1}: {fs.lines[ln].strip()}  // sink: {tags}")
   if related:
     code += "\n\n// Related data-flow lines in the same file (capability-labelled sinks):\n"
     code += "\n".join(related)
@@ -256,7 +295,7 @@ def build_file_state(
           for a in anchors
       ],
       "code_snippet": code,
-      "sinks": [s.to_state() for s in sinks],
+      "sinks": [s.to_state(near=[a.chosen for a in anchors if a.chosen is not None]) for s in sinks],
       "co_located_signals": {"network_transmission": network, "disclosure": disclosure},
       "related_lines": related,
       "app": app_facts,
@@ -286,6 +325,7 @@ def build_file_state(
             "sink_in_scope": a.sink_in_scope,
             "scope_capabilities": a.scope_capabilities,
             "tier": a.tier,
+            "lexical": a.lexical_verdict,
         },
         "app": app_facts,
         "permission": None,

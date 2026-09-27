@@ -81,20 +81,20 @@ the work packages and milestone gates that implement them are in
 | --- | --- |
 | `registry.py` | **Single source of truth**: one `PolicySpec` per policy (id, kind, activation, battery, compose, `compose_manifest`). Add a policy here. |
 | `engine.py` | Cascade evaluator: reads raw scan artifacts, filters candidates, analyses file structure, classifies identifiers, triages by capability tier, batches by file, isolates failures, writes `worker_*.json` + `typesafe_triage.json`. |
-| `structure.py` | Deterministic structure layer: language, imports, declared package, scopes, symbol references (comments/imports demoted), dependency inventory, first-party detection helpers. |
+| `structure.py` | Deterministic structure layer: language, imports, declared package, scopes (control-flow headers are not declarations), symbol references (every call site; comments/imports demoted), dependency inventory, first-party detection helpers, and the identifier-boundary lexical pre-gate (WP2: `boundary_matches`, `is_type_position`, `lexical_hits` → per-file `value` / `type_only` / `substring_only` / `demoted_only` verdict). |
 | `android_manifest.py` | Evaluator-owned manifest parser (WP1): discovers every `AndroidManifest.xml`, picks the primary module, merges `main` + flavor/build-type source sets into one `AppProfile` (permissions with `maxSdkVersion` and per-source-set attribution, all components incl. typeless services, `<property>`, `<queries>`, `tools:node="remove"`, accessibility `isAccessibilityTool`, Gradle `namespace`/`targetSdk` fallback). `manifest_details.json` is only a fallback. Stored on `RunContext.profile`, summarised in `typesafe_triage.json["app_profile"]`. |
 | `resources.py` | Default-locale resource index: `res/values/*.xml` strings (+ string arrays) and `res/xml/<name>.xml` paths; resolves `@string/` and `R.string.` references so policies can reason about disclosure *text*. |
 | `triage_diff.py` | `triage-diff <before> <after>`: finding-level and counter-level diff of two runs against a recorded baseline (WP0). |
 | `capabilities.py` | Behavioural capability taxonomy (`NETWORK_EGRESS`, `THIRD_PARTY_TELEMETRY`, `ADVERTISING_SDK`, `IPC_SHARING`, `LOCAL_PERSISTENCE`, `LOGGING`, `USER_DISCLOSURE_UI`, `UNKNOWN`), model-driven classification, `CapabilityCache`. No vendor names. |
-| `context.py` | Sinks (transfer-capable identifiers referenced in a file) and anchors (the occurrence of a hit nearest a sink, with tier and scope capabilities); builds the per-file state. |
+| `context.py` | Sinks (transfer-capable identifiers referenced in a file; every reference is used for ranking, the state lists the `MAX_SINK_REF_LINES_IN_STATE` nearest the anchors) and anchors (every occurrence ranked by sink tier then proximity, exact-case first; carries the lexical verdict); `related_lines` are the sink lines nearest an anchor; builds the per-file state. |
 | `constants.py` | All tunable thresholds + sensitivity/risk tables + model id + `THRESHOLD_PROVENANCE` + `EVALUATOR_VERSION`. |
 | `questions.py` | The typed question batteries (Choice/Score/Noul); the relevance question embeds the literal matched token. |
 | `client.py` | `HttpJevClient` (real API) + `HeuristicJevClient` (offline, labelled stand-in). |
 | `cache.py` | `ResultCache` + `CachingClient`: memoize by (model, questions, state). |
 | `snippets.py` | Legacy deterministic code-snippet + co-located data-flow extraction (v1 path). |
 | `templates.py` | Deterministic `issue_summary` / `recommendation`. |
-| `evaluate.py` | Compose functions: relevance gate, three-way transfer decision, code-derived severity, decision trace, critic on the atomic transfer claim. |
-| `calibrate.py` | Derives the transfer band and reliability metrics from an out-of-tree label set. |
+| `evaluate.py` | Compose functions: relevance gate (soft when an egress/IPC sink is in the anchor's scope, hard below `T_RELEVANCE_FLOOR`), three-way transfer decision, disclosure-status reconciliation against the battery's own Noul, code-derived severity, decision trace, critic on the atomic transfer claim. |
+| `calibrate.py` | Derives the transfer band and reliability metrics from an out-of-tree label set. `--rejoin --worker-dir DIR…` re-joins the frozen labels to a new run and exits 2 if any labelled transfer has no finding (the recall-1.0 check used at every WP gate). |
 | `batch.py` | File-state builder + namespacing used by the engine's batched path. |
 | `benchmark.py` | Per-finding vs batched: requests / tokens / latency / agreement. |
 | `eval/` | Labeled cases + `run_eval.py` precision/recall harness. |

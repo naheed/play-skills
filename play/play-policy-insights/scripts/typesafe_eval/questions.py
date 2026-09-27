@@ -58,20 +58,32 @@ def _severity(subject: str) -> Dict[str, Any]:
 def _relevance(subject: str, token: str = "") -> Dict[str, Any]:
   """Semantic match gate: does the snippet really handle this data type?
 
-  Scanner patterns are lexical (``record`` matches a DNS record type, ``audio/*``
-  matches a MIME filter). One generic question per signal lets code drop the
+  Scanner patterns are lexical (``record`` matches a DNS record type, ``track``
+  matches a network trace). One generic question per signal lets code drop the
   clear misfires before any policy question is composed, without per-type rules.
 
   The matched token is embedded literally when known: in a batched request the
   state carries a ``signals`` *list*, so a field path like
   ``signal.matched_pattern`` would not resolve for the model.
+
+  WP2 wording change: an earlier version listed "a MIME type" among the
+  *unrelated* uses. That taught the model that ``video/*`` inside an
+  ``ACTION_VIEW``/``ACTION_SEND`` chooser is a coincidence, and a labelled
+  media-sharing transfer was answered p=0.09-0.12 while its sibling MIME
+  literals in the same ``switch`` passed. A MIME type or picker filter that
+  selects, opens or shares files of that kind *is* handling the data type
+  (sharing via intent is a transfer by policy); only a MIME string that never
+  reaches any data (a constant table, a comment) is unrelated.
   """
   token_ref = f"the matched token `{token}`" if token else "the matched token"
   return _noul(
       instructions=(
-          f"Does `code_snippet` actually read, hold, or process {subject}, as "
-          f"opposed to an unrelated use of {token_ref} (a different meaning of "
-          "the word, a UI string, a MIME type, a comment, or an unrelated API)?"
+          f"Does `code_snippet` actually read, hold, process, select, open or "
+          f"share {subject}, as opposed to an unrelated use of {token_ref} (a "
+          "different meaning of the word, a UI label, a comment, or an "
+          "unrelated API)? A MIME type or file-picker filter used to pick, "
+          "open or hand off files of that kind counts as handling the data "
+          "type; a MIME string that never touches any data does not."
       ),
       yes="The snippet genuinely handles this data type.",
       no="The token is a coincidental match; this data type is not handled here.",
