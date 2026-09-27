@@ -610,6 +610,40 @@ Parallelism inside a milestone: WP1/WP2/WP3 are independent; WP4 follows
 WP1; WP5 follows WP4. In M3, WP9 can proceed alongside WP8; WP10 and WP11
 follow WP7.
 
+### M1 gate — result (passed with one recorded exception)
+
+Measured against the WP0 baseline (`.scratch/baselines/2.0.0-capability/`)
+after WP5:
+
+- selftest: 299 checks green (was 195 at WP0).
+- both apps run end-to-end live (evaluator → aggregate → critic → report).
+- dev-set recall: `calibrate --rejoin` exit 0, 48/48 labelled transfers
+  rejoined (checked at every WP; two losses surfaced and fixed on the way —
+  WP2 `Panels.java/VIDEOS`, WP4 `SMBAdapter.java/USER_ACCOUNT`).
+- the two App B findings the legacy skill dropped (A1) are present:
+  `package_visibility_policy` Suggestion and `all_files_access_policy`
+  Suggestion.
+- `triage-diff` vs baseline: App A 60 → 77 (+31 −14 ~5), App B 45 → 63
+  (+23 −5 ~10). Every removal is one of: a pre-gate drop
+  (`sftp_key.xml/EMAIL`), a relevance-gate drop of a confident negative
+  (`StrictMode`→DIAGNOSTICS, `edit_text`→UGC ×2, own-package
+  `getPackageInfo`→APPS_ON_DEVICE), a finding that moved between
+  `data_safety_section` and `prominent_disclosure_policy` for the same
+  file/type as the disclosure Choice moved (still present, 9 cases), or a
+  UNCERTAIN → LOCAL drift on one unlabelled candidate
+  (`SubscriptionStateMachineV2.kt/PURCHASE_HISTORY`, p 0.55 → below 0.35).
+  No labelled positive and no TRANSMITS finding was lost; TRANSMITS counts
+  are App A 16 → 15 (two threshold-adjacent flips to UNCERTAIN, both review
+  items, both TRANSMITS under the rejoined band applied at M2) and App B
+  4 → 8.
+- model calls per app: App B 41 → 39 (+1 purpose) ✓; **App A 83 → 100 (+1
+  purpose) ✗**. The pre-gate saving (−9 % / −16 % at a fixed cap) was spent
+  on recall in WP2 (`MAX_FINDINGS_PER_TYPE` 8 → 12 and the sink-in-scope cap
+  exemption, both needed to recover a labelled transfer). The charter orders
+  Recall above Cost, so this exception is accepted and recorded rather than
+  reverted; WP6's callee resolution and WP7's `destination_class` are the
+  planned levers for abstention and cost.
+
 A milestone gate that fails is resolved inside the milestone (fix or revert
 the offending WP by its flag); the next milestone does not start on a red
 gate.
@@ -700,7 +734,7 @@ touching the rest of the cascade.
 - [x] WP3 structured evidence
 - [x] WP4 `declared_core_purpose` (per-app cache)
 - [x] WP5 wave 1 policies (FGS fixes, package visibility, all files, exact alarm, target API)
-- [ ] **M1 gate**
+- [x] **M1 gate** (passed; App A model-call count exception recorded)
 - [ ] WP6 one-hop callee resolution
 - [ ] WP7 `destination_class` + label schema v2 + relabel
 - [ ] **M2 gate**
