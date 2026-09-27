@@ -1099,11 +1099,37 @@ def _test_destination_class() -> None:
   _check("dest_dev_backend_collection", dev["policy_id"] == "prominent_disclosure_policy" and dev["severity"] == "CRITICAL"
          and dev["is_third_party"] is False and dev["destination_class"] == "developer_backend"
          and dev["purpose"] == "App functionality", str((dev["policy_id"], dev["severity"], dev["purpose"])))
-  sdk = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "third_party_sdk", conf=0.4), "test")
-  _check("dest_sdk_is_sharing_any_confidence", sdk["is_third_party"] is True and sdk["severity"] == "CRITICAL"
-         and sdk["purpose"] == "Analytics or third-party sharing")
+  sdk = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "third_party_sdk", conf=0.6), "test")
+  _check("dest_sdk_is_sharing", sdk["is_third_party"] is True and sdk["severity"] == "CRITICAL"
+         and sdk["purpose"] == "Analytics or third-party sharing"
+         and sdk["decision_trace"]["destination"]["sharing_mass"] >= constants.T_SHARING_MASS)
   ipc = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "other_app_ipc"), "test")
   _check("dest_ipc_is_sharing", ipc["is_third_party"] is True and ipc["purpose"] == "Shared with another app (IPC)")
+  # Sharing is decided by the mass on the sharing classes, not by the argmax:
+  # a flat distribution whose argmax happens to be a sharing class does not
+  # flip ``is_third_party`` (review-flagged instead) ...
+  def _with_probs(p_transmit, probs):
+    cls = max(probs, key=probs.get)
+    a = _answers(p_transmit, cls)
+    a["destination_class"] = JevAnswer("choice", choice=cls, probabilities=probs, confidence=probs[cls])
+    return a
+  flat = _with_probs(0.95, {"third_party_sdk": 0.34, "developer_backend": 0.33, "unknown": 0.33})
+  fl = compose("EMAILS", "Up.kt (Pattern: email)", base, flat, "test")
+  _check("dest_flat_sharing_argmax_not_sharing",
+         fl["is_third_party"] is False and fl["destination_class"] == "third_party_sdk"
+         and fl["severity"] == "CRITICAL" and fl.get("needs_manual_review") is True
+         and "[sharing unconfirmed: third party sdk mass=0.34; verify]" in fl["issue_summary"]
+         and fl["decision_trace"]["destination"]["corroboration"] == "low_sharing_mass"
+         and fl["purpose"] == "App functionality",
+         str((fl["is_third_party"], fl["issue_summary"], fl["decision_trace"]["destination"])))
+  # ... while mass split across the two sharing classes counts even when the
+  # argmax is developer_backend.
+  split = _with_probs(0.95, {"developer_backend": 0.40, "third_party_sdk": 0.30, "other_app_ipc": 0.30})
+  sp = compose("EMAILS", "Up.kt (Pattern: email)", base, split, "test")
+  _check("dest_split_sharing_mass_counts", sp["is_third_party"] is True and sp["destination_class"] == "developer_backend"
+         and abs(sp["decision_trace"]["destination"]["sharing_mass"] - 0.60) < 1e-6
+         and sp.get("needs_manual_review") is None, str(sp["decision_trace"]["destination"]))
+  _check("dest_threshold_traced", sp["decision_trace"]["thresholds"]["T_SHARING_MASS"] == constants.T_SHARING_MASS)
   # Confirmed user-chosen (hint in scope + high confidence): inventory, EXEMPT.
   uc = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "user_chosen_destination"), "test")
   _check("dest_user_chosen_confirmed_inventory",
@@ -1157,12 +1183,28 @@ def _test_destination_class() -> None:
   # Sharing sink in scope still ORs in (pre-WP7 fact) even for developer_backend.
   ipc_dev = compose("EMAILS", "Up.kt (Pattern: email)", ipc_scope, _answers(0.95, "developer_backend"), "test")
   _check("dest_sharing_sink_in_scope_ors", ipc_dev["is_third_party"] is True)
+  # ... but a confirmed, applied user-chosen destination clears it: the chooser
+  # Intent is the sharing-capable sink, and the user picked the recipient.
+  ipc_hint = {**ipc_scope, "anchor": {**ipc_scope["anchor"], "destination_hints": ["USER_CHOSEN_DESTINATION"]},
+              "destination_hints": base["destination_hints"]}
+  ipc_uc = compose("EMAILS", "Up.kt (Pattern: email)", ipc_hint, _answers(0.95, "user_chosen_destination"), "test")
+  _check("dest_applied_user_chosen_not_sharing", ipc_uc["is_third_party"] is False
+         and ipc_uc["decision_trace"]["destination"]["applied"] is True
+         and ipc_uc["decision_trace"]["destination"]["sharing"] is False
+         and "not sharing" in ipc_uc["decision_trace"]["destination_note"], str(ipc_uc["decision_trace"]["destination"]))
+  # Unconfirmed user-chosen with an IPC sink in scope keeps the sharing flag.
+  ipc_uc2 = compose("EMAILS", "Up.kt (Pattern: email)", ipc_scope, _answers(0.95, "user_chosen_destination", conf=0.5), "test")
+  _check("dest_unconfirmed_user_chosen_keeps_sharing", ipc_uc2["is_third_party"] is True and ipc_uc2["severity"] == "CRITICAL")
   # Legacy fallback: an is_third_party Noul still composes.
   legacy = _answers(0.95, "developer_backend"); del legacy["destination_class"]
   legacy["is_third_party"] = JevAnswer("noul", noul=0.9)
   lg = compose("EMAILS", "Up.kt (Pattern: email)", no_hint, legacy, "test")
   _check("dest_legacy_noul_fallback", lg["is_third_party"] is True and lg["destination_class"] == "third_party_sdk"
          and lg["decision_trace"]["destination"]["legacy"] is True)
+  legacy_mid = dict(legacy); legacy_mid["is_third_party"] = JevAnswer("noul", noul=(constants.T_THIRD_PARTY - 0.05))
+  lgm = compose("EMAILS", "Up.kt (Pattern: email)", no_hint, legacy_mid, "test")
+  _check("dest_legacy_keeps_T_THIRD_PARTY", lgm["is_third_party"] is False and lgm["destination_class"] == "developer_backend"
+         and lgm.get("needs_manual_review") is None, str(lgm["decision_trace"]["destination"]))
   # Rollback flag: class traced, never applied, sharing = in-scope fact only.
   saved = constants.DESTINATION_CLASS_ENABLED
   constants.DESTINATION_CLASS_ENABLED = False

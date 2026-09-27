@@ -272,6 +272,16 @@ CONF_DESTINATION_ACT = 0.75
 # Destination classes that count as sharing with another party (plan §2 L2:
 # ``third_party_sdk`` is collection + sharing; ``other_app_ipc`` is sharing).
 SHARING_DESTINATION_CLASSES = ("third_party_sdk", "other_app_ipc")
+# A transfer is composed as sharing (``is_third_party``) when the probability
+# mass the Choice puts on the sharing classes together reaches this value --
+# "more likely shared than not" -- or when a sharing-capable sink is in the
+# anchor scope (static fact, no threshold). The argmax alone is not used: on
+# the first WP7 live run a flat six-way distribution made ``third_party_sdk``
+# the argmax at 0.38 on a developer-billing file and flipped the report's
+# sharing flag. A sharing argmax below the mass is traced and review-flagged
+# (``corroboration: low_sharing_mass``), never silently dropped. Lower than
+# the downgrade gate on purpose: sharing raises, the downgrade lowers.
+T_SHARING_MASS = 0.50
 # Destination classes that, once confirmed, mean the transfer is not
 # collection by the developer (no prominent-disclosure finding).
 NON_COLLECTION_DESTINATION_CLASSES = ("user_chosen_destination", "platform_component")

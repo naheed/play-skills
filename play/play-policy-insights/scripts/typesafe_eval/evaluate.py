@@ -157,6 +157,7 @@ def _decision_trace(
           "RELEVANCE_SOFT_GATE_FILE_EGRESS": constants.RELEVANCE_SOFT_GATE_FILE_EGRESS,
           "T_DISCLOSURE": constants.T_DISCLOSURE,
           "T_THIRD_PARTY": constants.T_THIRD_PARTY,
+          "T_SHARING_MASS": constants.T_SHARING_MASS,
           "CONF_DESTINATION_ACT": constants.CONF_DESTINATION_ACT,
           "DESTINATION_CLASS_ENABLED": constants.DESTINATION_CLASS_ENABLED,
           "provenance": constants.THRESHOLD_PROVENANCE,
@@ -322,16 +323,20 @@ class Destination:
     probabilities: The Choice's per-option probabilities (trace only).
     hints: Deterministic hint kinds found in the anchor scope
       (``structure.destination_hints``).
-    sharing: True when the transfer counts as sharing with another party
-      (``constants.SHARING_DESTINATION_CLASSES``) or a sharing-capable sink
-      is in the anchor scope. Drives the report's ``is_third_party``.
+    sharing: True when the transfer counts as sharing with another party --
+      the probability mass on ``constants.SHARING_DESTINATION_CLASSES``
+      reaches ``T_SHARING_MASS`` or a sharing-capable sink is in the anchor
+      scope. Drives the report's ``is_third_party``.
+    sharing_mass: The summed probability of the sharing classes (1.0 / 0.0
+      when the Choice carried no distribution).
     confirmed: True when the class may change the composed severity: the
       confidence reaches ``CONF_DESTINATION_ACT`` *and* an independent signal
       corroborates it (see ``corroboration``). Only meaningful for the
       non-collection classes; other classes never lower a severity.
     corroboration: Why ``confirmed`` holds (``hint`` / ``user_initiated`` /
       ``no_egress_in_scope``) or why not (``low_confidence`` /
-      ``uncorroborated`` / ``n/a``).
+      ``uncorroborated`` / ``n/a``); ``low_sharing_mass`` when a sharing
+      argmax did not reach ``T_SHARING_MASS`` and no IPC sink backs it.
     applied: True when the class actually changed the finding (a confirmed
       non-collection class on a transfer at/above ``T_TRANSMIT_LOW``).
     legacy: True when the class was derived from an ``is_third_party`` Noul
@@ -340,12 +345,13 @@ class Destination:
 
   def __init__(self, cls: str, confidence: float, probabilities: Dict[str, float],
                hints: List[str], sharing: bool, confirmed: bool, corroboration: str,
-               legacy: bool = False):
+               legacy: bool = False, sharing_mass: float = 0.0):
     self.cls = cls
     self.confidence = confidence
     self.probabilities = probabilities
     self.hints = hints
     self.sharing = sharing
+    self.sharing_mass = sharing_mass
     self.confirmed = confirmed
     self.corroboration = corroboration
     self.applied = False
@@ -356,6 +362,11 @@ class Destination:
     """A confirmed class under which the transfer is not collection by the developer."""
     return self.confirmed and self.cls in constants.NON_COLLECTION_DESTINATION_CLASSES
 
+  @property
+  def sharing_unconfirmed(self) -> bool:
+    """The argmax is a sharing class but the composed ``sharing`` is False (review, not a flip)."""
+    return self.cls in constants.SHARING_DESTINATION_CLASSES and not self.sharing
+
   def to_trace(self) -> Dict[str, Any]:
     return {
         "class": self.cls,
@@ -363,6 +374,7 @@ class Destination:
         "probabilities": {k: round(v, 4) for k, v in (self.probabilities or {}).items()},
         "hints": self.hints,
         "sharing": self.sharing,
+        "sharing_mass": round(self.sharing_mass, 4),
         "confirmed": self.confirmed,
         "corroboration": self.corroboration,
         "applied": self.applied,
@@ -388,7 +400,8 @@ def destination_from_answers(answers: Dict[str, JevAnswer]) -> Tuple[str, float,
   if legacy is not None and legacy.noul is not None:
     p = float(legacy.noul)
     cls = "third_party_sdk" if p >= constants.T_THIRD_PARTY else "developer_backend"
-    return cls, min(1.0, abs(p - 0.5) * 2.0), {}, True
+    # A two-point distribution so ``sharing_mass`` reproduces the Noul.
+    return cls, min(1.0, abs(p - 0.5) * 2.0), {"third_party_sdk": p, "developer_backend": 1.0 - p}, True
   return DESTINATION_UNKNOWN, 0.0, {}, False
 
 
@@ -434,21 +447,35 @@ def compose_destination(
   charter's "never suppressed by judgement alone" applied to the one place a
   judgement lowers a severity.
 
-  ``sharing`` is recall-safe: a sharing class counts regardless of confidence,
-  and a sharing-capable sink inside the anchor scope counts regardless of the
-  class (the pre-WP7 OR). With ``DESTINATION_CLASS_ENABLED`` off the class is
-  still traced but ``confirmed`` is always False and ``sharing`` reduces to
-  the static in-scope fact.
+  ``sharing`` is recall-leaning but not argmax-driven: the probability mass
+  on the sharing classes must reach ``T_SHARING_MASS`` ("more likely shared
+  than not"; the legacy Noul is a two-point distribution so it reproduces the
+  old ``is_third_party``), and a sharing-capable sink inside the anchor scope
+  counts regardless of the class (the pre-WP7 OR). A sharing argmax below
+  the mass with no IPC sink is traced as ``corroboration: low_sharing_mass``
+  and review-flagged by the caller. With ``DESTINATION_CLASS_ENABLED`` off
+  the class is still traced but ``confirmed`` is always False and ``sharing``
+  reduces to the static in-scope fact.
   """
   cls, confidence, probabilities, legacy = destination_from_answers(answers)
   hints = _anchor_hint_kinds(state)
   enabled = constants.DESTINATION_CLASS_ENABLED
-  sharing_by_class = enabled and cls in constants.SHARING_DESTINATION_CLASSES
+  if probabilities:
+    sharing_mass = sum(float(probabilities.get(c, 0.0)) for c in constants.SHARING_DESTINATION_CLASSES)
+  else:
+    sharing_mass = 1.0 if cls in constants.SHARING_DESTINATION_CLASSES else 0.0
+  if legacy:
+    # The Noul already applied ``T_THIRD_PARTY``; keep the old semantics exactly.
+    sharing_by_class = enabled and cls in constants.SHARING_DESTINATION_CLASSES
+  else:
+    sharing_by_class = enabled and sharing_mass >= constants.T_SHARING_MASS
   sharing = bool(transmits and (sharing_by_class or sharing_in_scope))
 
   confirmed = False
   corroboration = "n/a"
-  if enabled and cls in constants.NON_COLLECTION_DESTINATION_CLASSES:
+  if enabled and transmits and cls in constants.SHARING_DESTINATION_CLASSES and not sharing:
+    corroboration = "low_sharing_mass"
+  elif enabled and cls in constants.NON_COLLECTION_DESTINATION_CLASSES:
     if confidence < constants.CONF_DESTINATION_ACT:
       corroboration = "low_confidence"
     elif cls == "user_chosen_destination":
@@ -463,10 +490,11 @@ def compose_destination(
         confirmed, corroboration = True, "no_egress_in_scope"
       else:
         corroboration = "uncorroborated"
-  log.debug("destination for %s in %s: class=%s conf=%.2f hints=%s sharing=%s confirmed=%s (%s)",
+  log.debug("destination for %s in %s: class=%s conf=%.2f mass=%.2f hints=%s sharing=%s confirmed=%s (%s)",
             (state.get("signal") or {}).get("data_type"), (state.get("signal") or {}).get("file"),
-            cls, confidence, hints, sharing, confirmed, corroboration)
-  return Destination(cls, confidence, probabilities, hints, sharing, confirmed, corroboration, legacy)
+            cls, confidence, sharing_mass, hints, sharing, confirmed, corroboration)
+  return Destination(cls, confidence, probabilities, hints, sharing, confirmed, corroboration,
+                     legacy, sharing_mass=sharing_mass)
 
 
 def relevance_is_low(verdict: str) -> bool:
@@ -802,8 +830,17 @@ def _compose_data_safety_finding(
     # user-initiated") is exactly what the confirmed class overrides.
     disclosure_status = "EXEMPT"
     destination.applied = True
+    # A user-directed hand-off to a destination the user picked (or to a
+    # platform component on the device) is not "sharing" by the developer in
+    # the Data Safety sense, even though the chooser Intent in scope is a
+    # sharing-capable sink. The static OR is overridden only here, behind the
+    # double gate; the trace keeps ``sharing_mass`` and the in-scope sinks.
+    if destination.sharing:
+      destination.sharing = False
+      is_third_party = False
     destination_note = (f"{destination.cls} confirmed by {destination.corroboration} "
-                        f"(conf={destination.confidence:.2f}); composed as inventory")
+                        f"(conf={destination.confidence:.2f}); composed as inventory, "
+                        f"not sharing")
     log.info("destination %s for %s in %s: %s", destination.cls, data_type,
              state["signal"]["file"], destination_note)
   else:
@@ -834,8 +871,13 @@ def _compose_data_safety_finding(
   destination_review = bool(
       constants.DESTINATION_CLASS_ENABLED and transmits and not destination.applied
       and (destination.cls == DESTINATION_UNKNOWN
-           or destination.cls in constants.NON_COLLECTION_DESTINATION_CLASSES))
-  if destination_review:
+           or destination.cls in constants.NON_COLLECTION_DESTINATION_CLASSES
+           or destination.sharing_unconfirmed))
+  if destination_review and destination.sharing_unconfirmed:
+    destination_note = (f"{destination.cls} argmax but sharing mass "
+                        f"{destination.sharing_mass:.2f} < T_SHARING_MASS and no sharing sink in "
+                        f"scope; is_third_party not set, kept for review")
+  elif destination_review:
     destination_note = (f"{destination.cls} not applied ({destination.corroboration}, "
                         f"conf={destination.confidence:.2f}); kept for review")
     log.info("destination %s for %s in %s: %s", destination.cls, data_type,
@@ -847,7 +889,7 @@ def _compose_data_safety_finding(
     purpose = "Platform component on the same device"
   elif decision == UNCERTAIN:
     purpose = "Possible transfer (uncertain; manual review)"
-  elif destination.cls == "other_app_ipc" and constants.DESTINATION_CLASS_ENABLED:
+  elif destination.cls == "other_app_ipc" and is_third_party and constants.DESTINATION_CLASS_ENABLED:
     purpose = "Shared with another app (IPC)"
   elif is_third_party:
     purpose = "Analytics or third-party sharing"
@@ -863,6 +905,9 @@ def _compose_data_safety_finding(
     summary = f"{summary} [transfer uncertain: p={p_transmit:.2f}; verify]"
   if destination.applied:
     summary = f"{summary} [destination: {destination.cls.replace('_', ' ')}]"
+  elif destination_review and destination.sharing_unconfirmed:
+    summary = (f"{summary} [sharing unconfirmed: {destination.cls.replace('_', ' ')} "
+               f"mass={destination.sharing_mass:.2f}; verify]")
   elif destination_review:
     summary = (f"{summary} [destination {destination.cls.replace('_', ' ')} unconfirmed: "
                f"conf={destination.confidence:.2f}; verify]")

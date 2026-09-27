@@ -420,6 +420,10 @@ def calibrate(labels: Dict[str, Any], min_precision: float = 0.90,
       "reliability_in_derived_band": reliability_in_band(
           cases, band["T_TRANSMIT_LOW"], band["T_TRANSMIT_HIGH"]),
       "destination": destination_report(cases),
+      # The joined rows themselves (label fields + ``p_transmit`` + ``run_*``),
+      # so two reports can be diffed case by case. The report is written
+      # next to the label file, out of tree, so real file names are fine here.
+      "cases": [dict(sorted(c.items())) for c in cases],
       "warnings": [],
   }
   regressions = report["destination"].get("sharing_regressions") or []

@@ -540,6 +540,63 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
   labelled sharing case loses its sharing flag. `EVALUATOR_VERSION` bump
   (question wording changed).
 - **Size.** Medium across `questions.py`, `evaluate.py`, `calibrate.py`.
+- **Outcome (done).** Implemented as planned with two deliberate deviations
+  and two refinements found in live validation:
+  1. *Deviation — no finding is dropped.* The plan said a confirmed
+     `user_chosen_destination` / `platform_component` "yields no finding";
+     the charter says a finding is never suppressed by judgement alone, so
+     the confirmed class composes the finding as a `data_safety_section`
+     SUGGESTION with disclosure EXEMPT (the transfer stays inventoried, the
+     summary is suffixed `[destination: …]`) and clears `is_third_party`.
+     Applying it is double-gated: confidence ≥ `CONF_DESTINATION_ACT` (0.75)
+     **and** corroboration — the deterministic hint in scope, the battery's
+     own `user_initiated`, or (platform) no strong egress reachable. An
+     unconfirmed class or `unknown` keeps the transfer severity and adds a
+     review flag with the reason (`low_confidence` / `uncorroborated`).
+  2. *Deviation — hints live in `structure.py`, not `capabilities.py`.* They
+     are per-scope lexical facts (a user-source token meeting a
+     destination-shaped identifier; chooser / document-picker tokens; URL
+     literals split by host against the package domain), so they belong with
+     the other deterministic scope analysis. Hint-free states are
+     byte-identical to WP6.
+  3. *Refinement — sharing by probability mass.* The first live run flipped
+     `is_third_party` on a developer-billing file because a flat six-way
+     distribution made `third_party_sdk` the argmax at 0.38. Sharing now
+     requires the mass on `third_party_sdk + other_app_ipc` to reach
+     `T_SHARING_MASS = 0.50` (or an IPC sink in scope, as before); a sharing
+     argmax below the mass is traced `low_sharing_mass`, review-flagged and
+     suffixed `[sharing unconfirmed …]`. One App A finding changed.
+  4. *Refinement — applied class clears the sharing flag.* Eight of the
+     eleven labelled user-chosen transfers kept `is_third_party` from the
+     chooser `Intent` in scope; `sharing_agreement` was 0.522. A confirmed,
+     applied non-collection class now clears it (Data Safety: a transfer to a
+     destination the user picks is not sharing by the developer):
+     `sharing_agreement` 0.783.
+  Live results (WP7 vs the WP6 snapshot; question text changed so the
+  data-safety battery was re-asked — App A 153 requests / 625k input tokens,
+  App B 48 / 264k): App A findings 128 → 126, CRITICAL 2 → 0 (both were
+  user-composed support e-mails, now SUGGESTION inventory), IMPORTANT
+  45 → 44, decisions LOCAL/UNCERTAIN/TRANSMITS 77/23/18 → 73/26/18; App B
+  77 → 79, CRITICAL 3 → 1 (the deterministic target-API finding),
+  IMPORTANT 39 → 30, SUGGESTION 36 → 49. Seven downgrades were applied on
+  both apps together (the share-sheet hand-offs in `Panels.java`, the
+  bug-report share, both support e-mails, an SMB listing to a user-typed
+  host, a backup-restore picker); `calibrate --rejoin`: exit 0, 48/48,
+  `applied_downgrades_wrong` 0, `sharing_regressions` none, destination
+  accuracy 0.826, `user_chosen_destination` precision / recall 1.0 / 1.0,
+  `third_party_sdk` recall 1.0 at precision 0.6 (two proxy-backend files
+  the model calls third-party), the single `platform_component` label
+  (clipboard) answered `unknown`. **Abstention at the current constants
+  0.50 → 0.479 (< 0.50 ✓)**, UNCERTAIN true transfers 6 → 5, recall-at-high
+  0.696 → 0.739, precision-at-high 0.889 → 0.895. Per-case `p_transmit`
+  moved by less than 0.10 on every labelled case but one non-transfer, so
+  the reliability numbers shift with bin edges: in the current band
+  (0.35–0.70, 23 cases) ECE 0.280 → 0.304, in the derived band ECE
+  0.328 → 0.267; overall ECE 0.197 → 0.223, Brier 0.179 → 0.180. The
+  derived band widened to 0.20 / 0.72 because the clipboard case scores
+  0.20 (it was 0.23 and already below `T_TRANSMIT_LOW` at WP6); the M2 gate
+  decides whether that label stays a transfer. Selftest 393 checks. Version
+  bump and `THRESHOLD_PROVENANCE` refresh deferred to M2 as planned.
 
 ### WP8 — Consent defaults, string resources, flavor attribution (L4)
 
@@ -786,7 +843,7 @@ touching the rest of the cascade.
 - [x] WP5 wave 1 policies (FGS fixes, package visibility, all files, exact alarm, target API)
 - [x] **M1 gate** (passed; App A model-call count exception recorded)
 - [x] WP6 one-hop callee resolution
-- [ ] WP7 `destination_class` + label schema v2 + relabel
+- [x] WP7 `destination_class` + label schema v2 + relabel
 - [ ] **M2 gate**
 - [ ] WP8 consent defaults, string resources, flavor attribution
 - [ ] WP9 wave 2 policies

@@ -471,7 +471,21 @@ cached v1 answers still compose.
   gate keeps the transfer severity, is marked for review and says why
   (`corroboration: "low_confidence"` / `"uncorroborated"`), so the report still surfaces it
   and a reviewer sees what would have to be true for the downgrade. A LOCAL decision makes the
-  class moot (`"n/a"`). Sharing classes never need corroboration: they raise, not lower.
+  class moot (`"n/a"`). An applied non-collection class also clears `is_third_party`: the
+  chooser `Intent` in scope is a sharing-capable sink, but a hand-off to a destination the
+  user picked is not sharing *by the developer* in the Data Safety sense (trace
+  `destination_note` ends "not sharing"; `sharing_mass` and the sinks stay in the trace).
+- **Sharing is decided by probability mass, not by the argmax.** `is_third_party` is set when
+  the mass the Choice puts on `third_party_sdk + other_app_ipc` reaches
+  `T_SHARING_MASS = 0.50` ("more likely shared than not") or when a sharing-capable sink is in
+  the anchor's scope (the pre-WP7 static OR). The first WP7 live run showed why the argmax is
+  not enough: a nearly flat six-way distribution made `third_party_sdk` the argmax at 0.38 on
+  a developer-billing file and flipped the report's sharing flag. A sharing argmax below the
+  mass with no IPC sink in scope is traced as `corroboration: "low_sharing_mass"`,
+  review-flagged and suffixed `[sharing unconfirmed: third party sdk mass=0.34; verify]` —
+  never silently dropped. The bar is lower than the downgrade gate on purpose (sharing
+  raises, the downgrade lowers). A legacy `is_third_party` Noul keeps its own `T_THIRD_PARTY`
+  semantics exactly.
 - **Deterministic destination hints are priors, never decisions.** `structure.destination_hints`
   scans an anchor's scope for three patterns and attaches them to the anchor
   (`anchor.destination_hints`) and to `state["destination_hints"]` (only when non-empty, so
@@ -487,9 +501,10 @@ cached v1 answers still compose.
   hints are evidence to weigh, not the answer. The hints are also what the corroboration gate
   reads, which is why they are computed in code and not asked.
 - **Trace.** `decision_trace.destination` records `class`, `confidence`, the full
-  `probabilities` dict, the `hints` seen, `sharing`, `confirmed`, `corroboration`, `applied`,
-  `legacy` and `enabled`; `destination_note` explains any composition change in one sentence;
-  `thresholds` gains `CONF_DESTINATION_ACT` and `DESTINATION_CLASS_ENABLED`; the finding gains
+  `probabilities` dict, the `hints` seen, `sharing`, `sharing_mass`, `confirmed`,
+  `corroboration`, `applied`, `legacy` and `enabled`; `destination_note` explains any
+  composition change in one sentence; `thresholds` gains `CONF_DESTINATION_ACT`,
+  `T_SHARING_MASS` and `DESTINATION_CLASS_ENABLED`; the finding gains
   `destination_class` and a purpose string per class ("User-chosen destination (user-directed
   transfer; not collection by the developer)", "Shared with another app (IPC)", …).
 - **Stand-in client.** `HeuristicJevClient._destination_prior` (the offline stand-in, not the
