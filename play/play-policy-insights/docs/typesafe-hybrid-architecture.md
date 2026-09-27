@@ -1,8 +1,9 @@
 # Play Policy Insights × TypeSafe (Jev): Hybrid Architecture Design
 
-Status: Draft / prototype
+Status: Draft / prototype (v1 design; v2 capability-based evaluation is specified in
+[`capability-based-evaluation.md`](capability-based-evaluation.md) and summarised in §9.2)
 Owner: play-policy-insights
-Last updated: 2026-09-26
+Last updated: 2026-09-27
 
 ## 1. Purpose
 
@@ -191,6 +192,11 @@ consumes):
 | `__main__.py` | CLI: `python -m typesafe_eval run <temp_dir> [--client heuristic|http] [--model jev-1.13.0]`. |
 | `eval/` | Labeled fixtures + `run_eval.py` to measure agreement/calibration of a client against expected decisions. |
 | `selftest.py` | Offline unit checks (snippets, templates, HTTP request-build/response-parse, answer composition). |
+| `structure.py` (v2) | Deterministic structure layer: imports, declared package, scopes, symbol references, dependency inventory. |
+| `capabilities.py` (v2) | Behavioural capability taxonomy, model-driven identifier classification, persistent human-reviewable cache. |
+| `context.py` (v2) | Sinks and anchors: chooses the occurrence of a hit nearest a transfer-capable sink; capability-tiered ranking. |
+| `engine.py` (v2) | Cascade: filter -> classify -> triage -> batched batteries -> manifest checks -> Play declaration; writes `typesafe_triage.json`. |
+| `calibrate.py` (v2) | Derives the transfer band and reliability metrics from an out-of-tree label set; emits the provenance block. |
 
 ### 7.1 Where it plugs in
 
@@ -249,6 +255,49 @@ for the dimensions and bars, and the
 policies and choosing models. The earlier offline-heuristic "0.94 agreement" was
 circular (the heuristic is derived from the same signals); these live numbers are
 the real signal.
+
+### 9.2 Real-application validation and the v2 redesign (`2.0.0-capability`)
+
+Running the v1 build on two real open-source applications (rather than synthetic
+snippets) exposed three failure modes the 13-case set could not: real off-device
+sends scoring 0.52-0.54 fell under the single `T_TRANSMIT = 0.55` cliff and were
+reported as local-only; a credential sent over a raw socket was ranked past the
+per-type cap by ubiquitous IPC platform types and never asked about; and the
+critic pruned a genuine device-id upload because the evidence it saw was the
+first pattern match (a type declaration), not the send. `T_TRANSMIT` was
+also the wrong shape: forcing a binary decision at 0.55 discarded the model's
+uncertainty instead of routing it to a human.
+
+The v2 design in [`capability-based-evaluation.md`](capability-based-evaluation.md)
+replaces §4's single threshold and §6's pattern-anchored snippets with:
+
+- a deterministic **structure layer** (imports, scopes, symbol references,
+  dependency inventory, first-party detection);
+- a **semantic layer** in which Jev labels third-party identifiers with a
+  vendor-free behavioural capability taxonomy (network egress, third-party
+  telemetry, advertising, IPC sharing, local persistence, logging, disclosure
+  UI, unknown), cached and human-correctable; no library names appear in
+  evaluator logic, enforced by a selftest lint;
+- a **policy layer** with a relevance gate, a three-way transfer decision
+  (LOCAL / UNCERTAIN / TRANSMITS at `T_TRANSMIT_LOW = 0.35`,
+  `T_TRANSMIT_HIGH = 0.70`) in which UNCERTAIN is surfaced as transferred and
+  routed to manual review rather than pruned, capability-tiered ranking so
+  explicit egress out-ranks IPC out-ranks unknown, a critic that verifies only
+  the atomic transfer claim, deterministic manifest checks, and a decision
+  trace on every finding;
+- a **calibration tool** and a `THRESHOLD_PROVENANCE` block recording the
+  label set, method, derived band and measured metrics.
+
+IPC hand-offs (intents, content providers, clipboard, bound services) are
+treated as *sharing* by policy direction.
+
+On the two applications v2 recovers every Critical the legacy skill found and
+v1 missed (as TRANSMITS findings plus Data Safety discrepancies), surfaces the
+dropped credential send at p=0.90, and has zero false negatives against 48
+hand-adjudicated transfer labels (23 true). Cost rose (78k -> 568k input tokens
+on the larger app, cold) because identifiers are now classified and each
+finding is asked relevance and transfer questions with real code context;
+capability labels and results are cached so a warm re-run makes zero requests.
 
 ## 10. Rollout
 
