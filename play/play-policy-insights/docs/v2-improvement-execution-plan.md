@@ -615,7 +615,7 @@ follow WP7.
 Measured against the WP0 baseline (`.scratch/baselines/2.0.0-capability/`)
 after WP5:
 
-- selftest: 299 checks green (was 195 at WP0).
+- selftest: 299 checks green (was 133 at WP0).
 - both apps run end-to-end live (evaluator → aggregate → critic → report).
 - dev-set recall: `calibrate --rejoin` exit 0, 48/48 labelled transfers
   rejoined (checked at every WP; two losses surfaced and fixed on the way —
