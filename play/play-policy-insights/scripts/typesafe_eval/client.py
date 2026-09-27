@@ -345,6 +345,7 @@ class HeuristicJevClient(JevClient):
     has_disclosure = any(
         gate in (co.get("disclosure") or []) for gate in self._DISCLOSURE_GATES
     )
+    destination = self._destination_prior(state) if isinstance(state, dict) else "unknown"
     category = str(app.get("store_category", "")).strip().lower()
 
     core_categories = self._CORE_BY_CATEGORY.get(data_type, set())
@@ -373,8 +374,35 @@ class HeuristicJevClient(JevClient):
           is_core=is_core,
           snippet=snippet,
           signal=signal,
+          destination=destination,
       )
     return answers
+
+  @staticmethod
+  def _destination_prior(state: Dict[str, Any]) -> str:
+    """Offline stand-in for the ``destination_class`` Choice (WP7).
+
+    Reads only what the state already carries: a ``USER_CHOSEN_DESTINATION``
+    hint wins, then the strongest sink capability (telemetry/advertising ->
+    third-party SDK, IPC only -> another app, network -> developer backend),
+    else ``unknown``. This is a heuristic for hermetic runs, not a judgement.
+    """
+    hints = {h.get("hint") for h in state.get("destination_hints") or []}
+    if "USER_CHOSEN_DESTINATION" in hints:
+      return "user_chosen_destination"
+    caps: set = set()
+    for s in state.get("sinks") or []:
+      caps.update(s.get("capabilities") or [])
+    for c in state.get("callees") or []:
+      for s in c.get("sinks") or []:
+        caps.update(s.get("capabilities") or [])
+    if caps & {"THIRD_PARTY_TELEMETRY", "ADVERTISING_SDK"}:
+      return "third_party_sdk"
+    if "NETWORK_EGRESS" in caps:
+      return "developer_backend"
+    if "IPC_SHARING" in caps:
+      return "other_app_ipc"
+    return "unknown"
 
   def _answer(
       self,
@@ -387,6 +415,7 @@ class HeuristicJevClient(JevClient):
       is_core: bool,
       snippet: str,
       signal: Dict[str, Any],
+      destination: str = "unknown",
   ) -> JevAnswer:
     qtype = question.get("type")
 
@@ -406,7 +435,8 @@ class HeuristicJevClient(JevClient):
     if qtype == "choice":
       options = list((question.get("criteria") or {}).keys())
       probs = self._choice_probs(
-          qid, options, has_network=has_network, has_disclosure=has_disclosure
+          qid, options, has_network=has_network, has_disclosure=has_disclosure,
+          destination=destination,
       )
       choice = max(probs, key=probs.get) if probs else (options[0] if options else "")
       return JevAnswer(
@@ -498,6 +528,7 @@ class HeuristicJevClient(JevClient):
       # The scanner cannot see intent; stay near "unknown" leaning no.
       return 0.4
     if qid == "is_third_party":
+      # Retired in WP7 (``destination_class`` Choice); kept for older batteries.
       return 0.5
     if qid == "evidence_supports_claim":
       pattern = str(signal.get("matched_pattern", ""))
@@ -519,8 +550,12 @@ class HeuristicJevClient(JevClient):
       *,
       has_network: bool,
       has_disclosure: bool,
+      destination: str = "unknown",
   ) -> Dict[str, float]:
     probs = {opt: 0.0 for opt in options}
+    if qid == "destination_class" and probs:
+      # WP7 stand-in: peak on the deterministic prior (see ``_destination_prior``).
+      return _peak(probs, destination if destination in probs else "unknown")
     if qid == "disclosure_status" and probs:
       if has_disclosure:
         winner = "DISCLOSED"

@@ -54,6 +54,25 @@ joined to the ``worker_*.json`` finding with the same (file suffix, data_type)
 and the probability is read from its decision trace. Labels live *outside* the
 repository (they name app files); only this tool and the derived numbers are
 checked in.
+
+Label schema v2 (WP7) adds an optional ``destination_class`` per case, one of
+``questions.DESTINATION_CLASS_OPTIONS`` (``developer_backend``,
+``third_party_sdk``, ``user_chosen_destination``, ``platform_component``,
+``other_app_ipc``) for labelled transfers; non-transfers leave it out (or
+``null``). When present the report adds:
+
+- ``destination``: the model's predicted class (read from the joined finding)
+  against the label -- per-class precision / recall / support, the confusion
+  table, and the share of labelled transfers whose *sharing* flag
+  (``is_third_party``) the run got right (``sharing_agreement``). A labelled
+  sharing case whose finding lost its sharing flag is listed in
+  ``sharing_regressions`` -- the WP7 exit criterion forbids any.
+- ``reliability_by_class``: Brier / ECE of ``p_transmit`` split by the labelled
+  class (non-transfers grouped as ``none``), so a badly calibrated class is
+  visible instead of averaged away.
+- ``reliability_in_band``: Brier / ECE restricted to the cases whose
+  ``p_transmit`` falls inside the *current* UNCERTAIN band -- the number the
+  WP7 exit criterion compares against WP6.
 """
 
 from __future__ import annotations
@@ -89,9 +108,19 @@ def _finding_probability(finding: Dict[str, Any]) -> Optional[float]:
   return float(p) if p is not None else None
 
 
-def _index_findings(worker_dirs: List[str]) -> List[Tuple[str, str, float]]:
-  """``(file, data_type, p_transmit)`` for every finding with a probability."""
-  out: List[Tuple[str, str, float]] = []
+#: Fields copied from the joined finding onto the case (prefixed ``run_``) so
+#: the destination report can compare the run against the label.
+_RUN_FIELDS = ("destination_class", "is_third_party", "transfer_decision", "severity")
+
+
+def _index_findings(worker_dirs: List[str]) -> List[Tuple[str, str, float, Dict[str, Any]]]:
+  """``(file, data_type, p_transmit, run_fields)`` for every finding with a probability.
+
+  ``run_fields`` carries the finding's ``destination_class`` (WP7; falls back
+  to the decision trace's ``destination.class``), ``is_third_party``,
+  ``transfer_decision`` and ``severity``.
+  """
+  out: List[Tuple[str, str, float, Dict[str, Any]]] = []
   for d in worker_dirs:
     for path in sorted(glob.glob(os.path.join(d, "worker_*.json"))):
       try:
@@ -105,7 +134,13 @@ def _index_findings(worker_dirs: List[str]) -> List[Tuple[str, str, float]]:
         files = f.get("files_involved") or []
         if p is None or not dt or not files:
           continue
-        out.append((files[0], dt, p))
+        trace = f.get("decision_trace") or {}
+        run = {k: f.get(k) for k in _RUN_FIELDS}
+        if run.get("destination_class") is None:
+          run["destination_class"] = (trace.get("destination") or {}).get("class")
+        run["destination_confirmed"] = (trace.get("destination") or {}).get("confirmed")
+        run["destination_applied"] = (trace.get("destination") or {}).get("applied")
+        out.append((files[0], dt, p, run))
   log.info("indexed %d findings with transfer probabilities from %d dirs", len(out), len(worker_dirs))
   return out
 
@@ -134,7 +169,7 @@ def join_probabilities(
     if c.get("p_transmit") is not None and not rejoin:
       joined.append(c)
       continue
-    match = [p for (f, dt, p) in index
+    match = [(p, run) for (f, dt, p, run) in index
              if dt == c.get("data_type") and f.endswith(c.get("file", "\x00"))]
     if not match:
       level = logging.ERROR if c.get("transfers") else logging.WARNING
@@ -143,7 +178,10 @@ def join_probabilities(
       if unmatched is not None:
         unmatched.append({**c, "reason": "no finding with a transfer probability in worker_dirs"})
       continue
-    joined.append({**c, "p_transmit": max(match)})
+    # The highest-probability finding is the one the report acts on; its
+    # run-side fields (destination class, sharing flag) travel with the case.
+    p_best, run_best = max(match, key=lambda m: m[0])
+    joined.append({**c, "p_transmit": p_best, **{f"run_{k}": v for k, v in run_best.items()}})
   return joined
 
 
@@ -198,6 +236,106 @@ def reliability(cases: List[Dict[str, Any]], bins: int = 10) -> Dict[str, Any]:
     ece += abs(acc - conf) * len(members) / len(cases)
     rows.append({"bin": [lo, hi], "n": len(members), "mean_p": round(conf, 3), "frac_true": round(acc, 3)})
   return {"brier": round(brier, 4), "ece": round(ece, 4), "bins": rows}
+
+
+def reliability_by_class(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+  """Brier / ECE of ``p_transmit`` per *labelled* destination class (WP7).
+
+  Non-transfers are grouped as ``none``; labelled transfers without a class
+  as ``unlabelled``. Bins are omitted per class (too thin to read); the
+  headline numbers and the support are enough to spot a class that is
+  mis-calibrated on its own.
+  """
+  groups: Dict[str, List[Dict[str, Any]]] = {}
+  for c in cases:
+    if not c["transfers"]:
+      key = "none"
+    else:
+      key = c.get("destination_class") or "unlabelled"
+    groups.setdefault(key, []).append(c)
+  out: Dict[str, Any] = {}
+  for key in sorted(groups):
+    r = reliability(groups[key])
+    out[key] = {"n": len(groups[key]), "brier": r["brier"], "ece": r["ece"],
+                "mean_p": round(sum(c["p_transmit"] for c in groups[key]) / len(groups[key]), 3)}
+  return out
+
+
+def reliability_in_band(cases: List[Dict[str, Any]], t_low: float, t_high: float) -> Dict[str, Any]:
+  """Brier / ECE restricted to the UNCERTAIN band ``[t_low, t_high)`` (WP7 exit metric)."""
+  members = [c for c in cases if t_low <= c["p_transmit"] < t_high]
+  r = reliability(members)
+  return {"band": [t_low, t_high], "n": len(members),
+          "positives": sum(1 for c in members if c["transfers"]),
+          "brier": r["brier"], "ece": r["ece"]}
+
+
+def destination_report(cases: List[Dict[str, Any]]) -> Dict[str, Any]:
+  """Predicted ``destination_class`` (from the joined findings) vs the labels (WP7).
+
+  Only labelled transfers with a ``destination_class`` label *and* a joined
+  ``run_destination_class`` take part. Reports per-class precision / recall /
+  support, the confusion table (``label -> predicted -> n``), the agreement of
+  the run's sharing flag with the label's sharing classes, and every labelled
+  sharing case whose finding lost its sharing flag (``sharing_regressions``,
+  which the WP7 exit criterion requires to be empty).
+  """
+  labelled = [c for c in cases if c["transfers"] and c.get("destination_class")]
+  scored = [c for c in labelled if c.get("run_destination_class")]
+  if not labelled:
+    return {"n_labelled": 0, "note": "no destination_class labels (schema v1)"}
+  sharing_classes = set(constants.SHARING_DESTINATION_CLASSES)
+  confusion: Dict[str, Dict[str, int]] = {}
+  for c in scored:
+    row = confusion.setdefault(str(c["destination_class"]), {})
+    pred = str(c.get("run_destination_class"))
+    row[pred] = row.get(pred, 0) + 1
+  classes = sorted({str(c["destination_class"]) for c in scored}
+                   | {str(c.get("run_destination_class")) for c in scored})
+  per_class: Dict[str, Any] = {}
+  for k in classes:
+    tp = sum(1 for c in scored if str(c["destination_class"]) == k and str(c.get("run_destination_class")) == k)
+    support = sum(1 for c in scored if str(c["destination_class"]) == k)
+    predicted = sum(1 for c in scored if str(c.get("run_destination_class")) == k)
+    per_class[k] = {
+        "support": support,
+        "predicted": predicted,
+        "precision": round(tp / predicted, 3) if predicted else None,
+        "recall": round(tp / support, 3) if support else None,
+    }
+  accuracy = (sum(1 for c in scored if str(c["destination_class"]) == str(c.get("run_destination_class")))
+              / len(scored)) if scored else None
+  sharing_cases = [c for c in scored if c["destination_class"] in sharing_classes]
+  sharing_regressions = [
+      {"file": c.get("file"), "data_type": c.get("data_type"),
+       "destination_class": c.get("destination_class"),
+       "run_destination_class": c.get("run_destination_class"),
+       "run_is_third_party": c.get("run_is_third_party")}
+      for c in sharing_cases if not c.get("run_is_third_party")
+  ]
+  sharing_agreement = (
+      sum(1 for c in scored if bool(c.get("run_is_third_party")) == (c["destination_class"] in sharing_classes))
+      / len(scored)) if scored else None
+  # Confirmed non-collection classes lower a severity, so a *wrong* one is the
+  # precision risk WP7 introduces; list every applied downgrade against its label.
+  applied = [
+      {"file": c.get("file"), "data_type": c.get("data_type"),
+       "destination_class": c.get("destination_class"),
+       "run_destination_class": c.get("run_destination_class"),
+       "agrees": c.get("destination_class") == c.get("run_destination_class")}
+      for c in scored if c.get("run_destination_applied")
+  ]
+  return {
+      "n_labelled": len(labelled),
+      "n_scored": len(scored),
+      "accuracy": round(accuracy, 3) if accuracy is not None else None,
+      "per_class": per_class,
+      "confusion": confusion,
+      "sharing_agreement": round(sharing_agreement, 3) if sharing_agreement is not None else None,
+      "sharing_regressions": sharing_regressions,
+      "applied_downgrades": applied,
+      "applied_downgrades_wrong": sum(1 for a in applied if not a["agrees"]),
+  }
 
 
 def band_metrics(cases: List[Dict[str, Any]], t_low: float, t_high: float) -> Dict[str, Any]:
@@ -275,8 +413,25 @@ def calibrate(labels: Dict[str, Any], min_precision: float = 0.90,
       "metrics_at_current_constants": band_metrics(
           cases, constants.T_TRANSMIT_LOW, constants.T_TRANSMIT_HIGH),
       "reliability": reliability(cases),
+      # WP7 (label schema v2): per-class views and the in-band metric.
+      "reliability_by_class": reliability_by_class(cases),
+      "reliability_in_band": reliability_in_band(
+          cases, constants.T_TRANSMIT_LOW, constants.T_TRANSMIT_HIGH),
+      "reliability_in_derived_band": reliability_in_band(
+          cases, band["T_TRANSMIT_LOW"], band["T_TRANSMIT_HIGH"]),
+      "destination": destination_report(cases),
       "warnings": [],
   }
+  regressions = report["destination"].get("sharing_regressions") or []
+  if regressions:
+    report["warnings"].append(
+        f"{len(regressions)} labelled sharing case(s) lost the sharing flag: "
+        + ", ".join(f"{r.get('file')}/{r.get('data_type')}" for r in regressions))
+  wrong = report["destination"].get("applied_downgrades_wrong") or 0
+  if wrong:
+    report["warnings"].append(
+        f"{wrong} confirmed non-collection destination(s) disagree with the label "
+        "(a severity was lowered on a wrong class); see destination.applied_downgrades")
   if len(cases) < MIN_RECOMMENDED_CASES:
     report["warnings"].append(
         f"only {len(cases)} labelled cases (< {MIN_RECOMMENDED_CASES}); treat as a "
@@ -296,7 +451,12 @@ def calibrate(labels: Dict[str, Any], min_precision: float = 0.90,
 
 def main(labels_path: str, out_path: Optional[str] = None, min_precision: float = 0.90,
          rejoin: bool = False, worker_dirs: Optional[List[str]] = None) -> int:
-  """CLI entry. Returns 2 when a labelled transfer is missing from the run."""
+  """CLI entry.
+
+  Returns 2 when a labelled transfer is missing from the run and 3 when a
+  labelled sharing case lost its sharing flag (WP7 exit criterion); both are
+  recall regressions the charter forbids.
+  """
   labels = _load_json(labels_path)
   report = calibrate(labels, min_precision=min_precision, rejoin=rejoin, worker_dirs=worker_dirs)
   text = json.dumps(report, indent=2, sort_keys=True)
@@ -310,4 +470,8 @@ def main(labels_path: str, out_path: Optional[str] = None, min_precision: float 
   if report["missing_positives"]:
     print(f"FAIL: {len(report['missing_positives'])} labelled transfer(s) not found in the run")
     return 2
+  regressions = report["destination"].get("sharing_regressions") or []
+  if regressions:
+    print(f"FAIL: {len(regressions)} labelled sharing case(s) lost the sharing flag")
+    return 3
   return 0

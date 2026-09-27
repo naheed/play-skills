@@ -236,8 +236,49 @@ RELEVANCE_SOFT_GATE_FILE_EGRESS = True
 T_DISCLOSURE = 0.50        # a prominent disclosure gate is present
 T_CORE_FUNCTION = 0.60     # the access is core to the app's stated purpose
 T_USER_INITIATED = 0.60    # the transfer is triggered by an explicit user action
-T_THIRD_PARTY = 0.60       # the sink is outside the developer's control
+T_THIRD_PARTY = 0.60       # legacy ``is_third_party`` Noul threshold (eval harness compatibility)
 T_EVIDENCE_SUPPORTS = 0.50  # critic: the snippet actually supports the claim
+
+# ---------------------------------------------------------------------------
+# WP7: ``destination_class`` replaces the ``is_third_party`` Noul.
+#
+# The data-safety battery asks *where* a transfer goes as a closed Choice
+# (``questions.DESTINATION_CLASS_OPTIONS``): developer_backend,
+# third_party_sdk, user_chosen_destination, platform_component,
+# other_app_ipc, unknown. ``evaluate`` composes the policy consequence in code
+# (plan §2 L2 table). Two classes -- ``user_chosen_destination`` (the user
+# typed the server, or picked the app to share with) and
+# ``platform_component`` (a system provider on the same device) -- mean the
+# transfer is *not* collection by the developer, so the finding becomes a
+# data-safety inventory SUGGESTION instead of a prominent-disclosure risk.
+#
+# That downgrade is the one place a model judgement lowers a severity, so it
+# is gated twice (charter: a finding is never suppressed by judgement alone):
+#   1. the Choice confidence must reach CONF_DESTINATION_ACT, and
+#   2. an independent signal must agree: for ``user_chosen_destination`` the
+#      deterministic USER_CHOSEN_DESTINATION hint in the anchor scope
+#      (``structure.destination_hints``) or the battery's own
+#      ``user_initiated`` >= T_USER_INITIATED; for ``platform_component`` the
+#      absence of any strong-egress sink in the anchor scope and among the
+#      callees the anchor reaches.
+# An unconfirmed downgrade candidate keeps its transfer-based severity, is
+# routed to manual review and traced as ``destination_confirmed=false``.
+# ``unknown`` always routes to review. Rollback: DESTINATION_CLASS_ENABLED =
+# False restores the pre-WP7 composition (sharing = IPC sink in scope only;
+# the Choice is still asked and traced but never changes a severity).
+# ---------------------------------------------------------------------------
+DESTINATION_CLASS_ENABLED = True
+CONF_DESTINATION_ACT = 0.75
+# Destination classes that count as sharing with another party (plan §2 L2:
+# ``third_party_sdk`` is collection + sharing; ``other_app_ipc`` is sharing).
+SHARING_DESTINATION_CLASSES = ("third_party_sdk", "other_app_ipc")
+# Destination classes that, once confirmed, mean the transfer is not
+# collection by the developer (no prominent-disclosure finding).
+NON_COLLECTION_DESTINATION_CLASSES = ("user_chosen_destination", "platform_component")
+# Deterministic destination hints (``structure.destination_hints``) are
+# computed only when this is on; they ride in the state as
+# ``destination_hints`` and in the trace, never as a decision.
+DESTINATION_HINTS_ENABLED = True
 T_ACCOUNT_DELETION = 0.60   # deterministic gate: snippet really deletes an account
 T_DECLARATION_COVERS = 0.50  # play_declaration: declaration covers a detected type
 

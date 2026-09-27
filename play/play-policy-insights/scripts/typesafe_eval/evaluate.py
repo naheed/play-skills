@@ -37,11 +37,13 @@ from typing import Dict
 from typing import Iterable
 from typing import List
 from typing import Optional
+from typing import Sequence
 from typing import Tuple
 
 from typesafe_eval import constants
 from typesafe_eval import questions as q
 from typesafe_eval import snippets
+from typesafe_eval import structure
 from typesafe_eval import templates
 from typesafe_eval.client import JevAnswer
 from typesafe_eval.client import JevClient
@@ -155,6 +157,8 @@ def _decision_trace(
           "RELEVANCE_SOFT_GATE_FILE_EGRESS": constants.RELEVANCE_SOFT_GATE_FILE_EGRESS,
           "T_DISCLOSURE": constants.T_DISCLOSURE,
           "T_THIRD_PARTY": constants.T_THIRD_PARTY,
+          "CONF_DESTINATION_ACT": constants.CONF_DESTINATION_ACT,
+          "DESTINATION_CLASS_ENABLED": constants.DESTINATION_CLASS_ENABLED,
           "provenance": constants.THRESHOLD_PROVENANCE,
       },
       "anchor": {
@@ -168,7 +172,15 @@ def _decision_trace(
           "lexical": anchor.get("lexical"),
           "callee_in_scope": anchor.get("callee_in_scope"),
           "callee_capabilities": anchor.get("callee_capabilities"),
+          "destination_hints": anchor.get("destination_hints"),
       },
+      # WP7: the deterministic destination priors read from the anchor scope
+      # (kind, line, why, source line). Empty when none was found.
+      "destination_hints": [
+          {"hint": h.get("hint"), "line": h.get("line"), "detail": h.get("detail"),
+           "evidence": h.get("evidence")}
+          for h in state.get("destination_hints") or []
+      ],
       "sinks": [
           {"symbol": s.get("symbol"), "capabilities": s.get("capabilities")} for s in sinks
       ],
@@ -291,6 +303,170 @@ def sharing_sinks_in_scope(state: Dict[str, Any]) -> List[str]:
       if set(s.get("capabilities") or []) & sharing:
         out.add(f"{callee.get('symbol')}.{s.get('symbol')}")
   return sorted(out)
+
+
+# ---------------------------------------------------------------------------
+# WP7: destination_class composition
+# ---------------------------------------------------------------------------
+
+DESTINATION_UNKNOWN = "unknown"
+
+
+class Destination:
+  """The composed destination of a transfer and how much the composer trusts it.
+
+  Attributes:
+    cls: One of ``questions.DESTINATION_CLASS_OPTIONS`` (``unknown`` when the
+      battery had no ``destination_class`` answer).
+    confidence: The Choice's calibrated confidence (0.0 when absent).
+    probabilities: The Choice's per-option probabilities (trace only).
+    hints: Deterministic hint kinds found in the anchor scope
+      (``structure.destination_hints``).
+    sharing: True when the transfer counts as sharing with another party
+      (``constants.SHARING_DESTINATION_CLASSES``) or a sharing-capable sink
+      is in the anchor scope. Drives the report's ``is_third_party``.
+    confirmed: True when the class may change the composed severity: the
+      confidence reaches ``CONF_DESTINATION_ACT`` *and* an independent signal
+      corroborates it (see ``corroboration``). Only meaningful for the
+      non-collection classes; other classes never lower a severity.
+    corroboration: Why ``confirmed`` holds (``hint`` / ``user_initiated`` /
+      ``no_egress_in_scope``) or why not (``low_confidence`` /
+      ``uncorroborated`` / ``n/a``).
+    applied: True when the class actually changed the finding (a confirmed
+      non-collection class on a transfer at/above ``T_TRANSMIT_LOW``).
+    legacy: True when the class was derived from an ``is_third_party`` Noul
+      (older battery / cached answers) rather than the Choice.
+  """
+
+  def __init__(self, cls: str, confidence: float, probabilities: Dict[str, float],
+               hints: List[str], sharing: bool, confirmed: bool, corroboration: str,
+               legacy: bool = False):
+    self.cls = cls
+    self.confidence = confidence
+    self.probabilities = probabilities
+    self.hints = hints
+    self.sharing = sharing
+    self.confirmed = confirmed
+    self.corroboration = corroboration
+    self.applied = False
+    self.legacy = legacy
+
+  @property
+  def non_collection(self) -> bool:
+    """A confirmed class under which the transfer is not collection by the developer."""
+    return self.confirmed and self.cls in constants.NON_COLLECTION_DESTINATION_CLASSES
+
+  def to_trace(self) -> Dict[str, Any]:
+    return {
+        "class": self.cls,
+        "confidence": round(self.confidence, 4),
+        "probabilities": {k: round(v, 4) for k, v in (self.probabilities or {}).items()},
+        "hints": self.hints,
+        "sharing": self.sharing,
+        "confirmed": self.confirmed,
+        "corroboration": self.corroboration,
+        "applied": self.applied,
+        "legacy": self.legacy,
+        "enabled": constants.DESTINATION_CLASS_ENABLED,
+    }
+
+
+def destination_from_answers(answers: Dict[str, JevAnswer]) -> Tuple[str, float, Dict[str, float], bool]:
+  """``(class, confidence, probabilities, legacy)`` from the battery's answers.
+
+  Prefers the ``destination_class`` Choice. Falls back to the retired
+  ``is_third_party`` Noul (``third_party_sdk`` at/above ``T_THIRD_PARTY``,
+  else ``developer_backend``, confidence = distance from 0.5 doubled) so
+  answers cached by an older battery still compose; the fallback is flagged
+  ``legacy`` in the trace. Missing both -> ``unknown`` at confidence 0.
+  """
+  a = answers.get("destination_class")
+  if a is not None and a.type == "choice" and a.choice:
+    cls = a.choice if a.choice in q.DESTINATION_CLASS_OPTIONS else DESTINATION_UNKNOWN
+    return cls, float(a.confidence or 0.0), dict(a.probabilities or {}), False
+  legacy = answers.get("is_third_party")
+  if legacy is not None and legacy.noul is not None:
+    p = float(legacy.noul)
+    cls = "third_party_sdk" if p >= constants.T_THIRD_PARTY else "developer_backend"
+    return cls, min(1.0, abs(p - 0.5) * 2.0), {}, True
+  return DESTINATION_UNKNOWN, 0.0, {}, False
+
+
+def _anchor_hint_kinds(state: Dict[str, Any]) -> List[str]:
+  anchor = state.get("anchor") or {}
+  kinds = anchor.get("destination_hints")
+  if kinds is None:
+    kinds = [h.get("hint") for h in state.get("destination_hints") or []]
+  return sorted({k for k in kinds if k})
+
+
+def _scope_has_strong_egress(state: Dict[str, Any]) -> bool:
+  anchor = state.get("anchor") or {}
+  reach = set(anchor.get("scope_capabilities") or []) | set(anchor.get("callee_capabilities") or [])
+  return bool(reach & set(constants.RANK_STRONG_EGRESS_CAPABILITIES))
+
+
+def compose_destination(
+    state: Dict[str, Any], answers: Dict[str, JevAnswer], transmits: bool,
+    user_initiated: bool, sharing_in_scope: Sequence[str],
+) -> Destination:
+  """Composes the destination of a transfer from the Choice plus static facts (WP7).
+
+  Plan §2 L2 table, in code:
+
+  ======================== ================== =====================================
+  class                    transfer is        consequence (when ``transmits``)
+  ======================== ================== =====================================
+  developer_backend        collection         declare; disclosure if sensitive
+  third_party_sdk          collection+sharing ``is_third_party``; disclosure required
+  other_app_ipc            sharing            ``is_third_party`` (IPC = sharing)
+  user_chosen_destination  not collection     inventory SUGGESTION, EXEMPT (*)
+  platform_component       local              inventory SUGGESTION, EXEMPT (*)
+  unknown                  uncertain          MANUAL_REVIEW, never pruned
+  ======================== ================== =====================================
+
+  (*) only when *confirmed*: confidence >= ``CONF_DESTINATION_ACT`` and an
+  independent signal agrees -- the deterministic ``USER_CHOSEN_DESTINATION``
+  hint or the battery's own ``user_initiated`` for the user-chosen class; no
+  strong-egress capability reachable from the anchor scope (same file or
+  callee) for the platform class. Otherwise the class is traced, the finding
+  keeps its transfer-based severity and goes to manual review. This is the
+  charter's "never suppressed by judgement alone" applied to the one place a
+  judgement lowers a severity.
+
+  ``sharing`` is recall-safe: a sharing class counts regardless of confidence,
+  and a sharing-capable sink inside the anchor scope counts regardless of the
+  class (the pre-WP7 OR). With ``DESTINATION_CLASS_ENABLED`` off the class is
+  still traced but ``confirmed`` is always False and ``sharing`` reduces to
+  the static in-scope fact.
+  """
+  cls, confidence, probabilities, legacy = destination_from_answers(answers)
+  hints = _anchor_hint_kinds(state)
+  enabled = constants.DESTINATION_CLASS_ENABLED
+  sharing_by_class = enabled and cls in constants.SHARING_DESTINATION_CLASSES
+  sharing = bool(transmits and (sharing_by_class or sharing_in_scope))
+
+  confirmed = False
+  corroboration = "n/a"
+  if enabled and cls in constants.NON_COLLECTION_DESTINATION_CLASSES:
+    if confidence < constants.CONF_DESTINATION_ACT:
+      corroboration = "low_confidence"
+    elif cls == "user_chosen_destination":
+      if structure.USER_CHOSEN_DESTINATION in hints:
+        confirmed, corroboration = True, "hint"
+      elif user_initiated:
+        confirmed, corroboration = True, "user_initiated"
+      else:
+        corroboration = "uncorroborated"
+    elif cls == "platform_component":
+      if not _scope_has_strong_egress(state):
+        confirmed, corroboration = True, "no_egress_in_scope"
+      else:
+        corroboration = "uncorroborated"
+  log.debug("destination for %s in %s: class=%s conf=%.2f hints=%s sharing=%s confirmed=%s (%s)",
+            (state.get("signal") or {}).get("data_type"), (state.get("signal") or {}).get("file"),
+            cls, confidence, hints, sharing, confirmed, corroboration)
+  return Destination(cls, confidence, probabilities, hints, sharing, confirmed, corroboration, legacy)
 
 
 def relevance_is_low(verdict: str) -> bool:
@@ -573,9 +749,15 @@ def _compose_data_safety_finding(
      report routes it to review (a False value is treated as "compliant" and
      dropped from review), severity capped at IMPORTANT, ``needs_manual_review``
      set, and the critic never prunes it.
-  4. Sharing: the model's ``is_third_party`` answer, OR-ed with the presence of a
-     sharing-capable sink inside the anchor's own scope (IPC counts as sharing
-     by policy direction).
+  4. Destination (WP7, :func:`compose_destination`): the ``destination_class``
+     Choice decides ``is_third_party`` (sharing classes, OR-ed with a
+     sharing-capable sink inside the anchor's own scope -- IPC counts as
+     sharing by policy direction). A *confirmed* ``user_chosen_destination``
+     or ``platform_component`` turns the finding into a data-safety inventory
+     SUGGESTION with disclosure EXEMPT (the transfer is not collection by the
+     developer); an unconfirmed one or ``unknown`` keeps the transfer-based
+     severity and routes to manual review. Below ``T_TRANSMIT_LOW`` the class
+     is traced only.
   """
   tax = _taxonomy().get(data_type, {})
   category = tax.get("category", "Other")
@@ -600,17 +782,30 @@ def _compose_data_safety_finding(
   user_initiated = (answers["user_initiated"].noul or 0.0) >= constants.T_USER_INITIATED
 
   sharing_in_scope = sharing_sinks_in_scope(state)
-  is_third_party = (
-      (answers["is_third_party"].noul or 0.0) >= constants.T_THIRD_PARTY
-  ) or (transmits and bool(sharing_in_scope))
+  destination = compose_destination(state, answers, transmits, user_initiated, sharing_in_scope)
+  is_third_party = destination.sharing
 
   disclosure_status = answers["disclosure_status"].choice or "MISSING"
   disclosure_note: Optional[str] = None
+  destination_note: Optional[str] = None
   # Local-only data needs no disclosure by definition, so compose EXEMPT in code
   # rather than relying on the model to infer it (it reads the question literally
   # and reports MISSING when no gate is present, even for on-device data).
   if decision == LOCAL:
     disclosure_status = "EXEMPT"
+  elif destination.non_collection:
+    # WP7: the user chose where the data goes (or it went to a platform
+    # component on the device) -- confirmed by an independent signal. Not
+    # collection by the developer, so no prominent-disclosure gate is owed;
+    # the transfer is still inventoried. ``reconcile_disclosure_status`` is
+    # skipped on purpose: its EXEMPT->MISSING rule ("transfer not
+    # user-initiated") is exactly what the confirmed class overrides.
+    disclosure_status = "EXEMPT"
+    destination.applied = True
+    destination_note = (f"{destination.cls} confirmed by {destination.corroboration} "
+                        f"(conf={destination.confidence:.2f}); composed as inventory")
+    log.info("destination %s for %s in %s: %s", destination.cls, data_type,
+             state["signal"]["file"], destination_note)
   else:
     disclosure_status, disclosure_note = reconcile_disclosure_status(
         disclosure_status, answers, transmits, user_initiated)
@@ -620,6 +815,11 @@ def _compose_data_safety_finding(
   # Severity is derived in code from the atomic booleans, not read off Jev's
   # advisory Score (which is logged for comparison only).
   severity = derive_data_safety_severity(data_type, transmits, disclosure_status, decision)
+  if destination.applied:
+    # A confirmed non-collection destination is inventory even when the
+    # transfer probability sits in the UNCERTAIN band (the band would
+    # otherwise hold it at IMPORTANT); the review flag below still applies.
+    severity = "SUGGESTION"
 
   # A transmitted, undisclosed type is a prominent-disclosure risk; otherwise it
   # is inventory for the Data Safety section reconciliation.
@@ -628,10 +828,31 @@ def _compose_data_safety_finding(
   else:
     policy_id = "data_safety_section"
 
-  if decision == UNCERTAIN:
+  # Unresolved destinations on a transfer: the class is a judgement, so an
+  # unconfirmed non-collection answer or ``unknown`` never lowers anything --
+  # it adds a review flag and a note (charter: review, do not suppress).
+  destination_review = bool(
+      constants.DESTINATION_CLASS_ENABLED and transmits and not destination.applied
+      and (destination.cls == DESTINATION_UNKNOWN
+           or destination.cls in constants.NON_COLLECTION_DESTINATION_CLASSES))
+  if destination_review:
+    destination_note = (f"{destination.cls} not applied ({destination.corroboration}, "
+                        f"conf={destination.confidence:.2f}); kept for review")
+    log.info("destination %s for %s in %s: %s", destination.cls, data_type,
+             state["signal"]["file"], destination_note)
+
+  if destination.applied and destination.cls == "user_chosen_destination":
+    purpose = "User-chosen destination (user-directed transfer; not collection by the developer)"
+  elif destination.applied and destination.cls == "platform_component":
+    purpose = "Platform component on the same device"
+  elif decision == UNCERTAIN:
     purpose = "Possible transfer (uncertain; manual review)"
+  elif destination.cls == "other_app_ipc" and constants.DESTINATION_CLASS_ENABLED:
+    purpose = "Shared with another app (IPC)"
   elif is_third_party:
     purpose = "Analytics or third-party sharing"
+  elif transmits and destination.cls == DESTINATION_UNKNOWN and constants.DESTINATION_CLASS_ENABLED:
+    purpose = "Transfer to an unresolved destination (manual review)"
   elif transmits:
     purpose = "App functionality"
   else:
@@ -640,6 +861,11 @@ def _compose_data_safety_finding(
   summary = templates.issue_summary(policy_id, name, disclosure_status, transmits)
   if decision == UNCERTAIN:
     summary = f"{summary} [transfer uncertain: p={p_transmit:.2f}; verify]"
+  if destination.applied:
+    summary = f"{summary} [destination: {destination.cls.replace('_', ' ')}]"
+  elif destination_review:
+    summary = (f"{summary} [destination {destination.cls.replace('_', ' ')} unconfirmed: "
+               f"conf={destination.confidence:.2f}; verify]")
   if relevance_low:
     summary = f"{summary} [data-type match uncertain: p={p_relevant or 0.0:.2f}; verify]"
     if severity == "CRITICAL":
@@ -656,8 +882,9 @@ def _compose_data_safety_finding(
       f"in {state['signal']['file']} (sinks: {sink_names})."
   )
 
-  log.debug("compose %s in %s: p_transmit=%.2f decision=%s severity=%s third_party=%s",
-            data_type, state["signal"]["file"], p_transmit, decision, severity, is_third_party)
+  log.debug("compose %s in %s: p_transmit=%.2f decision=%s severity=%s third_party=%s destination=%s",
+            data_type, state["signal"]["file"], p_transmit, decision, severity, is_third_party,
+            destination.cls)
 
   finding = {
       "psl_constant": data_type,
@@ -677,6 +904,7 @@ def _compose_data_safety_finding(
       "linked_to_user": category in _LINKED_CATEGORIES,
       # Fields the critic and the trace consume; downstream ignores unknown keys.
       "transfer_decision": decision,
+      "destination_class": destination.cls,
       "claim": claim,
       "claim_kind": "transfer",
       "sinks": [{"symbol": s["symbol"], "capabilities": s["capabilities"]} for s in sinks],
@@ -686,10 +914,12 @@ def _compose_data_safety_finding(
           state, answers, decision,
           {"sharing_sinks_in_scope": sharing_in_scope, "p_relevant": p_relevant,
            "relevance": relevance_trace(verdict),
-           "disclosure_reconciled": disclosure_note},
+           "disclosure_reconciled": disclosure_note,
+           "destination": destination.to_trace(),
+           "destination_note": destination_note},
       ),
   }
-  if decision == UNCERTAIN or relevance_low or disclosure_note:
+  if decision == UNCERTAIN or relevance_low or disclosure_note or destination_review:
     finding["needs_manual_review"] = True
   return finding
 

@@ -36,6 +36,10 @@ parser can answer without judgment:
   own class files does a capitalised identifier in a caller refer to, and on
   which lines is it referenced? Resolution uses the caller's imports and
   package, never the class's behaviour.
+- **Destination hints** (WP7) — does a scope read its host/URL from a
+  preference or UI field, hand data to a system chooser, or name a literal
+  endpoint (under the developer's own domain or not)? Priors for the
+  ``destination_class`` question, never decisions.
 
 Everything here is pure: it reads files under ``app_dir`` and returns plain
 dicts/lists. No network, no model, no writes. It is intentionally regex-based
@@ -1327,6 +1331,146 @@ def callee_references(
   log.debug("callee references in %s: %s", fs.relpath,
             [(r.symbol, r.relpath, len(r.lines), r.resolution) for r in refs])
   return refs
+
+
+# ---------------------------------------------------------------------------
+# Deterministic destination hints (WP7)
+# ---------------------------------------------------------------------------
+#
+# ``destination_class`` (questions.py) asks the model *where* a transfer goes.
+# The structure layer can often see a strong prior without judgement:
+#
+# * the host / URL / server the sink talks to is read from a preference or a
+#   UI field in the same scope -> the user chose the destination;
+# * the scope hands data to a system chooser / picker intent -> the user picks
+#   the receiving app;
+# * the endpoint is a compile-time literal whose host sits under the domain
+#   the app's own package name spells backwards -> the developer's backend;
+# * the endpoint is some other compile-time literal -> a constant endpoint
+#   (developer or third party; the model decides).
+#
+# Hints are *priors*: they ride in the state and in the decision trace and
+# corroborate the model's Choice in ``evaluate``; they never decide alone.
+# Only Android platform API names appear below (never a vendor or library).
+
+#: Hint kinds. Names are stable: they appear in states, traces and labels.
+USER_CHOSEN_DESTINATION = "USER_CHOSEN_DESTINATION"
+DEVELOPER_BACKEND = "DEVELOPER_BACKEND"
+CONSTANT_ENDPOINT = "CONSTANT_ENDPOINT"
+
+# Identifier parts that name a destination (host, URL, server, ...). Parts are
+# camelCase / snake_case segments so ``securityPrefs`` does not match ``uri``
+# while ``serverUrl``, ``mHost``, ``remote_addr`` and ``URL`` do.
+_DESTINATION_PARTS = ("host", "url", "uri", "server", "endpoint", "address", "addr",
+                      "domain", "remote", "hostname")
+_IDENT_RE = re.compile(r"\b[A-Za-z_]\w*\b")
+_CAMEL_SPLIT_RE = re.compile(r"[A-Z]?[a-z0-9]+|[A-Z]+(?![a-z])")
+
+
+def _names_destination(identifier: str) -> bool:
+  parts = [p.lower() for chunk in identifier.split("_") for p in _CAMEL_SPLIT_RE.findall(chunk)]
+  return any(p.startswith(frag) for p in parts for frag in _DESTINATION_PARTS)
+
+
+def _mentions_destination(line: str) -> bool:
+  return any(_names_destination(m.group(0)) for m in _IDENT_RE.finditer(line))
+# Reads of a preference, an intent extra, a UI field or a picked URI: the value
+# came from the user (or from an app the user chose) at run time.
+_USER_SOURCE_TOKENS = (
+    "getString(", "getText(", ".text", "getStringExtra(", "getQueryParameter(",
+    "getSelectedItem", "Preference", "prefs", "preferences", "settings",
+    "getData(", ".data", "getExtras(", "extras", "arguments", "Bundle",
+    "EditText", "TextView", "Spinner", "AutoComplete",
+)
+# The scope lets the user pick the receiving app or the target document.
+_CHOOSER_TOKENS = (
+    "createChooser(", "ACTION_SEND", "ACTION_SENDTO", "ACTION_VIEW", "ACTION_PICK",
+    "ACTION_GET_CONTENT", "ACTION_OPEN_DOCUMENT", "ACTION_CREATE_DOCUMENT",
+    "ACTION_OPEN_DOCUMENT_TREE", "ActivityResultContracts", "startActivityForResult(",
+    "ShareCompat", "ShareSheet",
+)
+_URL_LITERAL_RE = re.compile(r"[\"'](?:https?|wss?|ftps?|sftp|smb)://([A-Za-z0-9.\-]+)")
+_MAX_HINT_EVIDENCE_CHARS = 160
+
+
+@dataclasses.dataclass
+class DestinationHint:
+  """One deterministic prior about where a transfer in a scope goes.
+
+  Attributes:
+    kind: One of :data:`USER_CHOSEN_DESTINATION`, :data:`DEVELOPER_BACKEND`,
+      :data:`CONSTANT_ENDPOINT`.
+    line: 0-based line the hint was read from.
+    detail: Why -- ``preference_or_ui_field``, ``chooser``, or the literal
+      host for endpoint hints.
+    evidence: The stripped source line (bounded).
+  """
+
+  kind: str
+  line: int
+  detail: str
+  evidence: str
+
+  def to_state(self) -> Dict[str, object]:
+    return {"hint": self.kind, "line": self.line + 1, "detail": self.detail,
+            "evidence": self.evidence}
+
+
+def developer_domains(package_name: str) -> List[str]:
+  """Candidate developer domains spelt by an application id.
+
+  ``com.example.app`` -> ``["example.com"]``; ``io.example.sub.app`` ->
+  ``["example.io", "sub.example.io"]``. Generic hosting prefixes cannot be
+  inverted, so an id with fewer than two labels yields nothing.
+  """
+  labels = [p for p in (package_name or "").lower().split(".") if p]
+  if len(labels) < 2:
+    return []
+  out = [f"{labels[1]}.{labels[0]}"]
+  if len(labels) >= 3:
+    out.append(f"{labels[2]}.{labels[1]}.{labels[0]}")
+  return out
+
+
+def _host_under(host: str, domains: Sequence[str]) -> bool:
+  h = host.lower()
+  return any(h == d or h.endswith("." + d) for d in domains)
+
+
+def destination_hints(
+    lines: Sequence[str], scope: Tuple[int, int], dev_domains: Sequence[str] = ()
+) -> List[DestinationHint]:
+  """Deterministic destination priors for the lines in ``[scope[0], scope[1])``.
+
+  Args:
+    lines: The file's lines (0-based).
+    scope: Half-open 0-based line range (an anchor's enclosing scope).
+    dev_domains: :func:`developer_domains` of the app's package; a literal
+      endpoint under one of them is a :data:`DEVELOPER_BACKEND` hint.
+
+  Returns one hint per (kind, line), in line order; at most one
+  ``USER_CHOSEN_DESTINATION`` per line. Comment and import lines are skipped.
+  """
+  out: List[DestinationHint] = []
+  start, end = max(0, scope[0]), min(len(lines), scope[1])
+  for i in range(start, end):
+    line = lines[i]
+    stripped = line.strip()
+    if not stripped or stripped.startswith(_COMMENT_PREFIXES) or stripped.startswith(_IMPORT_PREFIXES):
+      continue
+    evidence = stripped[:_MAX_HINT_EVIDENCE_CHARS]
+    if any(tok in line for tok in _USER_SOURCE_TOKENS) and _mentions_destination(line):
+      out.append(DestinationHint(USER_CHOSEN_DESTINATION, i, "preference_or_ui_field", evidence))
+    elif any(tok in line for tok in _CHOOSER_TOKENS):
+      out.append(DestinationHint(USER_CHOSEN_DESTINATION, i, "chooser", evidence))
+    for m in _URL_LITERAL_RE.finditer(line):
+      host = m.group(1)
+      kind = DEVELOPER_BACKEND if _host_under(host, dev_domains) else CONSTANT_ENDPOINT
+      out.append(DestinationHint(kind, i, host, evidence))
+  if out:
+    log.debug("destination hints in lines %d-%d: %s", start + 1, end,
+              [(h.kind, h.line + 1, h.detail) for h in out])
+  return out
 
 
 def analyze_file(app_dir: str, relpath: str) -> FileStructure:

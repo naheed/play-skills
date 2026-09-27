@@ -66,10 +66,14 @@ def _predict(case, answers):
   """Predicted atomic decisions + composed is_risk, mirroring evaluate.py."""
   transmits = _noul(answers, "transmits_offdevice", constants.T_TRANSMIT)
   has_disc = _noul(answers, "has_prominent_disclosure", constants.T_DISCLOSURE)
+  # WP7: ``is_third_party`` is derived from the ``destination_class`` Choice
+  # (sharing classes), falling back to the retired Noul for older answer sets.
+  dest_cls, _, _, _ = evaluate.destination_from_answers(answers)
   pred = {
       "transmits_offdevice": transmits,
       "has_prominent_disclosure": has_disc,
-      "is_third_party": _noul(answers, "is_third_party", constants.T_THIRD_PARTY),
+      "is_third_party": dest_cls in constants.SHARING_DESTINATION_CLASSES,
+      "destination_class": dest_cls,
   }
   if case["battery"] == "permission":
     is_core = _noul(answers, "is_core_functionality", constants.T_CORE_FUNCTION)

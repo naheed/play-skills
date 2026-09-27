@@ -327,6 +327,16 @@ class Anchor:
   # from it), strongest reachable capability first, capped at
   # ``MAX_CALLEES_PER_ANCHOR``.
   callees: List["CalleeView"] = dataclasses.field(default_factory=list)
+  # WP7: deterministic destination priors read from the chosen scope
+  # (``structure.destination_hints``). Filled by :func:`build_file_state`
+  # for the chosen occurrence only; sent to the model as
+  # ``destination_hints`` and recorded in the trace.
+  destination_hints: List[structure.DestinationHint] = dataclasses.field(default_factory=list)
+
+  @property
+  def destination_hint_kinds(self) -> List[str]:
+    """Distinct hint kinds in the chosen scope (WP7), e.g. ``["USER_CHOSEN_DESTINATION"]``."""
+    return sorted({h.kind for h in self.destination_hints})
 
   @property
   def callee_capabilities(self) -> List[str]:
@@ -586,6 +596,13 @@ def build_file_state(
   """
   sinks = file_sinks(fs, profiles)
   anchors = [anchor_signal(fs, pattern, dt, sinks, callees) for dt, pattern in asks]
+  # WP7: destination priors are read from the chosen scope only (one pass per
+  # ask, not per candidate occurrence) and keyed by the app's own domains.
+  if constants.DESTINATION_HINTS_ENABLED:
+    dev_domains = structure.developer_domains(str(app_facts.get("package") or ""))
+    for a in anchors:
+      if a.chosen is not None:
+        a.destination_hints = structure.destination_hints(fs.lines, a.scope, dev_domains)
   code, related = _render_snippet(fs, anchors, sinks)
   callee_section, callee_snippets = _render_callees(anchors)
   code += callee_section
@@ -633,6 +650,16 @@ def build_file_state(
   }
   if all_callee_states:
     state["callees"] = all_callee_states
+  # WP7: one flat list across asks, tagged by data type so the model can tell
+  # which signal a hint belongs to in a batched request. Present only when a
+  # hint exists (states without hints stay byte-identical to pre-WP7).
+  hint_states = [
+      {"data_type": a.data_type, **h.to_state()} for a in anchors for h in a.destination_hints
+  ]
+  if hint_states:
+    state["destination_hints"] = hint_states
+    log.info("state for %s: %d destination hint(s): %s", fs.relpath, len(hint_states),
+             sorted({(h["data_type"], h["hint"], h["detail"]) for h in hint_states}))
 
   per_ask: List[Dict[str, Any]] = []
   for a in anchors:
@@ -642,7 +669,7 @@ def build_file_state(
     own_callees = _callee_states([a])
     if own_callees:
       own += _render_callees([a])[0]
-    per_ask.append({
+    mini: Dict[str, Any] = {
         "signal": {
             "data_type": a.data_type,
             "matched_pattern": a.pattern,
@@ -664,11 +691,15 @@ def build_file_state(
             "lexical": a.lexical_verdict,
             "callee_in_scope": a.callee_in_scope,
             "callee_capabilities": a.callee_capabilities,
+            "destination_hints": a.destination_hint_kinds,
         },
         "callees": own_callees,
         "app": app_facts,
         "permission": None,
-    })
+    }
+    if a.destination_hints:
+      mini["destination_hints"] = [h.to_state() for h in a.destination_hints]
+    per_ask.append(mini)
   log.debug("state for %s: %d asks, %d sinks, %d callees, %d snippet chars",
             fs.relpath, len(asks), len(sinks), len(all_callee_states), len(code))
   return state, per_ask

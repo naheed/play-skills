@@ -997,6 +997,232 @@ def _test_calibrate() -> None:
     _check("calibrate_joins_worker_probability", joined and joined[0]["p_transmit"] == 0.77, str(joined))
 
 
+def _test_destination_class() -> None:
+  """WP7: destination hints, the ``destination_class`` Choice and its composition.
+
+  Covers: hint detection (preference/UI read, chooser, developer vs constant
+  endpoint, camelCase part matching), the battery swap, every class in the
+  composition table (developer backend, third-party SDK, IPC, confirmed and
+  unconfirmed user-chosen, confirmed and uncorroborated platform, unknown),
+  the double gate (confidence + corroboration), the rollback flag, the legacy
+  ``is_third_party`` fallback, the heuristic client's prior, the state block
+  (present only with hits), and the calibrate v2 report.
+  """
+  from typesafe_eval import calibrate
+  from typesafe_eval import capabilities as caps
+  from typesafe_eval import client as clientmod
+  from typesafe_eval import constants
+  from typesafe_eval import context
+  from typesafe_eval import structure
+  from typesafe_eval.client import JevAnswer
+
+  # --- structure: hints -----------------------------------------------------
+  src = (
+      "import java.net.URL\n"
+      "class Up {\n"
+      "  fun send(d: String) {\n"
+      "    val host = prefs.getString(\"server_host\", \"\")\n"
+      "    val u = URL(\"https://api.example.com/v1\")\n"
+      "    val other = URL(\"https://collector.elsewhere.net/e\")\n"
+      "    post(host, d)\n"
+      "  }\n"
+      "  fun share(f: File) {\n"
+      "    startActivity(Intent.createChooser(Intent(Intent.ACTION_SEND), \"x\"))\n"
+      "  }\n"
+      "  fun noise() { val securityPrefs = getSharedPreferences(\"a\", 0); val t = binding.title.text }\n"
+      "  // val host = prefs.getString(\"in a comment\")\n"
+      "}\n"
+  ).splitlines()
+  doms = structure.developer_domains("com.example.app")
+  _check("dest_dev_domains", doms[0] == "example.com" and structure.developer_domains("app") == [], str(doms))
+  hints = structure.destination_hints(src, (2, 8), doms)
+  kinds = [(h.kind, h.line + 1, h.detail) for h in hints]
+  _check("dest_hint_pref_read", (structure.USER_CHOSEN_DESTINATION, 4, "preference_or_ui_field") in kinds, str(kinds))
+  _check("dest_hint_dev_backend", (structure.DEVELOPER_BACKEND, 5, "api.example.com") in kinds, str(kinds))
+  _check("dest_hint_constant_endpoint", (structure.CONSTANT_ENDPOINT, 6, "collector.elsewhere.net") in kinds, str(kinds))
+  _check("dest_hint_chooser", any(h.kind == structure.USER_CHOSEN_DESTINATION and h.detail == "chooser"
+                                  for h in structure.destination_hints(src, (8, 11))))
+  _check("dest_hint_no_false_part", structure.destination_hints(src, (11, 12)) == [])
+  _check("dest_hint_skips_comments", structure.destination_hints(src, (12, 13)) == [])
+  _check("dest_hint_state_shape", set(hints[0].to_state()) == {"hint", "line", "detail", "evidence"})
+  _check("dest_names_destination", structure._names_destination("serverUrl") and structure._names_destination("mHost")  # pylint: disable=protected-access
+         and structure._names_destination("remote_addr") and not structure._names_destination("securityPrefs"))  # pylint: disable=protected-access
+
+  # --- questions -------------------------------------------------------------
+  battery = q.data_safety_battery("EMAIL", "email address")
+  _check("dest_battery_swapped", "destination_class" in battery and "is_third_party" not in battery)
+  _check("dest_options_closed", set(battery["destination_class"]["criteria"]) == set(q.DESTINATION_CLASS_OPTIONS)
+         and "unknown" in q.DESTINATION_CLASS_OPTIONS and len(q.DESTINATION_CLASS_OPTIONS) == 6)
+  _check("dest_question_names_hints", "destination_hints" in battery["destination_class"]["instructions"])
+
+  # --- context: state block ---------------------------------------------------
+  fs = structure.FileStructure("Up.kt", "kotlin", src, ["java.net.URL"],
+                               structure.symbol_references(src, ["java.net.URL"]), "com.example.app")
+  profiles = {"java.net.URL": caps.CapabilityProfile("java.net.URL", "import", {"NETWORK_EGRESS": 0.9}, ["NETWORK_EGRESS"], "model", "m")}
+  state, per_ask = context.build_file_state(fs, [("EMAIL", "post(")], profiles, {"package": "com.example.app"})
+  _check("dest_state_block", {h["hint"] for h in state.get("destination_hints", [])} >= {"USER_CHOSEN_DESTINATION", "DEVELOPER_BACKEND"}
+         and state["destination_hints"][0]["data_type"] == "EMAIL", str(state.get("destination_hints")))
+  _check("dest_per_ask_kinds", "USER_CHOSEN_DESTINATION" in per_ask[0]["anchor"]["destination_hints"]
+         and per_ask[0]["destination_hints"], str(per_ask[0]["anchor"]))
+  plain = "import java.net.URL\nclass P {\n  fun f() {\n    val e = email()\n    URL(x).openStream()\n  }\n}\n".splitlines()
+  fs_plain = structure.FileStructure("P.kt", "kotlin", plain, ["java.net.URL"],
+                                     structure.symbol_references(plain, ["java.net.URL"]), "com.example.app")
+  state2, per_ask2 = context.build_file_state(fs_plain, [("EMAILS", "email()")], profiles, {"package": "com.example.app"})
+  _check("dest_state_absent_without_hits", "destination_hints" not in state2 and "destination_hints" not in per_ask2[0]
+         and per_ask2[0]["anchor"]["destination_hints"] == [], str(state2.get("destination_hints")))
+
+  # --- evaluate: composition table -------------------------------------------
+  def _answers(p_transmit, cls, conf=0.9, user_initiated=0.2):
+    n = len(q.DESTINATION_CLASS_OPTIONS)
+    probs = {o: (conf if o == cls else (1 - conf) / (n - 1)) for o in q.DESTINATION_CLASS_OPTIONS}
+    return {
+        "signal_relevant": JevAnswer("noul", noul=0.9),
+        "transmits_offdevice": JevAnswer("noul", noul=p_transmit),
+        "user_initiated": JevAnswer("noul", noul=user_initiated),
+        "destination_class": JevAnswer("choice", choice=cls, probabilities=probs, confidence=conf),
+        "has_prominent_disclosure": JevAnswer("noul", noul=0.1),
+        "disclosure_status": JevAnswer("choice", choice="MISSING"),
+        "severity": JevAnswer("score", score=1.0),
+    }
+  base = {
+      "signal": {"data_type": "EMAILS", "matched_pattern": "email", "file": "Up.kt",
+                 "line": 7, "matched_line": "post(host, d)", "all_lines": [7]},
+      "code_snippet": "L7: post(host, d)",
+      "sinks": [{"symbol": "URL", "capabilities": ["NETWORK_EGRESS"], "lines": [5, 6]}],
+      "anchor": {"scope": [3, 8], "proximity": 0, "sink_in_scope": True, "tier": 0,
+                 "scope_capabilities": ["NETWORK_EGRESS"], "destination_hints": ["USER_CHOSEN_DESTINATION"]},
+      "destination_hints": [{"hint": "USER_CHOSEN_DESTINATION", "line": 4, "detail": "preference_or_ui_field", "evidence": "val host = ..."}],
+      "app": {},
+  }
+  compose = evaluate._compose_data_safety_finding  # pylint: disable=protected-access
+  dev = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "developer_backend"), "test")
+  _check("dest_dev_backend_collection", dev["policy_id"] == "prominent_disclosure_policy" and dev["severity"] == "CRITICAL"
+         and dev["is_third_party"] is False and dev["destination_class"] == "developer_backend"
+         and dev["purpose"] == "App functionality", str((dev["policy_id"], dev["severity"], dev["purpose"])))
+  sdk = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "third_party_sdk", conf=0.4), "test")
+  _check("dest_sdk_is_sharing_any_confidence", sdk["is_third_party"] is True and sdk["severity"] == "CRITICAL"
+         and sdk["purpose"] == "Analytics or third-party sharing")
+  ipc = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "other_app_ipc"), "test")
+  _check("dest_ipc_is_sharing", ipc["is_third_party"] is True and ipc["purpose"] == "Shared with another app (IPC)")
+  # Confirmed user-chosen (hint in scope + high confidence): inventory, EXEMPT.
+  uc = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "user_chosen_destination"), "test")
+  _check("dest_user_chosen_confirmed_inventory",
+         uc["policy_id"] == "data_safety_section" and uc["severity"] == "SUGGESTION"
+         and uc["prominent_disclosure_status"] == "EXEMPT" and uc["is_transferred"] is True
+         and uc.get("needs_manual_review") is None and uc["is_third_party"] is False
+         and "[destination: user chosen destination]" in uc["issue_summary"],
+         str((uc["policy_id"], uc["severity"], uc["prominent_disclosure_status"], uc["issue_summary"])))
+  tr = uc["decision_trace"]["destination"]
+  _check("dest_trace_confirmed_by_hint", tr["confirmed"] is True and tr["corroboration"] == "hint"
+         and tr["applied"] is True and tr["hints"] == ["USER_CHOSEN_DESTINATION"], str(tr))
+  _check("dest_trace_hints_listed", uc["decision_trace"]["destination_hints"][0]["hint"] == "USER_CHOSEN_DESTINATION")
+  # Same class, no hint, not user-initiated: kept at CRITICAL for review.
+  no_hint = {**base, "anchor": {**base["anchor"], "destination_hints": []}, "destination_hints": []}
+  uc2 = compose("EMAILS", "Up.kt (Pattern: email)", no_hint, _answers(0.95, "user_chosen_destination"), "test")
+  _check("dest_user_chosen_uncorroborated_kept",
+         uc2["severity"] == "CRITICAL" and uc2["policy_id"] == "prominent_disclosure_policy"
+         and uc2.get("needs_manual_review") is True and "unconfirmed" in uc2["issue_summary"]
+         and uc2["decision_trace"]["destination"]["corroboration"] == "uncorroborated", str(uc2["issue_summary"]))
+  # No hint but the battery says user-initiated: corroborated.
+  uc3 = compose("EMAILS", "Up.kt (Pattern: email)", no_hint, _answers(0.95, "user_chosen_destination", user_initiated=0.9), "test")
+  _check("dest_user_chosen_by_user_initiated", uc3["severity"] == "SUGGESTION"
+         and uc3["decision_trace"]["destination"]["corroboration"] == "user_initiated")
+  # Hint present but low confidence: kept.
+  uc4 = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "user_chosen_destination", conf=constants.CONF_DESTINATION_ACT - 0.01), "test")
+  _check("dest_user_chosen_low_confidence_kept", uc4["severity"] == "CRITICAL"
+         and uc4["decision_trace"]["destination"]["corroboration"] == "low_confidence")
+  # Platform component: confirmed only without strong egress reachable.
+  ipc_scope = {**no_hint, "sinks": [{"symbol": "ContentResolver", "capabilities": ["IPC_SHARING"], "lines": [5]}],
+               "anchor": {**no_hint["anchor"], "scope_capabilities": ["IPC_SHARING"], "tier": 1}}
+  pc = compose("EMAILS", "Up.kt (Pattern: email)", ipc_scope, _answers(0.95, "platform_component"), "test")
+  _check("dest_platform_confirmed_no_egress", pc["severity"] == "SUGGESTION" and pc["prominent_disclosure_status"] == "EXEMPT"
+         and pc["decision_trace"]["destination"]["corroboration"] == "no_egress_in_scope"
+         and pc["purpose"] == "Platform component on the same device", str(pc["purpose"]))
+  pc2 = compose("EMAILS", "Up.kt (Pattern: email)", no_hint, _answers(0.95, "platform_component"), "test")
+  _check("dest_platform_with_egress_kept", pc2["severity"] == "CRITICAL" and pc2.get("needs_manual_review") is True
+         and pc2["decision_trace"]["destination"]["corroboration"] == "uncorroborated")
+  # Unknown on a transfer: review, never lowered.
+  unk = compose("EMAILS", "Up.kt (Pattern: email)", no_hint, _answers(0.95, "unknown"), "test")
+  _check("dest_unknown_review", unk["severity"] == "CRITICAL" and unk.get("needs_manual_review") is True
+         and unk["purpose"] == "Transfer to an unresolved destination (manual review)")
+  # UNCERTAIN transfer + confirmed user-chosen: inventory but still reviewed.
+  mid = (constants.T_TRANSMIT_LOW + constants.T_TRANSMIT_HIGH) / 2
+  ucm = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(mid, "user_chosen_destination"), "test")
+  _check("dest_uncertain_user_chosen", ucm["severity"] == "SUGGESTION" and ucm.get("needs_manual_review") is True
+         and ucm["transfer_decision"] == "UNCERTAIN")
+  # LOCAL: destination moot (traced, not applied, no review flag from it).
+  loc = compose("EMAILS", "Up.kt (Pattern: email)", no_hint, _answers(0.1, "unknown"), "test")
+  _check("dest_local_moot", loc["severity"] == "SUGGESTION" and loc.get("needs_manual_review") is None
+         and loc["decision_trace"]["destination"]["applied"] is False)
+  # Sharing sink in scope still ORs in (pre-WP7 fact) even for developer_backend.
+  ipc_dev = compose("EMAILS", "Up.kt (Pattern: email)", ipc_scope, _answers(0.95, "developer_backend"), "test")
+  _check("dest_sharing_sink_in_scope_ors", ipc_dev["is_third_party"] is True)
+  # Legacy fallback: an is_third_party Noul still composes.
+  legacy = _answers(0.95, "developer_backend"); del legacy["destination_class"]
+  legacy["is_third_party"] = JevAnswer("noul", noul=0.9)
+  lg = compose("EMAILS", "Up.kt (Pattern: email)", no_hint, legacy, "test")
+  _check("dest_legacy_noul_fallback", lg["is_third_party"] is True and lg["destination_class"] == "third_party_sdk"
+         and lg["decision_trace"]["destination"]["legacy"] is True)
+  # Rollback flag: class traced, never applied, sharing = in-scope fact only.
+  saved = constants.DESTINATION_CLASS_ENABLED
+  constants.DESTINATION_CLASS_ENABLED = False
+  try:
+    off = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "user_chosen_destination"), "test")
+    off_sdk = compose("EMAILS", "Up.kt (Pattern: email)", base, _answers(0.95, "third_party_sdk"), "test")
+    _check("dest_flag_off", off["severity"] == "CRITICAL" and off.get("needs_manual_review") is None
+           and off["decision_trace"]["destination"]["applied"] is False and off_sdk["is_third_party"] is False
+           and off["decision_trace"]["destination"]["enabled"] is False)
+  finally:
+    constants.DESTINATION_CLASS_ENABLED = saved
+
+  # --- heuristic client prior --------------------------------------------------
+  hc = clientmod.HeuristicJevClient()
+  ans = hc.system_one(base, battery)
+  _check("dest_heuristic_user_chosen", ans["destination_class"].choice == "user_chosen_destination"
+         and ans["destination_class"].confidence >= constants.CONF_DESTINATION_ACT, str(ans["destination_class"]))
+  ans2 = hc.system_one(no_hint, battery)
+  _check("dest_heuristic_network_dev_backend", ans2["destination_class"].choice == "developer_backend")
+  tele = {**no_hint, "sinks": [{"symbol": "Reporter", "capabilities": ["THIRD_PARTY_TELEMETRY"], "lines": [5]}]}
+  _check("dest_heuristic_telemetry_sdk", hc.system_one(tele, battery)["destination_class"].choice == "third_party_sdk")
+  _check("dest_heuristic_no_sink_unknown", hc.system_one({**no_hint, "sinks": []}, battery)["destination_class"].choice == "unknown")
+
+  # --- calibrate v2 --------------------------------------------------------------
+  cases = [
+      {"file": "a", "data_type": "T", "transfers": True, "p_transmit": 0.92, "destination_class": "developer_backend",
+       "run_destination_class": "developer_backend", "run_is_third_party": False},
+      {"file": "b", "data_type": "T", "transfers": True, "p_transmit": 0.81, "destination_class": "third_party_sdk",
+       "run_destination_class": "developer_backend", "run_is_third_party": False},
+      {"file": "c", "data_type": "T", "transfers": True, "p_transmit": 0.55, "destination_class": "user_chosen_destination",
+       "run_destination_class": "user_chosen_destination", "run_is_third_party": False, "run_destination_applied": True},
+      {"file": "d", "data_type": "T", "transfers": False, "p_transmit": 0.60},
+      {"file": "e", "data_type": "T", "transfers": False, "p_transmit": 0.20},
+  ]
+  report = calibrate.calibrate({"cases": cases, "description": "synthetic v2"}, min_precision=0.9)
+  dest = report["destination"]
+  _check("calibrate_v2_counts", dest["n_labelled"] == 3 and dest["n_scored"] == 3 and dest["accuracy"] == round(2 / 3, 3), str(dest))
+  _check("calibrate_v2_per_class", dest["per_class"]["developer_backend"]["precision"] == 0.5
+         and dest["per_class"]["third_party_sdk"]["recall"] == 0.0, str(dest["per_class"]))
+  _check("calibrate_v2_sharing_regression", len(dest["sharing_regressions"]) == 1 and dest["sharing_regressions"][0]["file"] == "b"
+         and any("lost the sharing flag" in w for w in report["warnings"]))
+  _check("calibrate_v2_applied_downgrades", len(dest["applied_downgrades"]) == 1 and dest["applied_downgrades_wrong"] == 0)
+  _check("calibrate_v2_by_class", set(report["reliability_by_class"]) == {"developer_backend", "third_party_sdk", "user_chosen_destination", "none"}
+         and report["reliability_by_class"]["none"]["n"] == 2, str(report["reliability_by_class"]))
+  _check("calibrate_v2_in_band", report["reliability_in_band"]["n"] == 2 and report["reliability_in_band"]["positives"] == 1,
+         str(report["reliability_in_band"]))
+  v1 = calibrate.calibrate({"cases": [{k: v for k, v in c.items() if not k.startswith("run_") and k != "destination_class"} for c in cases]})
+  _check("calibrate_v1_labels_still_work", v1["destination"]["n_labelled"] == 0 and "note" in v1["destination"])
+  # Join carries the run's destination fields onto the case.
+  with tempfile.TemporaryDirectory() as d:
+    with open(os.path.join(d, "worker_x.json"), "w", encoding="utf-8") as f:
+      json.dump({"findings": [{"psl_constant": "T", "files_involved": ["app/A.kt"], "destination_class": "other_app_ipc",
+                               "is_third_party": True, "transfer_decision": "TRANSMITS", "severity": "IMPORTANT",
+                               "decision_trace": {"scores": {"transmits_offdevice": 0.77},
+                                                  "destination": {"class": "other_app_ipc", "confirmed": False, "applied": False}}}]}, f)
+    joined = calibrate.join_probabilities([{"file": "A.kt", "data_type": "T", "transfers": True, "destination_class": "other_app_ipc"}], [d])
+    _check("calibrate_v2_join_run_fields", joined and joined[0]["run_destination_class"] == "other_app_ipc"
+           and joined[0]["run_is_third_party"] is True and joined[0]["run_destination_applied"] is False, str(joined))
+
+
 def _test_app_purpose() -> None:
   """WP4: once-per-app purpose question — cache miss/hit, low confidence, failure, purpose_in."""
   from typesafe_eval import capabilities as capsmod
@@ -2145,6 +2371,7 @@ def main() -> int:
   _test_evidence_line()
   _test_app_purpose()
   _test_callee_resolution()
+  _test_destination_class()
   _test_relevance_token_embedded()
   print()
   if _FAILURES:

@@ -433,8 +433,73 @@ p >= T_TRANSMIT_HIGH                  -> TRANSMITS  is_transferred=True, severit
 `is_transferred=True` for UNCERTAIN is deliberate: `generate_report.py` only surfaces a
 MANUAL_REVIEW item in "needs review" when the finding is transferred, and an undeclared
 transferred type becomes a Data Safety discrepancy. Sharing (`is_third_party`) is set when a
-sink with a sharing capability is in scope, which is how IPC hand-offs reach the report as
-sharing.
+sink with a sharing capability is in scope **or** when the model classifies the destination
+as a sharing class (below), which is how IPC hand-offs reach the report as sharing.
+
+**Destination class (WP7)** (`questions.destination_class_question`,
+`evaluate.compose_destination`, `structure.destination_hints`). Before WP7 the data-safety
+battery asked one Noul, `is_third_party`, and the evaluator could only say "transfer" or
+"not a transfer". Half of the labelled transfers on the development set are not *collection*
+by the developer at all: an e-mail the user composes to a support address, a file the user
+shares through the system chooser, a document written into a SAF tree the user picked, a
+directory listing fetched from an SMB/FTP server the user typed in, a diagnostic string put on
+the clipboard. Every one of them scored UNCERTAIN or TRANSMITS and landed in the review queue at
+IMPORTANT or above. The battery now asks a closed Choice instead:
+
+| `destination_class` | Meaning | Composition |
+| --- | --- | --- |
+| `developer_backend` | The developer's own servers or an endpoint the developer controls | collection; `is_third_party = False` |
+| `third_party_sdk` | An SDK or service run by someone else (analytics, crash reporting, ads, cloud vendor) | collection **and** sharing; `is_third_party = True` |
+| `other_app_ipc` | Another app on the device via Intent, ContentProvider, broadcast, bound service | sharing; `is_third_party = True` |
+| `user_chosen_destination` | The user picks the recipient at run time (chooser, share sheet, compose UI, SAF tree, a server address the user configured) | not collection by the developer: `data_safety_section` becomes SUGGESTION, disclosure EXEMPT, `destination.applied = True` |
+| `platform_component` | An on-device system service (clipboard, notification, media store, system settings); nothing leaves the device | same as above |
+| `unknown` | The snippet does not show where the data goes | keep the transfer severity, `needs_manual_review`, summary suffixed `[destination unknown unconfirmed: conf=…; verify]` |
+
+The `is_third_party` field is kept on every finding — derived from the class — because
+`generate_report.py` (read-only in this change set) consumes it; the eval harness
+(`eval/run_eval.py`) derives it the same way through `evaluate.destination_from_answers`,
+which also accepts a legacy `is_third_party` Noul answer (`legacy: true` in the trace) so
+cached v1 answers still compose.
+
+- **Double gate for the downgrade.** A non-collection class lowers a severity, so it needs
+  more than the model's word. `compose_destination` only *applies* `user_chosen_destination`
+  or `platform_component` when the class confidence is at least `CONF_DESTINATION_ACT = 0.75`
+  **and** something in the state corroborates it: a `preference_or_ui_field` or `chooser`
+  destination hint inside the anchor's scope (`corroboration: "hint"`), `user_initiated >=
+  T_USER_INITIATED` (`"user_initiated"`), or for `platform_component` no strong egress sink in
+  `scope_capabilities ∪ callee_capabilities` (`"no_egress_in_scope"`). A class that fails the
+  gate keeps the transfer severity, is marked for review and says why
+  (`corroboration: "low_confidence"` / `"uncorroborated"`), so the report still surfaces it
+  and a reviewer sees what would have to be true for the downgrade. A LOCAL decision makes the
+  class moot (`"n/a"`). Sharing classes never need corroboration: they raise, not lower.
+- **Deterministic destination hints are priors, never decisions.** `structure.destination_hints`
+  scans an anchor's scope for three patterns and attaches them to the anchor
+  (`anchor.destination_hints`) and to `state["destination_hints"]` (only when non-empty, so
+  hint-free states are byte-identical to WP6): a user-source token (`getString(`, `EditText`,
+  `getStringExtra(`, `Preference`, …) on a line that names a destination-shaped identifier
+  (`host`, `url`, `endpoint`, `server`, … split at camel/snake boundaries so `securityPrefs`
+  does not match `url`) → `preference_or_ui_field`; a chooser or document-picker token
+  (`createChooser(`, `ACTION_SEND`, `ACTION_OPEN_DOCUMENT_TREE`, `ActivityResultContracts`,
+  …) → `chooser`; a URL literal → `developer_backend` when its host is under the app's own
+  package domain (`structure.developer_domains`: `com.example.app` → `example.com`,
+  `app.example.com`) else `constant_endpoint` with the host as `detail`. Comment and import
+  lines are skipped. The question text tells the model what each hint kind means and that the
+  hints are evidence to weigh, not the answer. The hints are also what the corroboration gate
+  reads, which is why they are computed in code and not asked.
+- **Trace.** `decision_trace.destination` records `class`, `confidence`, the full
+  `probabilities` dict, the `hints` seen, `sharing`, `confirmed`, `corroboration`, `applied`,
+  `legacy` and `enabled`; `destination_note` explains any composition change in one sentence;
+  `thresholds` gains `CONF_DESTINATION_ACT` and `DESTINATION_CLASS_ENABLED`; the finding gains
+  `destination_class` and a purpose string per class ("User-chosen destination (user-directed
+  transfer; not collection by the developer)", "Shared with another app (IPC)", …).
+- **Stand-in client.** `HeuristicJevClient._destination_prior` (the offline stand-in, not the
+  model) answers from the hints and the strongest capability in scope so the selftest and
+  `--client heuristic` runs exercise every composition branch; it is labelled as a stand-in in
+  the code and its answers are never used in a live run.
+- Rollback: `DESTINATION_CLASS_ENABLED = False` keeps the question in the battery but
+  composes exactly as WP6 did (sharing from in-scope IPC sinks only, no downgrade, no review
+  suffix); `DESTINATION_HINTS_ENABLED = False` omits the hints from the state and the anchor
+  so the corroboration gate can only be satisfied by `user_initiated`.
 
 **Play declaration check** (`_run_play_declaration`) runs only for TRANSMITS findings and only
 when a Play declaration is present; UNCERTAIN findings are not turned into Non-Compliant
@@ -483,7 +548,8 @@ Findings already marked `needs_manual_review` are routed without a model call.
 anchor's whole function, the matched line, and the nearest capability-labelled *transfer*
 sink (`(out of scope)` when it lies outside that function). Files without a transfer sink keep
 the single-line `<file>:L<n> — <matched>` form. `finding["evidence_flow"]` carries the same
-facts as a dict (`source`, `sink`) for downstream tooling; WP7 appends `destination_class`.
+facts as a dict (`source`, `sink`) for downstream tooling; the finding's top-level
+`destination_class` (WP7) says where the sink sends the data.
 
 **Decision trace.** Each finding's `decision_trace` records `scores` (every probability),
 `thresholds` (the values in force), `anchor` (file, line, scope, `scope_capabilities`,
@@ -539,6 +605,23 @@ run. A labelled *transfer* with no finding is a recall loss by construction: it 
 package runs this against both development apps before it is committed; the band and
 reliability numbers it reports are recorded but only *applied* to `constants.py` at a
 milestone with the version bump.
+
+**Label schema v2 (WP7).** Every `transfers: true` case may carry `destination_class` (one of
+the five non-`unknown` classes above); non-transfers omit it; v1 label files without the field
+still work. In `--rejoin` mode the join copies the run's own `destination_class`,
+`is_third_party`, `transfer_decision`, `severity`, and the trace's `destination_confirmed` /
+`destination_applied` onto each case (`run_*` fields), and the report gains:
+
+- `reliability_by_class` — Brier / ECE / mean `p_transmit` per labelled class (non-transfers
+  are grouped as `none`), which shows *which kind* of transfer the model is unsure about.
+- `reliability_in_band` (current constants) and `reliability_in_derived_band` — Brier / ECE
+  restricted to the UNCERTAIN band, the number WP7's exit criterion compares against WP6.
+- `destination` — per-class precision / recall / support, the confusion matrix,
+  `sharing_agreement` (labelled sharing class ⇔ run `is_third_party`), `sharing_regressions`
+  (a labelled sharing transfer the run did not mark `is_third_party`; each one is a warning
+  and the command exits 3 — a downgrade that loses a sharing disclosure is a recall loss in
+  the Data Safety sense), `applied_downgrades` and `applied_downgrades_wrong` (a downgrade the
+  run *applied* on a case whose label is a collection class).
 
 ### 4.1 Result on the development set
 

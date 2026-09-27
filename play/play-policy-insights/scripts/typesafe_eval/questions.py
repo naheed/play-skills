@@ -114,14 +114,87 @@ def _disclosure_status(subject: str) -> Dict[str, Any]:
   }
 
 
+#: Closed option set for ``destination_class`` (WP7). Replaces the
+#: ``is_third_party`` Noul, which collapsed "the developer's own backend" with
+#: "a third-party SDK" and "the user's own server" with "another app" -- the
+#: reason the worst-calibrated dev-set bin sat in the UNCERTAIN band. The
+#: policy consequence of each class is composed in code
+#: (``evaluate.compose_destination``); the model only picks the class.
+#: ``unknown`` is the escape hatch and always routes to manual review.
+#: Adding an option requires a fixture that exercises it (closed option lists).
+DESTINATION_CLASS_OPTIONS: Dict[str, str] = {
+    "developer_backend": (
+        "A server or service the app developer operates: the endpoint is fixed"
+        " in the code or configuration (not chosen by the user) and belongs to"
+        " the developer, e.g. the app's own API, licensing or sync server."
+    ),
+    "third_party_sdk": (
+        "A library or service run by someone other than the developer that"
+        " receives the data: crash/error reporting, analytics, advertising,"
+        " push, payment or cloud SDKs (`sinks` capabilities THIRD_PARTY_TELEMETRY"
+        " or ADVERTISING_SDK are strong signs)."
+    ),
+    "user_chosen_destination": (
+        "The user decides where the data goes at run time: a server, host, URL"
+        " or account the user typed or configured (read from a preference, a"
+        " text field or a picked URI), or a system share/picker sheet where the"
+        " user selects the receiving app or document. `destination_hints` with"
+        " USER_CHOSEN_DESTINATION is a strong sign."
+    ),
+    "platform_component": (
+        "A component of the operating system on the same device with no"
+        " network hop: the media store, a system content provider, a"
+        " notification, the clipboard, a system settings screen."
+    ),
+    "other_app_ipc": (
+        "Another application on the device receives the data through an"
+        " explicit intent, broadcast, bound service or content provider that"
+        " names or targets that app (not a user-facing chooser)."
+    ),
+    "unknown": (
+        "The snippet does not show where the data goes, or no transfer is"
+        " visible."
+    ),
+}
+
+
+def destination_class_question(subject: str) -> Dict[str, Any]:
+  """The ``destination_class`` Choice for one data type (WP7).
+
+  Asked as part of the data-safety battery so it batches with the other
+  questions; ``evaluate`` reads the answer only when the transfer
+  probability is at or above ``T_TRANSMIT_LOW`` (below the band the data is
+  local and the destination is moot). Instructions point at the state fields
+  that carry the deterministic priors -- ``sinks`` capabilities, ``callees``
+  (WP6) and ``destination_hints`` (WP7) -- and say explicitly that the hints
+  are priors, not the answer.
+  """
+  return {
+      "type": "choice",
+      "instructions": (
+          f"If `code_snippet` sends {subject} off-device or to another app, WHERE "
+          "does it go? Use the capabilities in `sinks`, the helper files in "
+          "`callees` (when present) and the deterministic priors in "
+          "`destination_hints` (when present: USER_CHOSEN_DESTINATION means the "
+          "host/URL or receiving app is chosen by the user at run time; "
+          "DEVELOPER_BACKEND means a literal endpoint under the developer's own "
+          "domain; CONSTANT_ENDPOINT means a literal endpoint elsewhere). Hints "
+          "are priors to weigh against the code, not the answer. Pick the single "
+          "best class; choose `unknown` when the destination is not visible."
+      ),
+      "criteria": dict(DESTINATION_CLASS_OPTIONS),
+  }
+
+
 def data_safety_battery(
     data_type: str, description: str, token: str = ""
 ) -> Dict[str, Dict[str, Any]]:
   """Battery for a single data-safety finding (one detected data type).
 
   Produces the typed inputs the existing ``worker_<goal>.json`` schema expects:
-  the four data-safety booleans, a disclosure-status choice, and a severity
-  score. Instructions embed the literal data type (and the scanner token that
+  the data-safety Nouls (relevance, transfer, user-initiated, disclosure), the
+  ``destination_class`` Choice (WP7; ``is_third_party`` is derived from it in
+  code), a disclosure-status choice, and a severity score. Instructions embed the literal data type (and the scanner token that
   anchored the signal, when given) so the battery works whether the state holds
   one signal or a whole file's worth (see request batching).
   """
@@ -153,16 +226,7 @@ def data_safety_battery(
           yes="An explicit user action triggers the transfer.",
           no="The transfer happens automatically without a user action.",
       ),
-      "is_third_party": _noul(
-          instructions=(
-              f"Does `code_snippet` send {subject} to a destination outside the "
-              "developer's own control — a sink whose capabilities in `sinks` "
-              "include THIRD_PARTY_TELEMETRY, ADVERTISING_SDK, or IPC_SHARING, or "
-              "any other party that is not the developer's own backend?"
-          ),
-          yes="The sink is a third party outside the developer's control.",
-          no="The sink is the developer's own backend, or there is no sink.",
-      ),
+      "destination_class": destination_class_question(subject),
       "has_prominent_disclosure": _noul(
           instructions=(
               f"For {subject}, does `code_snippet` (with "
