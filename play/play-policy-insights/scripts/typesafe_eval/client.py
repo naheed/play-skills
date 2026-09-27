@@ -323,6 +323,11 @@ class HeuristicJevClient(JevClient):
     approx_chars = len(json.dumps({"state": state, "questions": questions}))
     self.total_input_tokens += approx_chars // 4
 
+    # Capability classification requests carry a ``symbols`` list; answer them
+    # from generic behavioural keywords in the identifier (stand-in only).
+    if isinstance(state, dict) and "symbols" in state and "capability_definitions" in state:
+      return self._classify_symbols(state["symbols"], questions)
+
     signal = state.get("signal", {}) if isinstance(state, dict) else {}
     co = state.get("co_located_signals", {}) if isinstance(state, dict) else {}
     app = state.get("app", {}) if isinstance(state, dict) else {}
@@ -330,6 +335,13 @@ class HeuristicJevClient(JevClient):
 
     data_type = signal.get("data_type", "")
     has_network = bool(co.get("network_transmission"))
+    # Critic states carry the finding instead of a signal; treat labelled sinks
+    # (or a snippet that mentions related data-flow lines) as network evidence.
+    finding = state.get("finding", {}) if isinstance(state, dict) else {}
+    if finding:
+      has_network = has_network or bool(finding.get("sinks")) or (
+          "Related data-flow lines" in str(finding.get("evidence_snippet", "")))
+      snippet = snippet or str(finding.get("evidence_snippet", ""))
     has_disclosure = any(
         gate in (co.get("disclosure") or []) for gate in self._DISCLOSURE_GATES
     )
@@ -425,6 +437,42 @@ class HeuristicJevClient(JevClient):
 
     return JevAnswer(type=str(qtype))
 
+  # Generic *behavioural* keywords (not product names) that hint at a capability
+  # in an identifier such as ``java.net.Socket`` or ``some.sdk.analytics.Tracker``.
+  # This is the offline stand-in for the model's knowledge; it is deliberately
+  # crude and exists only so the pipeline runs hermetically in tests.
+  _CAPABILITY_HINTS = {
+      "NETWORK_EGRESS": (".net", "net.", "http", "socket", "url", "request",
+                         "websocket", "grpc", "dns", "client", "api."),
+      "THIRD_PARTY_TELEMETRY": ("analytics", "crash", "telemetry", "metrics",
+                                "tracking", "tracker", "report"),
+      "ADVERTISING_SDK": ("ads", "advert", "adview", "admanager"),
+      "IPC_SHARING": ("intent", "clipboard", "broadcast", "contentprovider",
+                      "contentresolver", "share"),
+      "LOCAL_PERSISTENCE": ("sqlite", "database", "prefs", "preferences", "persist",
+                            "file", "storage", "datastore", "cache"),
+      "LOGGING": ("log", "print"),
+      "USER_DISCLOSURE_UI": ("dialog", "alert", "consent", "permission", "rationale"),
+  }
+
+  def _classify_symbols(
+      self, symbols: list, questions: Dict[str, Dict[str, Any]]
+  ) -> Dict[str, JevAnswer]:
+    answers: Dict[str, JevAnswer] = {}
+    by_id = {int(s["id"]): str(s.get("identifier", "")).lower() for s in symbols}
+    for qid in questions:
+      try:
+        idx_str, cap = qid.split("__", 1)
+        idx = int(idx_str.lstrip("s"))
+      except ValueError:
+        answers[qid] = JevAnswer(type="noul", noul=0.5)
+        continue
+      ident = by_id.get(idx, "")
+      hints = self._CAPABILITY_HINTS.get(cap, ())
+      answers[qid] = JevAnswer(
+          type="noul", noul=0.85 if any(h in ident for h in hints) else 0.1)
+    return answers
+
   @staticmethod
   def _noul_value(
       qid: str,
@@ -437,6 +485,11 @@ class HeuristicJevClient(JevClient):
   ) -> float:
     if qid == "transmits_offdevice":
       return 0.9 if has_network else 0.1
+    if qid == "signal_relevant":
+      # The stand-in cannot judge semantics; lean relevant (recall-safe).
+      return 0.8
+    if qid == "evidence_shows_transfer":
+      return 0.9 if has_network else 0.2
     if qid == "has_prominent_disclosure":
       return 0.85 if has_disclosure else 0.05
     if qid == "is_core_functionality":
