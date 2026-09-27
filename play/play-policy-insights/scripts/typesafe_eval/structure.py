@@ -672,17 +672,53 @@ def is_type_position(line: str, col: int, length: int) -> bool:
   return False
 
 
+def code_portion(line: str) -> str:
+  """``line`` with a trailing ``//`` or ``/*`` comment removed (WP9).
+
+  Comment openers inside string literals (``"http://host"``) are kept: the
+  scan tracks ``"`` / ``'`` quoting and only cuts at an opener that is
+  outside every literal. Used so that a token mentioned only in a trailing
+  comment (``String TAG = "Adapter";  // MediaStore``) is classified as a
+  comment mention rather than a value use, which otherwise makes it the
+  anchor of a per-file question. Full-line comments are handled separately by
+  the ``_COMMENT_PREFIXES`` check.
+  """
+  quote: Optional[str] = None
+  i = 0
+  n = len(line)
+  while i < n:
+    ch = line[i]
+    if quote is not None:
+      if ch == "\\":
+        i += 2
+        continue
+      if ch == quote:
+        quote = None
+    elif ch in ("\"", "'"):
+      quote = ch
+    elif ch == "/" and i + 1 < n and line[i + 1] in ("/", "*"):
+      return line[:i]
+    i += 1
+  return line
+
+
 def lexical_hits(lines: Sequence[str], pattern: str) -> LexicalHits:
   """Classifies every occurrence of an identifier pattern (see :class:`LexicalHits`)."""
   out = LexicalHits()
   if not is_identifier_pattern(pattern):
     return out
-  for i, line in enumerate(lines):
-    if pattern not in line and not (
-        pattern.islower() and (pattern[0].upper() + pattern[1:]) in line):
+  variant = (pattern[0].upper() + pattern[1:]) if pattern.islower() else None
+  for i, raw in enumerate(lines):
+    if pattern not in raw and not (variant is not None and variant in raw):
       continue
-    stripped = line.lstrip()
+    stripped = raw.lstrip()
     if stripped.startswith(_COMMENT_PREFIXES) or stripped.startswith(_IMPORT_PREFIXES):
+      out.demoted_lines.append(i)
+      out.examples.setdefault("demoted", stripped[:160])
+      continue
+    # WP9: a mention that survives only in a trailing comment is a comment mention.
+    line = code_portion(raw)
+    if pattern not in line and not (variant is not None and variant in line):
       out.demoted_lines.append(i)
       out.examples.setdefault("demoted", stripped[:160])
       continue

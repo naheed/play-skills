@@ -709,6 +709,59 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
   (`photo_video`), root-level folder → Suggestion (`files_and_docs`),
   matching or exceeding the legacy findings.
 - **Size.** Small–medium in `registry.py`, `questions.py`, `templates.py`.
+- **Outcome (done).** Implemented as planned with one deviation and three
+  refinements found in two live rounds:
+  1. *Deviation — root-level folder severity follows the matrix, not the
+     plan text.* `resources/goal_permissions_and_apis.md` lists "creates a
+     root-level folder" as Important; the plan said Suggestion. The
+     composition uses **Important** for a non-file-management purpose and
+     **Suggestion** when the purpose is in `ALL_FILES_ACCESS_PURPOSES` (a
+     file manager legitimately manages folders), so the App B exit criterion
+     still reads Suggestion and the matrix row holds for every other app.
+  2. *Refinement — planner gates instead of asking everywhere.* The photo /
+     video code question is asked only when a media or legacy read
+     permission ships (`PolicySpec.requires_permissions`), the root-folder
+     question only for files that compose or write a root path
+     (`applies_file` → `context.has_storage_write_hint`), and each once per
+     file (`one_per_file`). App A: 2 photo/video and 5 files/docs candidates
+     gated, no question asked, no finding; App B: 12 photo/video candidates
+     collapsed to 14 per-file tasks, 7 files/docs candidates gated, 8 asked.
+     Every drop is in `typesafe_triage.json["dropped"]`.
+  3. *Refinement — the composition is double-gated like WP7/WP8.* A model
+     "no" on the root-folder question does not remove a finding when a
+     deterministic hint writes at the root (SUGGESTION + review, "model
+     disagrees"); a `LIBRARY_QUERY` hint against a "user-selected" answer
+     keeps a review SUGGESTION instead of composing nothing. Live, two
+     thumbnail helpers on App B were exactly that shape (p = 0.24 / 0.13
+     against a `LIBRARY_QUERY` hint) and are surfaced for review rather than
+     dropped.
+  4. *Refinement — trailing comments are demoted.* The first live round
+     anchored two per-file questions on `String TAG = "…";  // MediaStore`.
+     `structure.code_portion` strips a trailing `//` / `/*` comment outside
+     string literals before `lexical_hits` classifies a line; the second
+     round anchored the same files on the real `MediaStore` uses with
+     identical findings.
+  Live results (WP9 vs the WP8 snapshot): App A 128 → 128 findings, no
+  change except the recorded gate drops. App B 79 → 88: `photo_video_access_policy`
+  manifest **Important** (uncapped `READ_EXTERNAL_STORAGE` on 34, "no
+  READ_MEDIA_* … grants nothing", straddle note for the 29 build) + Suggestion
+  (broad media, purpose `file_manager` p = 1.00); `files_and_docs_policy`
+  manifest **Important** (uncapped `WRITE_EXTERNAL_STORAGE`) + Suggestion
+  (`requestLegacyExternalStorage`); code: three full-library Suggestions
+  (`MediaScanEngine`, `ContentAdapter`, `MSAdapter`; p 0.78–0.82), two
+  review Suggestions (hint contradiction), two root-folder Suggestions
+  (`Utils.java:L668`, `CA.java:L149`, both `[STORAGE_ROOT, writes]`, p 0.83 /
+  0.92) — the exit criterion exactly, matching the legacy findings. Three
+  unrelated data-safety findings moved between `data_safety_section` and
+  `prominent_disclosure_policy` for the same file/type (the new state blocks
+  re-ask the battery; every one still present) and `Panels.java/PHOTOS`
+  moved TRANSMITS → UNCERTAIN (p 0.77 → 0.63, label intact, still surfaced
+  as a review item). `calibrate --rejoin`: exit 0, 48/48, LOCAL false
+  negatives 0, `missing_positives` empty; at current constants recall-at-high
+  0.609 → 0.565 (that one case), precision-at-high 0.875 → 0.867, abstention
+  0.521 → 0.542. Cost: App B cold 25 requests / 190k input tokens (14 + 8
+  new per-file questions), warm re-run 2 requests. Selftest 480 → 539
+  checks. Patch version bump folded into M3.
 
 ### WP10 — `data_type_confirmed` (L7)
 
@@ -964,7 +1017,7 @@ touching the rest of the cascade.
 - [x] WP7 `destination_class` + label schema v2 + relabel
 - [x] **M2 gate** (passed; abstention 0.562 vs < 0.50 recorded as the exception)
 - [x] WP8 consent defaults, string resources, flavor attribution
-- [ ] WP9 wave 2 policies
+- [x] WP9 wave 2 policies
 - [ ] WP10 `data_type_confirmed`
 - [ ] WP11 wave 3 policies
 - [ ] **M3 gate**

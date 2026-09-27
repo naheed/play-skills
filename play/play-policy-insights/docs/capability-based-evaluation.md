@@ -634,6 +634,113 @@ questions also saw `R.string.crash_consent_body` instead of the sentence the use
   `STRING_RESOLUTION_ENABLED = False` omits `strings`; `PERMISSION_ATTRIBUTION_ENABLED = False`
   omits `manifest_sources`.
 
+**Wave-2 storage policies: photos/videos and files/docs (WP9)**
+(`registry._photo_video_findings` / `_files_and_docs_findings` / `_photo_video_code_spec` /
+`_files_and_docs_code_spec`, `structure.external_storage_paths` / `media_access_hints` /
+`code_portion`, `context.file_storage_hints` / `has_storage_write_hint`,
+`questions.photo_video_battery` / `files_and_docs_battery`,
+`evaluate.compose_photo_video_finding` / `compose_files_and_docs_finding`,
+`engine._plan_from_candidates` gates). Before WP9 the evaluator had no policy for the two
+storage permission families Play reviews most often: an app that still requests
+`READ_EXTERNAL_STORAGE` / `WRITE_EXTERNAL_STORAGE` without a `maxSdkVersion` cap on a modern
+target, an app that reads the whole media library when the Photo Picker would do, and an app
+that creates its own folder at the root of shared storage. App B (a file manager) does all
+three, and the legacy skill reported them; v2 was silent. The plan's matrix
+(`resources/goal_permissions_and_apis.md`) fixes the severities; the purpose from WP4 decides
+whether broad access is *justified*.
+
+- **Manifest rules are deterministic and read the merged profile.** `photo_video_access_policy`:
+  an uncapped `READ_EXTERNAL_STORAGE` while any shipped flavour targets `>= 33`
+  (`PHOTO_PICKER_TARGET_SDK`) → **Important** (`rule: legacy_read_uncapped_on_33_plus`; the
+  evidence says whether a `READ_MEDIA_*` companion exists — without one the permission "grants
+  nothing" on 33+ — and, when another flavour still targets `<= 32`, adds "the build targeting
+  API 29 still uses it"); any broad media permission (`READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO`,
+  or the legacy read permission where it is still effective) → Suggestion when the established
+  purpose is in `PHOTO_VIDEO_PURPOSES` (gallery/editor, backup/antivirus, file manager), else
+  **Important** (review-marked when the purpose is not established) (`broad_media_purpose`);
+  `READ_MEDIA_IMAGES` / `VIDEO` on `>= 34` without `READ_MEDIA_VISUAL_USER_SELECTED` →
+  Suggestion (`missing_visual_user_selected`). `files_and_docs_policy`: an uncapped
+  `WRITE_EXTERNAL_STORAGE` on `>= 30` (`SCOPED_STORAGE_TARGET_SDK`) → **Important**
+  (`legacy_write_uncapped_on_30_plus`); `android:requestLegacyExternalStorage="true"` on
+  `>= 30` → Suggestion (`legacy_storage_flag_on_30_plus`, evidence names the source set that
+  sets it). Capped permissions, a `32` / `29` target, and absent permissions are silent
+  (boundary checks in selftest). Every rule is traced as `decision_trace.rule` with the
+  values it read.
+- **Two deterministic hint families feed two Nouls.** `structure.external_storage_paths`
+  finds lines that name the shared-storage root (`getExternalStorageDirectory(`, `"/sdcard`,
+  `"/storage/emulated/0`) or a public directory (`getExternalStoragePublicDirectory(`,
+  `DIRECTORY_DOWNLOADS`…), follows `STORAGE_HINT_WINDOW = 6` lines (stopping at the block's
+  closing brace) and records whether a path is *composed* from the root (`File(`, `+ "`,
+  `resolve(`, `separator`) and whether that window *writes* (`mkdir(s)`, `createNewFile(`,
+  `FileOutputStream(`, `renameTo(`, `Files.write(`…): strength `writes` > `composes` >
+  `references`. App-specific directories (`getExternalFilesDir`) are never hints — scoped
+  storage is exactly what they are for — and comment / import lines are skipped.
+  `structure.media_access_hints` reads an anchor's scope for a MediaStore collection token
+  *and* a query token within the window (`LIBRARY_QUERY`) or a picker token
+  (`ACTION_PICK_IMAGES`, `PickVisualMedia`, `ACTION_OPEN_DOCUMENT`… → `USER_PICK`); a
+  collection constant alone is not a query. `context.build_file_state` attaches
+  `state["external_storage_paths"]` (per file, strongest first, nearest anchor next, capped
+  at `MAX_STORAGE_HINTS_IN_STATE = 6`) and `state["media_access_hints"]` (per anchor,
+  `data_type`-tagged, capped at `MAX_MEDIA_HINTS_IN_STATE`) only when non-empty, so hint-free
+  states are byte-identical to WP8. The Nouls: `accesses_full_media_library` (with the usual
+  `signal_relevant` gate) and `creates_root_level_external_folder` (no relevance gate: the
+  question is about the file, not the token). Their instructions explain the hint blocks and
+  say the hints are evidence, not the answer.
+- **Three planner gates keep the questions cheap and honest (`PolicySpec.requires_permissions`,
+  `applies_file`, `one_per_file`).** The photo/video code question is asked only when one of
+  `READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO` / `READ_EXTERNAL_STORAGE` ships in the Play build
+  (App A ships none, so its 2 MEDIA/PHOTOS candidates are dropped with the reason `none of
+  [...] ships in the Play build`); the root-folder question only for a file whose hints
+  compose or write a root path (`context.has_storage_write_hint`; a bare
+  `path.startsWith(root)` does not activate it); both are asked **once per file** (the first
+  candidate in triage rank order carries it; the rest are dropped `asked once per file`).
+  Every drop is written to `typesafe_triage.json["dropped"]`, and the counters
+  `planner_gated` / `tasks_per_policy` show the effect per policy. Specs that need the
+  once-per-app purpose declare `needs_app_purpose` and receive it as the `app_purpose=`
+  keyword of `compose`.
+- **Composition is asymmetric and double-gated, like WP7/WP8.** `compose_photo_video_finding`
+  reads `p_full_library` into a mode (`full_library` ≥ `T_FULL_MEDIA_LIBRARY = 0.60`,
+  `user_selected` ≤ 0.40, else `uncertain`) and checks it against the deterministic hints
+  (`corroborated` when a `LIBRARY_QUERY` hint agrees with full-library or a `USER_PICK` hint
+  with user-selected; `contradicted` when they disagree → review flag and the suffix
+  `[deterministic hint X disagrees; verify]`). A justified purpose (`PHOTO_VIDEO_PURPOSES`)
+  with confirmed user-selected access composes **nothing** — that is the compliant path —
+  unless a `LIBRARY_QUERY` hint contradicts it, in which case a SUGGESTION is kept for review;
+  justified full-library → SUGGESTION ("confirm the Play Console declaration"); an
+  unjustified purpose → **Important** in every mode ("use the Photo Picker"); `uncertain`
+  is review-marked and stays at or below Important; an unestablished purpose adds review.
+  `compose_files_and_docs_finding` composes nothing when the state has no storage hint
+  (recall is carried by the planner gate, not by the model); `confirmed` (`p >=
+  T_ROOT_LEVEL_FOLDER = 0.60`) → **Important**, or SUGGESTION when the purpose is in
+  `ALL_FILES_ACCESS_PURPOSES` (a file manager legitimately manages folders — the evidence says
+  "file-management purpose: scoped alternative suggested"); `uncertain` → SUGGESTION + review;
+  `denied` → nothing **only if** no deterministic hint writes (double gate), otherwise
+  SUGGESTION + review with "model disagrees" in the summary. The evidence is the hint line
+  itself (`Utils.java:L668 — parent_dir = new File(Environment.getExternalStorageDirectory()…)
+  … temp_dir.mkdirs(); [STORAGE_ROOT, writes]`), not the scanner's token line, because the
+  folder is created where the path is composed. Traces: `decision_trace.media_access`
+  (`p_full_library`, `mode`, `hints`, `corroborated`, `contradicted`, threshold) and
+  `decision_trace.root_folder` (`p_root_level`, `mode`, `hints`, `deterministic_write`,
+  threshold); both record `app_purpose`, `justified_by_purpose` and `allowed_purposes`; the
+  finding carries `media_access_mode` / `root_folder_mode`.
+- **A trailing comment is not a value use.** The first live run anchored two photo/video
+  questions on `String TAG = "ContentAdapter";  // MediaStore`: the WP2 lexical classifier
+  demoted full-line comments but read a trailing `// MediaStore` as an identifier use, and the
+  one-per-file gate then carried the file's question on that line. `structure.code_portion`
+  now strips a trailing `//` or `/*` comment that is outside every string literal (URLs such
+  as `"http://host"` survive) before `lexical_hits` classifies a line, so the mention is
+  `demoted` and the anchor lands on the real query. This applies to every identifier pattern,
+  not only wave 2.
+- **Stand-in client.** `HeuristicJevClient._storage_priors` answers both Nouls from the hint
+  blocks in the state (`LIBRARY_QUERY` → 0.85, `USER_PICK` only → 0.15; `writes` → 0.85,
+  `composes` → 0.5, `references` → 0.15; 0.5 without hints) so offline runs and the selftest
+  exercise every composition branch; labelled as a stand-in, never used in a live run.
+- Rollback: `PHOTO_VIDEO_POLICY_ENABLED` / `FILES_AND_DOCS_POLICY_ENABLED = False` remove the
+  four specs from `REGISTRY` (no manifest rules, no questions, no gates);
+  `STORAGE_HINTS_ENABLED` / `MEDIA_HINTS_ENABLED = False` omit the hint blocks from the state
+  (the root-folder question is then never activated; the media question composes without
+  corroboration).
+
 **Play declaration check** (`_run_play_declaration`) runs only for TRANSMITS findings and only
 when a Play declaration is present; UNCERTAIN findings are not turned into Non-Compliant
 verdicts on their own.
@@ -652,6 +759,8 @@ permissions that ship in the Play build are examined. Wave 1 (WP5):
 | `package_visibility_policy` | `QUERY_ALL_PACKAGES`: `<queries>` also declared → Important; purpose in `PACKAGE_VISIBILITY_PURPOSES` → Suggestion; otherwise Important (review-marked when not established) |
 | `exact_alarm_policy` | `USE_EXACT_ALARM`: purpose in `EXACT_ALARM_PURPOSES` → Suggestion, otherwise Important; `SCHEDULE_EXACT_ALARM` → Suggestion |
 | `target_api_level` | lowest `targetSdk` among the shipped flavours: `< PLAY_EXISTING_APP_MIN_TARGET_SDK` → **Critical**, `< PLAY_REQUIRED_TARGET_SDK` → Important, unknown → Suggestion + review. The requirement is a dated constant (`PLAY_TARGET_SDK_PROVENANCE`), never a model question |
+| `photo_video_access_policy` (WP9) | uncapped `READ_EXTERNAL_STORAGE` on a `>= 33` target → Important; broad media permission: purpose in `PHOTO_VIDEO_PURPOSES` → Suggestion, otherwise Important (review-marked when not established); `READ_MEDIA_IMAGES`/`VIDEO` on `>= 34` without `READ_MEDIA_VISUAL_USER_SELECTED` → Suggestion |
+| `files_and_docs_policy` (WP9) | uncapped `WRITE_EXTERNAL_STORAGE` on a `>= 30` target → Important; `requestLegacyExternalStorage="true"` on `>= 30` → Suggestion |
 
 Purpose conditioning goes through `evaluate.purpose_in` only, so an `unknown`, `other` or
 low-confidence purpose can raise a severity (and marks the finding for review) but never
@@ -686,9 +795,10 @@ facts as a dict (`source`, `sink`) for downstream tooling; the finding's top-lev
 
 **Decision trace.** Each finding's `decision_trace` records `scores` (every probability),
 `thresholds` (the values in force), `anchor` (file, line, scope, `scope_capabilities`,
-`rank_tier`, proximity, `lexical` verdict, `destination_hints`, `guard_defaults` (WP8)),
-`sinks`, `relevance` (`ok`/`low`), `disclosure_reconciled`, `destination` (WP7), `consent`
-(WP8), `model`, `taxonomy_version` and `evaluator_version`.
+`rank_tier`, proximity, `lexical` verdict, `destination_hints`, `guard_defaults` (WP8),
+`media_hints` (WP9)), `sinks`, `relevance` (`ok`/`low`), `disclosure_reconciled`,
+`destination` (WP7), `consent` (WP8), `media_access` / `root_folder` (WP9), `model`,
+`taxonomy_version` and `evaluator_version`.
 
 ### 3.4 Triage file (`typesafe_triage.json`)
 

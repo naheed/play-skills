@@ -2761,6 +2761,18 @@ def _test_wave2_storage_policies() -> None:
          and pick[0].detail == "ACTION_PICK_IMAGES" and pick[0].line + 1 == 10, str(pick))
   _check("media_hint_collection_without_query_silent", const == [], str(const))
 
+  # --- structure: trailing-comment mentions are not value uses ---------------
+  _check("code_portion_strips_trailing_comment",
+         structure.code_portion('String TAG = "A";  // MediaStore') == 'String TAG = "A";  '
+         and structure.code_portion('String u = "http://host/x"; int y = 1;') == 'String u = "http://host/x"; int y = 1;'
+         and structure.code_portion("int a = b /* MediaStore */ + c;") == "int a = b "
+         and structure.code_portion("char c = '/'; // x") == "char c = '/'; ")
+  lex = structure.lexical_hits(['String TAG = "Adapter";    // MediaStore',
+                                'Uri u = MediaStore.Files.getContentUri("external");',
+                                'String s = "see MediaStore";'], "MediaStore")
+  _check("lexical_trailing_comment_mention_demoted",
+         lex.demoted_lines == [0] and lex.value_lines == [1, 2] and lex.ranked_lines()[0] == 1, str(lex))
+
   # --- manifest rules -------------------------------------------------------
   def purpose(label, p=0.9, source="model"):
     return {"purpose": label, "confidence": p, "source": source}
