@@ -1,0 +1,1094 @@
+# Capability-Based Evaluation (hybrid evaluator v2)
+
+Status: Implemented (`EVALUATOR_VERSION = "2.1.0-capability"`; `2.0.0-capability` was the pre-M2 wording and band)
+Owner: play-policy-insights
+Last updated: 2026-09-27
+Supersedes: the single-cliff `T_TRANSMIT` decision and pattern-anchored snippets described
+in [`typesafe-hybrid-architecture.md`](typesafe-hybrid-architecture.md) §4 and §6 (kept there
+for history; §9.2 of that document points here).
+
+## 1. Problem statement
+
+The first hybrid prototype (v1) reproduced the legacy skill's *shape* (typed questions,
+code-composed severity) but on real applications it missed the findings that matter:
+
+- Every real off-device send that the legacy agent flagged as Critical on one development
+  app was downgraded to "local only" by v1. The `transmits_offdevice` probability landed at
+  0.52-0.54, just under a single 0.55 cliff, and the finding silently became Compliant.
+- On the second app, a credential sent over a raw socket was ranked ninth among nine
+  candidates for its data type and dropped by the per-type cap before any question was asked.
+- The critic scored a genuine device-id upload at `evidence_supports_claim = 0.10` and pruned
+  it, because the "evidence" it was shown was the first line matching the scanner pattern (a
+  type declaration), not the code that performs the send.
+- The snippet extractor knew nothing about the code: no imports, no scopes, no notion of
+  which identifiers in a file are capable of moving data anywhere.
+
+Two tempting fixes were rejected explicitly: (a) adding rules that name specific libraries
+(an HTTP client, a crash reporter) and (b) tuning constants until the two development apps
+produce the expected reports. Both overfit. The design below gives the model the ability to
+say what an identifier *can do* and lets code compose that into a policy decision.
+
+## 2. Design principles
+
+1. **Recall before precision, precision before cost.** The
+   [evaluation charter](evaluation-charter.md) orders the dimensions Recall > Precision >
+   Calibration > Latency > Cost. A missed real transfer is the worst outcome; an extra item
+   in "needs review" is the cheapest.
+2. **Uncertainty is a first-class output.** A probability in the middle of the range is
+   reported as UNCERTAIN, routed to a human, and never pruned. The model is not forced to
+   pick a side it cannot support.
+3. **Capabilities, not vendors.** Evaluator logic never contains a library, SDK, or vendor
+   name. It contains a small taxonomy of *behaviours* (network egress, third-party telemetry,
+   IPC hand-off, ...). The model labels identifiers with those behaviours; a selftest lint
+   fails the build if a vendor token appears in evaluator code.
+4. **IPC is sharing.** Handing data to another application via an `Intent`, a
+   `ContentProvider`, the clipboard, a bound service, or a file-provider URI is a transfer
+   under the Data Safety policy. It is judged as such; it is only *ranked* below explicit
+   egress because IPC-capable platform types appear in nearly every Android source file.
+5. **Deterministic where possible, model where necessary.** Structure (imports, scopes,
+   symbol references, dependency manifests) is parsed in code. The model is asked three
+   kinds of narrow questions: what can this identifier do, does this snippet handle this
+   data type, and does this snippet transfer it.
+6. **Every decision carries its provenance.** Findings record the probabilities, the
+   thresholds in force, the anchor that was shown, the sinks in scope, the model id, the
+   taxonomy version and the evaluator version.
+7. **Thresholds are calibrated artifacts.** `constants.THRESHOLD_PROVENANCE` records the
+   label set, method, derived band and measured metrics; `calibrate.py` regenerates it.
+
+## 3. Architecture: three layers and a cascade
+
+```
+                 scanner hits (data_safety_scan.json), manifest, Play declaration
+                                            |
+  +-------------------- structure layer (deterministic) --------------------+
+  |  structure.py: language, imports, declared package, dependency inventory |
+  |  symbol references, scope detection, comment/import demotion            |
+  +-------------------------------------------------------------------------+
+                                            |
+  +-------------------- semantic layer (model + cache) ---------------------+
+  |  capabilities.py: classify third-party identifiers into the capability  |
+  |  taxonomy; package level first, class level only where it matters;      |
+  |  persistent human-reviewable cache                                      |
+  +-------------------------------------------------------------------------+
+                                            |
+  +-------------------- policy layer (model + code) ------------------------+
+  |  context.py: anchor each hit on the occurrence nearest a transfer sink  |
+  |  engine.py: filter -> triage (tiered rank) -> batched batteries         |
+  |  evaluate.py: relevance gate, three-way transfer decision, severity,    |
+  |               critic on the atomic transfer claim, decision trace       |
+  +-------------------------------------------------------------------------+
+                                            |
+              worker_<goal>.json  +  typesafe_triage.json  (consumed unchanged
+              by orchestrator.py aggregate and generate_report.py)
+```
+
+### 3.1 Structure layer (`structure.py`)
+
+Pure Python, no network. Per file it produces a `FileStructure` with the language, the
+import inventory, the declared `package`/`namespace`, and helpers over the line array:
+
+- `symbol_references(lines, symbol)` returns the lines that *use* a symbol, skipping import
+  lines and comment lines (a mention in a comment is not a data flow). Every call site is
+  returned (bounded only by `MAX_SYMBOL_REFERENCE_LINES = 400`); an earlier cap of 12 hid the
+  14th `Intent` use in a large activity from ranking (WP2).
+- `all_occurrences(lines, pattern)` returns scanner-pattern hits with comment and import
+  lines demoted to the end, so an anchor prefers executable code. With the lexical pre-gate
+  on, identifier-boundary hits come first and exact-case hits before case-folded ones.
+- `enclosing_scope(lines, index)` finds the *function* containing a line using an
+  indentation/brace depth profile, so the snippet shown to the model is the whole function
+  that performs the operation rather than a fixed window. Control-flow headers
+  (`switch (x) {`, `if (…) {`, `= when (…) {`, …) are not declarations
+  (`is_declaration_header`), so a hit inside a `switch` still sees a sink called two lines
+  after the block.
+- `dependency_inventory(app_dir)` reads Gradle, `pubspec.yaml`, `package.json` and similar
+  manifests so build-declared dependencies can be classified even when no import is seen.
+- `package_of(module)` and `declared_package(content)` support first-party detection: an
+  import whose package equals the manifest package or any package declared by an analysed
+  source file is the app's own code and is not sent for classification.
+
+Wildcard imports (`import foo.bar.*`) are preserved so the package can still be classified.
+
+#### 3.1.1 App profile (`android_manifest.py`, `resources.py`) — added in WP1
+
+The orchestrator's `manifest_details.json` records only a handful of facts (package,
+target SDK, permission names, services that *have* a `foregroundServiceType`), and the
+orchestrator is read-only for this work. The evaluator therefore parses the manifests itself,
+once per run, into an `AppProfile` stored on `RunContext.profile`:
+
+- **Module discovery.** Every `AndroidManifest.xml` (skipping `IGNORED_DIR_NAMES` and test
+  source sets) is grouped by module root (the prefix before `/src/`). The primary module is
+  the one whose manifest declares a LAUNCHER activity, then the one with most components;
+  other modules (benchmarks, libraries) are logged in `other_modules` and never merged, so a
+  library manifest cannot inject permissions or components.
+- **Source-set merge with attribution.** `src/main` first, then flavors and build types in
+  sorted order. Every permission and component carries `sources` (the source sets that
+  declared it) and `removed_in` (`tools:node="remove"`). Attribute conflicts follow the
+  Gradle manifest merger: `main` wins unless the flavor's `<application>` lists the
+  attribute in `tools:replace`. `AppProfile.ships_in_play_build(entry)` applies the same
+  flavor rule as candidate filtering (`main` + `play` when a `play` flavor exists), so a
+  component declared only in a non-Play flavor is visible as such rather than silently
+  merged in.
+- **Facts that `manifest_details.json` lacks.** Services *without* a
+  `foregroundServiceType`, `<property>` sub-tags (special-use FGS subtype), `<queries>`,
+  `maxSdkVersion` / `minSdkVersion` / `usesPermissionFlags` on permissions,
+  `requestLegacyExternalStorage` and similar `<application>` flags, exported state,
+  intent filters, app- and component-level `<meta-data>`, `<uses-feature>`, and the
+  `isAccessibilityTool` flag read from the accessibility service's `res/xml` config.
+- **Provenance.** Modern projects keep `namespace`/`applicationId`/`targetSdk` in Gradle,
+  so the module's `build.gradle(.kts)` is scanned for numeric/quoted literals (comments
+  stripped); the manifest's `package` and `<uses-sdk>` come next; `manifest_details.json`
+  is the last fallback. `sdk_provenance` records the source of each value and any
+  disagreement with the orchestrator is logged at WARNING and kept in `warnings`.
+- **Derived platform facts (no policy judgement).** `launcher_activities()`,
+  `default_handler_roles()` (SMS / dialer / assistant / home / telecom roles from
+  framework intent constants), `sms_receivers()`, `file_handling_activities()`,
+  `services_without_fgs_type()`, `exported_components()`.
+- **Observability.** `AppProfile.summary()` is written to
+  `typesafe_triage.json["app_profile"]`; counters `manifests_merged`, `manifest_warnings`,
+  `manifest_other_modules` are recorded. A parse failure in one flavor manifest degrades to
+  a warning and a partial profile; a total failure falls back to `manifest_details.json`
+  and never aborts a run.
+
+`resources.py` indexes the default-locale `res/values/*.xml` strings and `res/xml/` paths so
+`@string/` labels (and, from WP8, disclosure wording referenced as `R.string.x`) resolve to
+text.
+
+#### 3.1.2 Identifier-boundary lexical pre-gate — added in WP2
+
+The scanner's patterns are substrings, so `race` matches `printStackTrace`, `uid` matches
+`fluid`, `imap` matches `Multimap` and `dob` matches `adobe`. The v1 evaluator paid a model
+call to reject each of these. The pre-gate is a deterministic cascade step that runs after
+file analysis and before the capability classifier, so files whose only hits are
+coincidences also leave the import inventory (fewer classification requests):
+
+- **What counts as a match.** For identifier-shaped patterns only
+  (`^[A-Za-z_]\w*(\.[A-Za-z_]\w*)*$`), an occurrence must start and end at an identifier
+  boundary: a non-alphanumeric character, a camelCase transition (`userUid`, `UidCache`), a
+  digit, or a short English affix (`Relogin`, `records`, `tracking`, `tracker`, `trackable`).
+  A capitalised variant of a lowercase pattern counts as a (non-exact) match. MIME literals,
+  paths and other non-identifier patterns are `non_identifier` and always pass.
+- **Type vs value position.** `is_type_position` recognises class/interface headers,
+  `: Type`, `<Type>`, `@Type`, and `Type name =` declarations. A file whose only boundary
+  hits are type positions gets verdict `type_only`; dropping those is **off**
+  (`LEXICAL_TYPE_ONLY_DROP = False`) because a `: AudioRecord` field driven through the field
+  name is a real use. The verdict is recorded so the effect can be measured on labels first.
+- **Verdicts** per (file, pattern): `value`, `type_only`, `substring_only` (dropped, with the
+  offending line as `example`), `demoted_only` (hits only in comments/imports; kept), `none`.
+  They land in `typesafe_triage.json["counters"]["lexical_pregate"]`, in each drop record,
+  and on every finding as `decision_trace.anchor.lexical`.
+- **Rollback.** `LEXICAL_PREGATE_ENABLED = False` restores the previous behaviour exactly.
+
+Measured on the two development apps: 41 and 37 candidates dropped, 9 and 11 files pruned,
+all inspected as genuine coincidences; battery requests at a fixed cap fell 9 % and 16 %.
+
+#### 3.1.3 Recall checks that shaped the cascade — WP2
+
+`calibrate --rejoin` (see §4) re-joins the frozen label set to every new run and fails when a
+labelled transfer has no finding. Running it after each change surfaced five silent recall
+losses that had nothing to do with the model, each fixed at its root rather than by tuning:
+occurrence capping before ranking (`MAX_OCCURRENCES_RANKED`), symbol-reference truncation
+(`MAX_SYMBOL_REFERENCE_LINES`), control-flow headers clipping the anchor scope
+(`is_declaration_header`), the per-type cost cap dropping candidates that had a sink in
+scope (`CAP_EXEMPTS_SINK_IN_SCOPE`), and a relevance question that told the model MIME
+types were coincidences (`questions._relevance`). The rule that emerged: **caps bound cost,
+never evidence** — a candidate whose own function calls an egress/IPC sink is never dropped
+for cost, and every list shown to the model is bounded separately from the list used for
+ranking.
+
+### 3.2 Semantic layer (`capabilities.py`)
+
+The taxonomy (`TAXONOMY_VERSION = "1"`) is behavioural and vendor-free:
+
+| Capability | Meaning | Transfer? | Sharing? |
+| --- | --- | --- | --- |
+| `NETWORK_EGRESS` | Can send bytes off-device (sockets, HTTP, RPC, DNS, websockets). | yes | no |
+| `THIRD_PARTY_TELEMETRY` | Reports events, crashes or analytics to a party other than the developer. | yes | yes |
+| `ADVERTISING_SDK` | Serves or measures advertising. | yes | yes |
+| `IPC_SHARING` | Hands data to another application on the device (intents, providers, clipboard, bound services). | yes | yes |
+| `LOCAL_PERSISTENCE` | Writes to local storage or databases. | no | no |
+| `LOGGING` | Emits diagnostic output that stays on-device by default. | no | no |
+| `USER_DISCLOSURE_UI` | Presents consent or disclosure UI. | no | no |
+| `UNKNOWN` | Could not be classified with confidence. | treated as transfer-capable | no |
+
+The model is asked, per identifier, a battery of `Noul` questions "does this identifier
+provide capability X" (`classification_battery`), batched `CAPABILITY_BATCH_SIZE` identifiers
+per request. A label is applied at `T_CAPABILITY = 0.60`; a transfer capability scoring in
+`[T_CAPABILITY_UNKNOWN_LOW, T_CAPABILITY)` yields `UNKNOWN` rather than a confident "no",
+which keeps the identifier in scope as a possible sink (recall first).
+
+**Cascade.** Third-party imports are grouped by package and the package is classified first.
+Only packages labelled with a transfer capability or `UNKNOWN` have their individual classes
+refined; classes from packages that are clearly local-only inherit the package profile with
+`source = "package:<...>"`. On the development set this cut identifiers sent for
+classification by roughly 60 %. Build-declared dependencies are classified too and summarised
+into `app_facts["declared_capabilities"]`, which is included in every policy question's state
+so the model knows, for example, that the app links a crash reporter even when the current
+file does not import it.
+
+**Cache.** `CapabilityCache` persists profiles keyed by
+`"{TAXONOMY_VERSION}|{model}|{identifier}"` (default path `~/.cache/play_policy_insights/
+capabilities.json`, overridable by `PPI_CAPABILITY_CACHE` or `--capability-cache`). The file
+is plain JSON so a reviewer can inspect or correct a label; human-authored entries always win
+over model entries. A taxonomy or model change changes the key and therefore invalidates
+nothing silently. Cache hit/miss counts are recorded in the triage file.
+
+The same file also holds **per-app answers** (WP4) under keys
+`"app|{TAXONOMY_VERSION}|{model}|{question_id}|{digest}"`, where `digest` is the SHA-256 of
+the exact state and battery the model saw. Today the only such question is
+`declared_core_purpose` (below). `get_app_answer()` returns a human-authored entry regardless
+of model; `put_app_answer()` never overwrites one. A reviewer therefore pins an app's purpose
+by editing one JSON entry with `"source": "human"`, and the pin survives model changes.
+
+**Offline stand-in.** `HeuristicJevClient` answers classification questions from generic
+substring hints (`"http"`, `"socket"`, `"intent"`, `"prefs"`, ...). It exists so selftest and
+the wiring can run without a key. It is a labelled mock, never a source of judgment, and
+every finding it produces carries `client = "heuristic"`.
+
+### 3.3 Policy layer (`context.py`, `engine.py`, `evaluate.py`, `questions.py`)
+
+**Sinks and anchors.** For each analysed file `context.file_sinks` lists every imported
+identifier whose profile is transfer-capable, with the lines that reference it. For a scanner
+hit, `anchor_signal` chooses among all occurrences of the pattern the one that is best by
+`(tier, proximity)`, where proximity is the distance to the nearest sink reference (0 means
+the sink is used inside the hit's own scope) and tier is:
+
+| Tier | Meaning |
+| --- | --- |
+| 0 | A `NETWORK_EGRESS`, `THIRD_PARTY_TELEMETRY` or `ADVERTISING_SDK` sink is referenced in the anchor's scope. |
+| 1 | An `IPC_SHARING` sink is referenced in scope. |
+| 2 | Only `UNKNOWN`-capability sinks are in scope. |
+| 3 | No transfer-capable sink in scope. |
+
+The `Anchor` records `scope_capabilities` so the trace shows *why* a tier was assigned.
+
+**One-hop first-party callee resolution** (`structure.FirstPartyIndex`,
+`structure.callee_references`, `context.Callee`, `engine._resolve_callees`, WP6). The
+labelled set contained transfers where the anchor's function hands the value to the app's
+*own* helper (`Uploader.send(loc)`) and the network client lives in that helper's file. Seen
+from the anchor alone the function reaches no sink: the anchor ranked tier 3, was eligible
+for the per-type cap, and when it did reach the model the answer was UNCERTAIN because the
+snippet showed no transfer. The structure layer now closes that gap deterministically:
+
+- `build_first_party_index(app_dir, excluded_flavors)` walks the shipped `.kt` / `.java` /
+  `.cs` source once per run (build outputs, vendored trees, test source sets **and the
+  non-prioritised product flavours** excluded) into `simple class name → file(s)`, reading
+  each file's `package` from its head. The index is a *name* index: it never says what a
+  class does. Excluding flavours matters: on App A the unshipped `fdroid` flavour carries stub
+  copies of a billing SDK's classes; indexing them made the SDK's package look first-party
+  and silenced the real SDK import in the shipped flavour (a labelled transfer was lost in
+  the first WP6 run). For the same reason callee files never widen the first-party *package*
+  set — only candidate files and the profile's own package do.
+- After the lexical pre-gate, `engine._resolve_callees` looks, for every surviving candidate
+  file, at the capitalised identifiers referenced *inside the enclosing scopes of its
+  candidate hits* (`_candidate_scope_lines`), and resolves each through the index
+  (`FirstPartyIndex.resolve`): the caller's `import <pkg>.<Name>` wins when a first-party file
+  declares `<pkg>` (`resolution: import`); a name the caller imports from a package no
+  first-party file declares is a platform/third-party class that shares a name with an app
+  class (`Log`) and is **not** resolved; then the caller's own package (`same_package`); then
+  a unique match (`unique`); then the file sharing the longest directory prefix with the
+  caller (`nearest`, the two-flavour case). On each reference line the *members* called on
+  the symbol are recorded too (`Uploader.send(x)`, `Uploader(ctx).send(x)`,
+  `Uploader::send`, `Uploader.INSTANCE.send(x)` → `send`). At most
+  `MAX_CALLEE_FILES_PER_CALLER = 8` callee files per caller; each callee file is
+  structurally analysed once and its imports join the classification set, so
+  `context.file_sinks` labels its sinks exactly like a caller's (`imports_from_callees` in
+  the triage counters is the semantic-layer cost of the hop).
+- **Member level, file-level fallback.** `context.file_callees` locates every called member
+  in the callee (`structure.member_declaration_lines`: Kotlin `fun`/`val`, Python `def`,
+  Java/C# `Type name(` headers; `structure.declaration_scope` for the body). For one anchor,
+  `Callee.view(scope)` is *member-level* when every reference inside the scope names a
+  member and every member was located: the hop's sinks are the callee's sinks whose
+  reference lines fall inside those members' bodies. A bare constructor, a type position or
+  an unlocated (inherited, generated, extension) member falls back to the callee's
+  file-level sinks — the recall-safe direction — and says so (`granularity: "file"`). The
+  first WP6 run used file level only: large first-party utility classes then made nearly
+  every caller tier 0 (App A: 186 anchors reached a callee, model calls 100 → 143, +49 LOCAL
+  suggestions for 7 new TRANSMITS). Member level keeps the 7 and drops the dilution.
+- `context.anchor_signal` attaches to each occurrence's scope the callee views referenced in
+  it (`MAX_CALLEES_PER_ANCHOR = 3`, strongest reachable capability first, nearest call site
+  second). The anchor's tier is computed over `scope_capabilities ∪ callee_capabilities`;
+  both lists are kept apart in the trace (`anchor.callee_in_scope`,
+  `anchor.callee_capabilities`, `anchors_tier_raised_by_callee` in the counters) so a
+  reviewer sees whether the tier came from the file or from the hop. `Anchor.reach_in_scope`
+  (direct *or* callee) is what the per-type cap exemption reads (`cap_exempt_callee_only`
+  counts exemptions granted only because of a hop).
+- **Budget accounting.** Exempt candidates no longer consume `MAX_FINDINGS_PER_TYPE`: the
+  cap bounds the *no-reach* (tier 3) tail and reach-in-scope candidates are asked in
+  addition (`kept_budgeted` vs `cap_exempt_sink_in_scope`). Before WP6 exempt candidates
+  counted against the budget, so any change that made more anchors exempt displaced tier-3
+  candidates that had been asked before — three labelled transfers on App B in the first
+  WP6 run. The cap is a cost bound, never a reason to drop evidence, and the accounting now
+  matches that.
+- `context.build_file_state` appends `state["callees"]` — one entry per hop with `file`,
+  `symbol`, `hop: 1`, `called_at` (caller lines), `members`, `granularity`, `capabilities`,
+  the hop's `sinks` and a `code_snippet` of the called members' bodies (file level: the
+  callee's sink-reference scopes) — and renders the same under a
+  `// First-party callees reached from the snippet (one hop):` section of `code_snippet`.
+  When the callee regions together exceed `MAX_CALLEE_SNIPPET_LINES = 40` only the sink
+  reference lines are rendered; a hop that reaches no transfer sink is listed with a one-line
+  note (so the model sees "handed to `Store.save`, which reaches no known transfer sink").
+  Callee sinks are also listed as `Callee.Sink` in `co_located_signals.network_transmission`.
+  A file whose anchors reach no callee produces a state byte-identical to the pre-WP6 form.
+  The `transmits_offdevice` questions of both batteries explain `callees` in one clause.
+- `evaluate` treats a callee sink as reachable from the scope: `nearest_sink` prefers an
+  in-scope same-file sink, then a callee sink, then an out-of-scope same-file sink, and the
+  evidence line becomes
+  `source@Caller.kt:L12-L15 (L13: …) -> sink@net/Uploader.kt:L7 OkHttpClient [NETWORK_EGRESS] (via Uploader called at L14)`;
+  `files_involved` lists the callee file after the anchor file; `sharing_sinks_in_scope`
+  includes callee IPC sinks (`Sharer.Intent`); `file_has_strong_egress` (the WP4 soft-gate
+  condition) counts callee sinks; the decision trace carries `callees` and the critic claim
+  names `Callee.Sink`.
+- Rollback: `CALLEE_RESOLUTION_ENABLED = False` skips the index and every hop (the
+  `callee_resolution` counter says `enabled: false`). `MAX_CALLEE_HOPS = 1` is recorded but
+  deeper chains are not implemented — they need a call graph, not a name index. Known limits:
+  Kotlin top-level functions and Dart/JS helpers (multi-class, snake-case files) are not
+  resolved; a member access on a lower-case receiver (`repo.upload(x)`) is not followed
+  because the receiver's type is not in the scope.
+
+**Triage.** `engine._filter_candidates` drops non-prioritised build flavours, excluded paths
+(`res/values*` string catalogs and `src/test*` source sets, which are not shipped), and
+anything past `MAX_CANDIDATES_PER_TYPE`. `engine._triage` ranks the remaining candidates of a
+data type by `(tier, proximity, scanner order)` and keeps `MAX_FINDINGS_PER_TYPE = 8` with at
+most `MAX_PER_FILE_PER_TYPE = 2` per file. Every dropped candidate is written to the triage
+file with its rank, tier, proximity and reason, so a reviewer can see exactly what was not
+asked and why.
+
+**Declared core purpose** (`engine._ask_app_purpose`, `questions.app_purpose_battery`, WP4).
+Several policies (foreground-service types, `MANAGE_EXTERNAL_STORAGE`, exact alarms, package
+visibility, accessibility, SMS/call log) are only satisfiable when the app's *core purpose* is
+one of a short list Play names in the policy. The evaluator asks that once per app, before any
+per-finding work, as a single `Choice` over a closed option set —
+`file_manager`, `backup_or_antivirus`, `alarm_or_timer`, `calendar`,
+`messaging_default_handler`, `accessibility_tool`, `media_gallery_or_editor`, `launcher`,
+`per_app_network_control`, `other`, `unknown` — with a compact state: app name, package,
+`targetSdk`, store category, the first 600 characters of the store description and the
+`AppProfile` digest (permissions, components, intent filters). The answer, its confidence and
+the full distribution are recorded in `typesafe_triage.json["app_purpose"]` with `source`
+`model` / `cache` / `human` / `unavailable`, and the label alone is copied into
+`app_facts["purpose"]` so every later finding-level state carries it (symbol-classification
+states do not: identifier capability is app-independent and the cross-app cache must stay
+purpose-free). Rules that make the answer safe to consume:
+
+- `evaluate.purpose_in(app_purpose, allowed)` is the only reader. It returns `False` for
+  `unknown`, for a missing answer, and for any model answer below
+  `CONF_APP_PURPOSE = 0.75`; only a human pin bypasses the confidence check. Low confidence
+  therefore reads as "purpose not established" → the policy treats the permission as
+  *unjustified* (higher severity, review), never as a reason to suppress or soften.
+- An answer outside the closed set, a transport failure or a malformed reply degrade to
+  `unknown` / `unavailable`, are counted (`app_purpose_error`) and the run continues.
+- The offline `HeuristicJevClient` always answers `unknown` (peaked distribution) — it is a
+  labelled stand-in, not a purpose classifier.
+- Cost is one request per cold run (`app_purpose_requests`); the cache key covers the whole
+  state, so a changed store listing, manifest or option wording re-asks instead of reusing a
+  stale answer. On the development set the model answers `file_manager` (App B, p = 1.00) and
+  `per_app_network_control` (App A), matching the apps' listings.
+
+**Batteries.** Kept candidates are grouped per file and sent in chunks of
+`MAX_ASKS_PER_REQUEST = 6` data types per request (question ids are namespaced
+`a<i>__<qid>`). The file state contains the anchored scope, the capability-labelled sink
+lines (`MAX_SINK_LINES_IN_STATE`), the app facts and declared capabilities. Each ask contains:
+
+| Question | Type | Used for |
+| --- | --- | --- |
+| `signal_relevant` — does this snippet read, hold, process, select, open or share *this* data type (the literal matched token is embedded; a MIME/picker filter that picks, opens or hands off files of that kind counts) | `Noul` | relevance gate at `T_RELEVANCE = 0.30`; drops semantic false positives such as a database `record` matching AUDIO |
+| `transmits_offdevice` — is the value sent off-device *or handed to another app* | `Noul` | three-way transfer decision |
+| `is_third_party`, `has_prominent_disclosure`, `is_core_functionality`, `user_initiated` | `Noul` | severity composition in code |
+| `disclosure_status` — DISCLOSED / MISSING / EXEMPT | `Choice` | policy routing, after reconciliation with `has_prominent_disclosure` (below) |
+
+**Soft relevance gate** (`evaluate.relevance_verdict`, WP2). A `signal_relevant` answer below
+`T_RELEVANCE` may *suppress* a finding only when the anchor's own scope has no
+capability-labelled egress or IPC sink (rank tier 2–3). With a sink in scope the code
+demonstrably hands data to a transfer channel, so the finding is kept, capped at IMPORTANT,
+marked `needs_manual_review`, suffixed `[data-type match uncertain: p=…; verify]` and traced
+as `relevance: "low"`. Below `T_RELEVANCE_FLOOR = 0.10` the model is confidently negative and
+the finding is dropped regardless (on the dev apps every keep under 0.10 was `track`→MUSIC,
+`record`→AUDIO or `PowerManager`→DIAGNOSTICS). Rollback: `RELEVANCE_SOFT_GATE_ENABLED`.
+
+A second condition (WP4, `RELEVANCE_SOFT_GATE_FILE_EGRESS`) keeps an uncertain answer when the
+*file* references a strong egress sink (`NETWORK_EGRESS`, `THIRD_PARTY_TELEMETRY`,
+`ADVERTISING_SDK`) outside the anchor's function. The evidence is weaker, so the verdict is
+distinct: traced as `relevance: "low_file_egress"`, and the evidence line shows the sink
+`(out of scope)`. IPC-only or `UNKNOWN` file sinks do not qualify (every Activity references
+`Intent`). It was added when a labelled credential transfer was lost to answer drift
+(`signal_relevant` 0.29 against 0.30 at a tier-3 anchor in a file whose network client sits in
+another method); on the development set it costs one extra review item per app.
+
+**Disclosure reconciliation** (`evaluate.reconcile_disclosure_status`, WP2). The battery asks
+about disclosure twice (a Noul and a Choice); when they disagree the Choice is the less stable
+one. `DISCLOSED` with `has_prominent_disclosure < T_DISCLOSURE` becomes `MISSING` + review;
+`EXEMPT` on an off-device transfer that is not user-initiated becomes `MISSING`. The change is
+traced as `decision_trace.disclosure_reconciled`. LOCAL decisions are EXEMPT in code and never
+reconciled.
+
+**Three-way transfer decision** (`evaluate.transfer_decision`):
+
+```
+p < T_TRANSMIT_LOW  (0.35)            -> LOCAL      is_transferred=False, SUGGESTION, prunable
+T_LOW <= p < T_TRANSMIT_HIGH (0.72)   -> UNCERTAIN  is_transferred=True,  >= IMPORTANT,
+                                                    needs_manual_review=True, never pruned,
+                                                    title suffixed "[transfer uncertain: p=..; verify]"
+p >= T_TRANSMIT_HIGH                  -> TRANSMITS  is_transferred=True, severity from booleans
+```
+
+`is_transferred=True` for UNCERTAIN is deliberate: `generate_report.py` only surfaces a
+MANUAL_REVIEW item in "needs review" when the finding is transferred, and an undeclared
+transferred type becomes a Data Safety discrepancy. Sharing (`is_third_party`) is set when a
+sink with a sharing capability is in scope **or** when the model classifies the destination
+as a sharing class (below), which is how IPC hand-offs reach the report as sharing.
+
+**Destination class (WP7)** (`questions.destination_class_question`,
+`evaluate.compose_destination`, `structure.destination_hints`). Before WP7 the data-safety
+battery asked one Noul, `is_third_party`, and the evaluator could only say "transfer" or
+"not a transfer". Half of the labelled transfers on the development set are not *collection*
+by the developer at all: an e-mail the user composes to a support address, a file the user
+shares through the system chooser, a document written into a SAF tree the user picked, a
+directory listing fetched from an SMB/FTP server the user typed in, a diagnostic string put on
+the clipboard. Every one of them scored UNCERTAIN or TRANSMITS and landed in the review queue at
+IMPORTANT or above. The battery now asks a closed Choice instead:
+
+| `destination_class` | Meaning | Composition |
+| --- | --- | --- |
+| `developer_backend` | The developer's own servers or an endpoint the developer controls | collection; `is_third_party = False` |
+| `third_party_sdk` | An SDK or service run by someone else (analytics, crash reporting, ads, cloud vendor) | collection **and** sharing; `is_third_party = True` |
+| `other_app_ipc` | Another app on the device via Intent, ContentProvider, broadcast, bound service | sharing; `is_third_party = True` |
+| `user_chosen_destination` | The user picks the recipient at run time (chooser, share sheet, compose UI, SAF tree, a server address the user configured) | not collection by the developer: `data_safety_section` becomes SUGGESTION, disclosure EXEMPT, `destination.applied = True` |
+| `platform_component` | An on-device system service (clipboard, notification, media store, system settings); nothing leaves the device | same as above |
+| `unknown` | The snippet does not show where the data goes | keep the transfer severity, `needs_manual_review`, summary suffixed `[destination unknown unconfirmed: conf=…; verify]` |
+
+The `is_third_party` field is kept on every finding — derived from the class — because
+`generate_report.py` (read-only in this change set) consumes it; the eval harness
+(`eval/run_eval.py`) derives it the same way through `evaluate.destination_from_answers`,
+which also accepts a legacy `is_third_party` Noul answer (`legacy: true` in the trace) so
+cached v1 answers still compose.
+
+- **Double gate for the downgrade.** A non-collection class lowers a severity, so it needs
+  more than the model's word. `compose_destination` only *applies* `user_chosen_destination`
+  or `platform_component` when the class confidence is at least `CONF_DESTINATION_ACT = 0.75`
+  **and** something in the state corroborates it: a `preference_or_ui_field` or `chooser`
+  destination hint inside the anchor's scope (`corroboration: "hint"`), `user_initiated >=
+  T_USER_INITIATED` (`"user_initiated"`), or for `platform_component` no strong egress sink in
+  `scope_capabilities ∪ callee_capabilities` (`"no_egress_in_scope"`). A class that fails the
+  gate keeps the transfer severity, is marked for review and says why
+  (`corroboration: "low_confidence"` / `"uncorroborated"`), so the report still surfaces it
+  and a reviewer sees what would have to be true for the downgrade. A LOCAL decision makes the
+  class moot (`"n/a"`). An applied non-collection class also clears `is_third_party`: the
+  chooser `Intent` in scope is a sharing-capable sink, but a hand-off to a destination the
+  user picked is not sharing *by the developer* in the Data Safety sense (trace
+  `destination_note` ends "not sharing"; `sharing_mass` and the sinks stay in the trace).
+- **Sharing is decided by probability mass, not by the argmax.** `is_third_party` is set when
+  the mass the Choice puts on `third_party_sdk + other_app_ipc` reaches
+  `T_SHARING_MASS = 0.50` ("more likely shared than not") or when a sharing-capable sink is in
+  the anchor's scope (the pre-WP7 static OR). The first WP7 live run showed why the argmax is
+  not enough: a nearly flat six-way distribution made `third_party_sdk` the argmax at 0.38 on
+  a developer-billing file and flipped the report's sharing flag. A sharing argmax below the
+  mass with no IPC sink in scope is traced as `corroboration: "low_sharing_mass"`,
+  review-flagged and suffixed `[sharing unconfirmed: third party sdk mass=0.34; verify]` —
+  never silently dropped. The bar is lower than the downgrade gate on purpose (sharing
+  raises, the downgrade lowers). A legacy `is_third_party` Noul keeps its own `T_THIRD_PARTY`
+  semantics exactly.
+- **Deterministic destination hints are priors, never decisions.** `structure.destination_hints`
+  scans an anchor's scope for three patterns and attaches them to the anchor
+  (`anchor.destination_hints`) and to `state["destination_hints"]` (only when non-empty, so
+  hint-free states are byte-identical to WP6): a user-source token (`getString(`, `EditText`,
+  `getStringExtra(`, `Preference`, …) on a line that names a destination-shaped identifier
+  (`host`, `url`, `endpoint`, `server`, … split at camel/snake boundaries so `securityPrefs`
+  does not match `url`) → `preference_or_ui_field`; a chooser or document-picker token
+  (`createChooser(`, `ACTION_SEND`, `ACTION_OPEN_DOCUMENT_TREE`, `ActivityResultContracts`,
+  …) → `chooser`; a URL literal → `developer_backend` when its host is under the app's own
+  package domain (`structure.developer_domains`: `com.example.app` → `example.com`,
+  `app.example.com`) else `constant_endpoint` with the host as `detail`. Comment and import
+  lines are skipped. The question text tells the model what each hint kind means and that the
+  hints are evidence to weigh, not the answer. The hints are also what the corroboration gate
+  reads, which is why they are computed in code and not asked.
+- **Trace.** `decision_trace.destination` records `class`, `confidence`, the full
+  `probabilities` dict, the `hints` seen, `sharing`, `sharing_mass`, `confirmed`,
+  `corroboration`, `applied`, `legacy` and `enabled`; `destination_note` explains any
+  composition change in one sentence; `thresholds` gains `CONF_DESTINATION_ACT`,
+  `T_SHARING_MASS` and `DESTINATION_CLASS_ENABLED`; the finding gains
+  `destination_class` and a purpose string per class ("User-chosen destination (user-directed
+  transfer; not collection by the developer)", "Shared with another app (IPC)", …).
+- **Stand-in client.** `HeuristicJevClient._destination_prior` (the offline stand-in, not the
+  model) answers from the hints and the strongest capability in scope so the selftest and
+  `--client heuristic` runs exercise every composition branch; it is labelled as a stand-in in
+  the code and its answers are never used in a live run.
+- Rollback: `DESTINATION_CLASS_ENABLED = False` keeps the question in the battery but
+  composes exactly as WP6 did (sharing from in-scope IPC sinks only, no downgrade, no review
+  suffix); `DESTINATION_HINTS_ENABLED = False` omits the hints from the state and the anchor
+  so the corroboration gate can only be satisfied by `user_initiated`.
+
+**Consent defaults, string resources and flavour attribution (WP8)**
+(`structure.guard_flags` / `declaration_of` / `string_references`, `context.anchor_guards` /
+`resolved_strings`, `questions.consent_default_question`, `evaluate.compose_consent`,
+`android_manifest.AppProfile.partial_sources`, `engine._attribute_sources`). Before WP8 the
+evaluator could say *that* a transfer is undisclosed but not *how it is enabled*: App A's
+crash-report upload runs only when `persistentState.crashReportsEnabled` is true, and that
+flag is declared `by booleanPreference(true)` in another file — the transfer is on by default,
+which is what makes the missing disclosure a Critical rather than an Important finding. The
+same code path, gated by a flag declared `false`, is an opt-in the reviewer should verify
+rather than a Critical. Nothing in the snippet or the battery carried that fact; the disclosure
+questions also saw `R.string.crash_consent_body` instead of the sentence the user reads.
+
+- **Guards are found and resolved in code.** `structure.guard_flags(lines, scope)` reads every
+  control-flow condition inside the anchor's scope (`if` / `else if` / `elif` / `while`,
+  single- or multi-line, Kotlin/Java/Python heads; `when (subject)` is a switch and is not
+  read), splits it at `&&` / `||` / `and` / `or` and keeps the clauses that are a boolean
+  *flag*: a bare, possibly negated, possibly dotted identifier (`!BuildConfig.DEBUG`,
+  `ps.crashReportsEnabled`), a no-argument member call (`settings.isTelemetryOn()`) or an
+  inline preference read with a literal default (`prefs.getBoolean("share_stats", true)`).
+  Comparisons, arithmetic, calls with arguments and literals are not flags, and neither are
+  standard-library predicates on collections, strings, nullness, files or lifecycle
+  (`isEmpty()`, `isNullOrBlank()`, `exists()`, `isFinishing` — `structure._NON_SETTING_MEMBERS`;
+  the first live run showed them crowding real flags out of the state cap). A guard whose body
+  leaves the block (`if (!enabled) { log(); return }`, `if (optedOut) return`, `throw`,
+  `break`, `continue`) protects the code *after* it, so its sense is inverted and recorded
+  (`early_exit: true`; App A's crash-report initializer is exactly this shape). Comment and
+  import lines are skipped; at most `MAX_GUARDS_IN_STATE = 6` per anchor, outermost first.
+  `structure.declaration_of(flag, fs, index, app_dir)` then
+  locates the flag's declaration and its initialiser: the inline `getBoolean` default is its own
+  declaration (`resolution: inline`); else the flag's own file (`same_file`); else, for a dotted
+  flag, the receiver's declared type (`val ps: PersistentState`, `inject<PersistentState>()`,
+  `PersistentState ps = …`) is resolved through the WP6 first-party index and that file is
+  searched — one hop, `MAX_GUARD_DECLARATION_HOPS = 1` (`receiver_type`). `default_on` is
+  True/False only when the initialiser holds exactly one boolean literal (`= true`,
+  `booleanPref(false)`, `getBoolean(k, true)`), otherwise None: the evaluator never guesses a
+  default it could not read. A default computed from an expression — App A's
+  `booleanPref("firebase_error_reporting").withDefault<Boolean>(Utilities.isPlayStoreFlavour())`
+  — is therefore `unknown`; the initialiser text still reaches the model and is quoted in the
+  evidence (`default=unknown init="…isPlayStoreFlavour()"`) so a reviewer sees what the default
+  depends on. Test source sets are never indexed, so a test double cannot supply the default.
+- **The model sees the guards, the composer sees `runs_by_default`.** `context.GuardState`
+  folds the flag's sense into the declared literal: `runs_by_default` is True when the transfer
+  runs while the flag keeps its declared default (`if (flag) send()` with `flag = true`;
+  `if (!flag) return` with `flag = true`), False for an opt-in (`if (flag) send()` with `flag =
+  false`, or `if (!optedIn) send()` with `optedIn = true`), None when the default is unknown.
+  `context.build_file_state` attaches `state["guards"]` — one flat list across the file's asks,
+  tagged `data_type`, each entry `{flag, line, runs_when, early_exit?, declaration{file, line,
+  text, initialiser, default_on, resolution}, default_on, runs_by_default}` — only when at least
+  one guard was found, so guard-free states are byte-identical to M2 (cache-friendly). The
+  mini-state anchor carries `guard_defaults` (the `runs_by_default` of every located
+  declaration) and the decision trace records it under `anchor.guard_defaults`.
+- **One new Noul, `consent_default_on`**, sits in the data-safety battery between
+  `user_initiated` and `destination_class`: "does the transfer happen unless the user has turned
+  it off?". Its instructions explain the `guards` block (`runs_when`, `default_on: null` =
+  unknown) and say the guards are evidence to weigh, not the answer. Adding a question changes
+  the battery text, so cached answers are re-asked once (the version bump is folded into M3
+  with WP10's question change, as M2 did for WP6/WP7).
+- **Asymmetric composition (`evaluate.compose_consent`).** Only an undisclosed transfer
+  (`transmits` and `disclosure_status == MISSING`, and not a destination already applied as
+  inventory) is affected. *Raise* IMPORTANT → CRITICAL — TRANSMITS decisions only — when `p >=
+  T_CONSENT_DEFAULT_ON = 0.60` and no guard keeps the transfer off by default; the
+  corroboration names the deterministic fact that agrees — `guard_default_on`, `unconditional`
+  (no guard at all) or `model_only` (only unresolved guards; severity already derives from the
+  model's booleans and the finding is undisclosed). An UNCERTAIN decision is capped at
+  IMPORTANT by `derive_data_safety_severity` ("the evaluator does not assert a Critical it
+  cannot support"), so the default-on answer is recorded (`consent_default_on: true`,
+  `capped_by: uncertain_band`, note "severity stays capped at IMPORTANT") and the severity
+  stands — the first live run raised 17 UNCERTAIN findings on App A before this cap was
+  enforced. The same holds for a TRANSMITS whose destination class is still unresolved
+  (`capped_by: unresolved_destination`, note "severity unchanged"): "collection enabled by
+  default" is only a Critical once the evaluator knows the data leaves for a destination it can
+  name — the second live run raised two unconfirmed `user_chosen_destination` findings on App B
+  before this cap was added. A guard
+  with `runs_by_default == False` *vetoes* the model's default-on claim: severity unchanged,
+  `corroboration: vetoed_by_guard`, review flag, summary suffix `[consent default unclear: model
+  default-on vs guard default-off; verify]`. *Lower* to SUGGESTION (either band) only through
+  a double gate: `p <= 1 - CONF_CONSENT_ACT` (0.25) **and** a guard with `runs_by_default ==
+  False` (`guard_default_off`); the finding keeps `prominent_disclosure_policy` and
+  `prominent_disclosure_status: MISSING` because an opt-in toggle is not a prominent
+  disclosure, is review-flagged and suffixed `[opt-in: <flag> off by default; verify toggle
+  text]`. A confident "opt-in" with no such guard is `uncorroborated`, a mid-band answer
+  `low_confidence`; neither changes anything. A sensitive type that is already CRITICAL keeps
+  its severity (`action: none`) but still records `consent_default_on: true`.
+- **Evidence and trace.** When guards exist the evidence line gains ` [guard <flag>
+  default=<true|false|unknown> @<file>:L<n>]` for the deciding guard (the first that keeps the
+  transfer off, else the first located declaration), with `init="…"` when the default is not a
+  literal and `runs when false` when the flag's sense is inverted; `evidence_flow.guards` lists
+  them all with `runs_when`, `default_on` and `runs_by_default`. The finding gains
+  `consent_default_on` (True/False/None); `decision_trace.consent` records `p_default_on`,
+  `guards` (with `declaration` as `file:Ln`), `guard_defaults`, `default_on`, `action`,
+  `corroboration`, `capped_by` and `enabled`; `consent_note` explains any change in one
+  sentence; `thresholds` gains `T_CONSENT_DEFAULT_ON` and `CONF_CONSENT_ACT`.
+- **String resources reach the disclosure questions.** `context.resolved_strings` resolves
+  every `R.string.<name>` on the anchor scope's lines and on the file's disclosure-symbol lines
+  — each widened forward by `DISCLOSURE_STRING_WINDOW = 4` lines so a builder chain's
+  `.setMessage(R.string.x)` on the line after `AlertDialog.Builder(...)` is read too —
+  through the profile's default-locale `resources.ResourceIndex` into `state["strings"]`
+  (`name -> text`, `None` when the name is not in the default locale; capped at
+  `MAX_STRINGS_IN_STATE = 8`; present only when non-empty). `has_prominent_disclosure` and
+  `disclosure_status` now name `strings` so the model judges the dialog wording rather than
+  the resource identifier.
+- **Flavour attribution.** `AppProfile.partial_sources(entry)` returns the shipped source sets
+  that declare a permission or component when they are a strict subset of the build (`["play"]`
+  for a `play`-only permission; None for anything in `main`, declared everywhere or without
+  source attribution). `engine._attribute_sources` sets `finding["manifest_sources"]` (and the
+  same in the trace, counter `manifest_sources_attributed`) on manifest findings (from the
+  trace's `permission` / `service`) and on permission-goal code findings through
+  `constants.POLICY_PERMISSIONS` (location / contacts / audio), so a reviewer sees "this only
+  affects the Play flavour" without reading the manifests.
+- **Stand-in client.** `HeuristicJevClient._consent_prior` answers from `runs_by_default` of the
+  guards in the state (any False → 0.15, any True or no guard → 0.85, else 0.5); labelled as a
+  stand-in, never used in a live run.
+- Rollback: `CONSENT_DEFAULT_ENABLED = False` keeps the question, traces the Noul and guards,
+  and composes exactly as M2 did; `GUARDS_ENABLED = False` omits `guards` from the state (the
+  raise then relies on `unconditional` only and no lower is possible);
+  `STRING_RESOLUTION_ENABLED = False` omits `strings`; `PERMISSION_ATTRIBUTION_ENABLED = False`
+  omits `manifest_sources`.
+
+**Wave-2 storage policies: photos/videos and files/docs (WP9)**
+(`registry._photo_video_findings` / `_files_and_docs_findings` / `_photo_video_code_spec` /
+`_files_and_docs_code_spec`, `structure.external_storage_paths` / `media_access_hints` /
+`code_portion`, `context.file_storage_hints` / `has_storage_write_hint`,
+`questions.photo_video_battery` / `files_and_docs_battery`,
+`evaluate.compose_photo_video_finding` / `compose_files_and_docs_finding`,
+`engine._plan_from_candidates` gates). Before WP9 the evaluator had no policy for the two
+storage permission families Play reviews most often: an app that still requests
+`READ_EXTERNAL_STORAGE` / `WRITE_EXTERNAL_STORAGE` without a `maxSdkVersion` cap on a modern
+target, an app that reads the whole media library when the Photo Picker would do, and an app
+that creates its own folder at the root of shared storage. App B (a file manager) does all
+three, and the legacy skill reported them; v2 was silent. The plan's matrix
+(`resources/goal_permissions_and_apis.md`) fixes the severities; the purpose from WP4 decides
+whether broad access is *justified*.
+
+- **Manifest rules are deterministic and read the merged profile.** `photo_video_access_policy`:
+  an uncapped `READ_EXTERNAL_STORAGE` while any shipped flavour targets `>= 33`
+  (`PHOTO_PICKER_TARGET_SDK`) → **Important** (`rule: legacy_read_uncapped_on_33_plus`; the
+  evidence says whether a `READ_MEDIA_*` companion exists — without one the permission "grants
+  nothing" on 33+ — and, when another flavour still targets `<= 32`, adds "the build targeting
+  API 29 still uses it"); any broad media permission (`READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO`,
+  or the legacy read permission where it is still effective) → Suggestion when the established
+  purpose is in `PHOTO_VIDEO_PURPOSES` (gallery/editor, backup/antivirus, file manager), else
+  **Important** (review-marked when the purpose is not established) (`broad_media_purpose`);
+  `READ_MEDIA_IMAGES` / `VIDEO` on `>= 34` without `READ_MEDIA_VISUAL_USER_SELECTED` →
+  Suggestion (`missing_visual_user_selected`). `files_and_docs_policy`: an uncapped
+  `WRITE_EXTERNAL_STORAGE` on `>= 30` (`SCOPED_STORAGE_TARGET_SDK`) → **Important**
+  (`legacy_write_uncapped_on_30_plus`); `android:requestLegacyExternalStorage="true"` on
+  `>= 30` → Suggestion (`legacy_storage_flag_on_30_plus`, evidence names the source set that
+  sets it). Capped permissions, a `32` / `29` target, and absent permissions are silent
+  (boundary checks in selftest). Every rule is traced as `decision_trace.rule` with the
+  values it read.
+- **Two deterministic hint families feed two Nouls.** `structure.external_storage_paths`
+  finds lines that name the shared-storage root (`getExternalStorageDirectory(`, `"/sdcard`,
+  `"/storage/emulated/0`) or a public directory (`getExternalStoragePublicDirectory(`,
+  `DIRECTORY_DOWNLOADS`…), follows `STORAGE_HINT_WINDOW = 6` lines (stopping at the block's
+  closing brace) and records whether a path is *composed* from the root (`File(`, `+ "`,
+  `resolve(`, `separator`) and whether that window *writes* (`mkdir(s)`, `createNewFile(`,
+  `FileOutputStream(`, `renameTo(`, `Files.write(`…): strength `writes` > `composes` >
+  `references`. App-specific directories (`getExternalFilesDir`) are never hints — scoped
+  storage is exactly what they are for — and comment / import lines are skipped.
+  `structure.media_access_hints` reads an anchor's scope for a MediaStore collection token
+  *and* a query token within the window (`LIBRARY_QUERY`) or a picker token
+  (`ACTION_PICK_IMAGES`, `PickVisualMedia`, `ACTION_OPEN_DOCUMENT`… → `USER_PICK`); a
+  collection constant alone is not a query. `context.build_file_state` attaches
+  `state["external_storage_paths"]` (per file, strongest first, nearest anchor next, capped
+  at `MAX_STORAGE_HINTS_IN_STATE = 6`) and `state["media_access_hints"]` (per anchor,
+  `data_type`-tagged, capped at `MAX_MEDIA_HINTS_IN_STATE`) only when non-empty, so hint-free
+  states are byte-identical to WP8. The Nouls: `accesses_full_media_library` (with the usual
+  `signal_relevant` gate) and `creates_root_level_external_folder` (no relevance gate: the
+  question is about the file, not the token). Their instructions explain the hint blocks and
+  say the hints are evidence, not the answer.
+- **Three planner gates keep the questions cheap and honest (`PolicySpec.requires_permissions`,
+  `applies_file`, `one_per_file`).** The photo/video code question is asked only when one of
+  `READ_MEDIA_IMAGES` / `READ_MEDIA_VIDEO` / `READ_EXTERNAL_STORAGE` ships in the Play build
+  (App A ships none, so its 2 MEDIA/PHOTOS candidates are dropped with the reason `none of
+  [...] ships in the Play build`); the root-folder question only for a file whose hints
+  compose or write a root path (`context.has_storage_write_hint`; a bare
+  `path.startsWith(root)` does not activate it); both are asked **once per file** (the first
+  candidate in triage rank order carries it; the rest are dropped `asked once per file`).
+  Every drop is written to `typesafe_triage.json["dropped"]`, and the counters
+  `planner_gated` / `tasks_per_policy` show the effect per policy. Specs that need the
+  once-per-app purpose declare `needs_app_purpose` and receive it as the `app_purpose=`
+  keyword of `compose`.
+- **Composition is asymmetric and double-gated, like WP7/WP8.** `compose_photo_video_finding`
+  reads `p_full_library` into a mode (`full_library` ≥ `T_FULL_MEDIA_LIBRARY = 0.60`,
+  `user_selected` ≤ 0.40, else `uncertain`) and checks it against the deterministic hints
+  (`corroborated` when a `LIBRARY_QUERY` hint agrees with full-library or a `USER_PICK` hint
+  with user-selected; `contradicted` when they disagree → review flag and the suffix
+  `[deterministic hint X disagrees; verify]`). A justified purpose (`PHOTO_VIDEO_PURPOSES`)
+  with confirmed user-selected access composes **nothing** — that is the compliant path —
+  unless a `LIBRARY_QUERY` hint contradicts it, in which case a SUGGESTION is kept for review;
+  justified full-library → SUGGESTION ("confirm the Play Console declaration"); an
+  unjustified purpose → **Important** in every mode ("use the Photo Picker"); `uncertain`
+  is review-marked and stays at or below Important; an unestablished purpose adds review.
+  `compose_files_and_docs_finding` composes nothing when the state has no storage hint
+  (recall is carried by the planner gate, not by the model); `confirmed` (`p >=
+  T_ROOT_LEVEL_FOLDER = 0.60`) → **Important**, or SUGGESTION when the purpose is in
+  `ALL_FILES_ACCESS_PURPOSES` (a file manager legitimately manages folders — the evidence says
+  "file-management purpose: scoped alternative suggested"); `uncertain` → SUGGESTION + review;
+  `denied` → nothing **only if** no deterministic hint writes (double gate), otherwise
+  SUGGESTION + review with "model disagrees" in the summary. The evidence is the hint line
+  itself (`Utils.java:L668 — parent_dir = new File(Environment.getExternalStorageDirectory()…)
+  … temp_dir.mkdirs(); [STORAGE_ROOT, writes]`), not the scanner's token line, because the
+  folder is created where the path is composed. Traces: `decision_trace.media_access`
+  (`p_full_library`, `mode`, `hints`, `corroborated`, `contradicted`, threshold) and
+  `decision_trace.root_folder` (`p_root_level`, `mode`, `hints`, `deterministic_write`,
+  threshold); both record `app_purpose`, `justified_by_purpose` and `allowed_purposes`; the
+  finding carries `media_access_mode` / `root_folder_mode`.
+- **A trailing comment is not a value use.** The first live run anchored two photo/video
+  questions on `String TAG = "ContentAdapter";  // MediaStore`: the WP2 lexical classifier
+  demoted full-line comments but read a trailing `// MediaStore` as an identifier use, and the
+  one-per-file gate then carried the file's question on that line. `structure.code_portion`
+  now strips a trailing `//` or `/*` comment that is outside every string literal (URLs such
+  as `"http://host"` survive) before `lexical_hits` classifies a line, so the mention is
+  `demoted` and the anchor lands on the real query. This applies to every identifier pattern,
+  not only wave 2.
+- **Stand-in client.** `HeuristicJevClient._storage_priors` answers both Nouls from the hint
+  blocks in the state (`LIBRARY_QUERY` → 0.85, `USER_PICK` only → 0.15; `writes` → 0.85,
+  `composes` → 0.5, `references` → 0.15; 0.5 without hints) so offline runs and the selftest
+  exercise every composition branch; labelled as a stand-in, never used in a live run.
+- Rollback: `PHOTO_VIDEO_POLICY_ENABLED` / `FILES_AND_DOCS_POLICY_ENABLED = False` remove the
+  four specs from `REGISTRY` (no manifest rules, no questions, no gates);
+  `STORAGE_HINTS_ENABLED` / `MEDIA_HINTS_ENABLED = False` omit the hint blocks from the state
+  (the root-folder question is then never activated; the media question composes without
+  corroboration).
+
+**Confirming the data type (WP10, L7)**
+(`taxonomy.py`, `questions.data_type_confirmed_question`, `evaluate.compose_type_confirmation`,
+`calibrate.type_confirmation_report`). The scanner labels a candidate by token: `uid` is
+`USER_ACCOUNT`, `email` is `EMAILS`, a `.jpg` path is `PHOTOS`. The label is often right and
+sometimes not — an Android app UID is not a user account, an SSH key file is not a photo, a
+share login is a user ID rather than a name — and before WP10 every downstream decision
+(sensitivity, severity, the Data Safety category the finding names) was composed on the
+scanner's guess. The legacy skill's most frequent manual relabel was exactly this. WP10 asks
+the model one closed question and composes on the answer without letting a judgement remove
+a finding.
+
+- **The question is closed and taxonomy-driven.** `taxonomy.load()` reads the Data Safety
+  taxonomy from `resources/policies.json` once (`lru_cache`; an unreadable file logs a warning
+  and yields an empty taxonomy, which disables the question's options rather than the run).
+  `taxonomy.siblings(data_type)` returns the alternatives a reviewer would actually consider:
+  the type's confusion siblings first (`constants.TYPE_CONFUSION_SIBLINGS`, e.g.
+  `USER_ACCOUNT → DEVICE_ID, NAME, …`), then the other types in the same category, capped at
+  `MAX_TYPE_SIBLING_OPTIONS = 6`. `data_type_confirmed_question` offers `as_labelled`, those
+  siblings, `NOT_PERSONAL` ("the value is not personal data — an app UID, a package name, a
+  developer constant") and `unknown`, each with the taxonomy's own description, and asks "what
+  is the value at the anchor, really?". It sits in the data-safety battery immediately after
+  `signal_relevant` (before `transmits_offdevice`) so the model settles what the value is
+  before it reasons about where it goes.
+- **Read only in band.** `compose_type_confirmation` reads the answer only when the transfer
+  is at or above `T_TRANSMIT_LOW` (`transmits`); below the band the finding is local inventory
+  and the label is moot (`read: false` in the trace). An answer below `CONF_TYPE_CONFIRM =
+  0.75`, `as_labelled`, or an option the taxonomy does not know (stale cache, edited
+  question) composes as labelled and is traced only.
+- **Composition follows the charter's asymmetry.** A sibling type at or above the bar
+  **relabels**: the finding is composed on that type throughout — `psl_constant`, category,
+  display name, sensitivity, summary, the Play declaration check — and `scanner_data_type`
+  keeps the original so labels and diffs still join. A relabel that *raises* severity applies
+  in full (`EMAIL → EMAILS`, a more sensitive type is more of a finding); one that would
+  *lower* it moves one step at most (CRITICAL → IMPORTANT), sets `lowered`, flags review and
+  is reported as disputed. `NOT_PERSONAL` keeps the finding and the scanner's type (a model
+  judgement never removes a finding; the inventory stays as the scanner saw it), caps severity
+  at IMPORTANT and routes to review with the note "model says the value is not personal data
+  (conf=…); finding kept as labelled, severity capped at IMPORTANT, review" — the reviewer, not
+  the model, decides an app UID is not a user account. `unknown` flags review. A consent
+  raise (WP8) on a disputed type is capped (`capped_by: disputed_type`): the evaluator does not
+  assert a Critical on a type it is not sure of.
+- **Evidence and trace.** The finding gains `scanner_data_type`, `data_type_confirmed` (the
+  raw answer), `confirmed_type` (the effective type) and `psl_constant` set to the effective
+  type; `decision_trace.type_confirmation` records `answer`, `confidence`, `read`, `action`
+  (`as_labelled` / `relabelled` / `not_personal` / `unknown`), `effective_type`, `lowered`,
+  `review`, and `type_note` explains any change in one sentence; `thresholds` gains
+  `CONF_TYPE_CONFIRM`. The summary is suffixed `[type: X -> Y conf=…]` (plus `; verify` when
+  the relabel lowered the severity), `[type disputed: not personal data per model conf=…;
+  verify]` or `[type unclear conf=…; verify]`. `typesafe_triage.json["type_confirmations"]` lists every
+  non-`as_labelled` answer (`file`, `scanner_type`, `answer`, `effective_type`, `confidence`,
+  `lowered`) and the counter `type_confirmations` gives the per-run split.
+- **Calibration.** `calibrate --rejoin` joins labels through `scanner_data_type` (falling back
+  to `psl_constant`) so a relabelled finding still meets its label, accepts an optional
+  `confirmed_type` on a label, and prints a `type_confirmation` block: the
+  labelled-vs-confirmed confusion table, `accuracy`, `n_labelled_confirmed_type`,
+  `missed_relabels` (label says a different type, run composed as labelled), `wrong_relabels`
+  (label confirms the scanner's type, run relabelled or disputed) and `not_read`. A
+  `wrong_relabels` entry is a warning, not an error: the finding is still in the report.
+- **What it did on the dev apps.** All six App A adapter `uid` findings (`USER_ACCOUNT`) came
+  back `NOT_PERSONAL` at p 0.83–0.99 and are now IMPORTANT + review with a `type_note` instead
+  of silent Important findings; `CrashReporter.kt` relabelled `PERFORMANCE_DIAGNOSTICS →
+  CRASH_LOGS` (p 1.00); App B relabelled `KeysActivity.java PHOTOS → FILES_AND_DOCS` (p 0.86,
+  SSH key files) and `SMBAdapter.java NAME → USER_ACCOUNT` (p 0.99, a share login). Two App A
+  `EMAILS` cases (the developer's support address placed in an `ACTION_SENDTO` chooser) came
+  back `NOT_PERSONAL` against labels that say `EMAILS`; the labels were not changed to fit the
+  model and both findings stay in the report as labelled with review. Recall 48/48; type
+  confirmation accuracy 0.938 over the labelled set.
+- **Stand-in client.** `HeuristicJevClient` answers `as_labelled` (peaked) for every
+  `data_type_confirmed` question so offline runs and the selftest compose as before; the
+  selftest exercises every other branch by hand-built answers. Labelled as a stand-in, never
+  used in a live run.
+- Rollback: `DATA_TYPE_CONFIRMED_ENABLED = False` removes the question from the battery
+  (cached answers for the previous battery text become valid again) and composes exactly as
+  WP9 did.
+
+**Play declaration check** (`_run_play_declaration`) runs only for TRANSMITS findings and only
+when a Play declaration is present; UNCERTAIN findings are not turned into Non-Compliant
+verdicts on their own.
+
+**Manifest checks** (`_run_manifest`) are deterministic and bypass the critic. Each
+`MANIFEST`-kind spec receives `registry.ManifestInputs` — the merged `AppProfile` (WP1), the
+legacy `manifest_details` dict as fallback, the cached `declared_core_purpose` answer (WP4)
+and the app root — and returns zero or more findings with `client = "deterministic"`,
+`kind = "manifest"` and a `decision_trace` holding the facts it read. Only components and
+permissions that ship in the Play build are examined. Wave 1 (WP5):
+
+| Policy | Rule (severity) |
+| --- | --- |
+| `foreground_services_policy` | typeless service whose own class calls `startForeground` on `targetSdk >= 34` → **Critical** (the branch the legacy input made unreachable: `manifest_details.foreground_services` listed only typed services); `specialUse` without `PROPERTY_SPECIAL_USE_FGS_SUBTYPE` → **Critical**; type without its `FOREGROUND_SERVICE_<TYPE>` permission → Important; type whose definition the *established* purpose clearly falls outside (`constants.FGS_TYPE_MISALIGNED_PURPOSES`) → Important; every typed service → Suggestion inventory; `FOREGROUND_SERVICE_SPECIAL_USE` with no `specialUse` service → Suggestion |
+| `all_files_access_policy` | `MANAGE_EXTERNAL_STORAGE`: purpose in `ALL_FILES_ACCESS_PURPOSES` → Suggestion, otherwise **Critical** (review-marked when the purpose is not established); plus scoped media / uncapped legacy storage permissions → Important (redundant scope) |
+| `package_visibility_policy` | `QUERY_ALL_PACKAGES`: `<queries>` also declared → Important; purpose in `PACKAGE_VISIBILITY_PURPOSES` → Suggestion; otherwise Important (review-marked when not established) |
+| `exact_alarm_policy` | `USE_EXACT_ALARM`: purpose in `EXACT_ALARM_PURPOSES` → Suggestion, otherwise Important; `SCHEDULE_EXACT_ALARM` → Suggestion |
+| `target_api_level` | lowest `targetSdk` among the shipped flavours: `< PLAY_EXISTING_APP_MIN_TARGET_SDK` → **Critical**, `< PLAY_REQUIRED_TARGET_SDK` → Important, unknown → Suggestion + review. The requirement is a dated constant (`PLAY_TARGET_SDK_PROVENANCE`), never a model question |
+| `photo_video_access_policy` (WP9) | uncapped `READ_EXTERNAL_STORAGE` on a `>= 33` target → Important; broad media permission: purpose in `PHOTO_VIDEO_PURPOSES` → Suggestion, otherwise Important (review-marked when not established); `READ_MEDIA_IMAGES`/`VIDEO` on `>= 34` without `READ_MEDIA_VISUAL_USER_SELECTED` → Suggestion |
+| `files_and_docs_policy` (WP9) | uncapped `WRITE_EXTERNAL_STORAGE` on a `>= 30` target → Important; `requestLegacyExternalStorage="true"` on `>= 30` → Suggestion |
+
+Purpose conditioning goes through `evaluate.purpose_in` only, so an `unknown`, `other` or
+low-confidence purpose can raise a severity (and marks the finding for review) but never
+lowers one. The one code fact a manifest policy reads — `startForeground` in the service's own
+class file — is an exact-identifier match (`structure.value_reference_lines`) that ignores
+comments, imports and `startForegroundService`; a base-class call is not resolved, so a miss
+means "not confirmed", never "not a foreground service".
+
+**Critic** (`evaluate.evaluate_critic_chunk`) verifies one atomic claim per finding, the
+transfer claim ("this snippet sends or shares <data type>"), against the anchored evidence
+plus sink lines, instead of the compound "does the evidence support the whole finding". The
+routing (`evaluate._critic_decision`) is recall-weighted:
+
+| Finding decision | `evidence_shows_transfer` | Verdict |
+| --- | --- | --- |
+| TRANSMITS | >= `CONF_ACT` (0.75) | VERIFIED, High |
+| TRANSMITS | >= `T_EVIDENCE_SUPPORTS` (0.50) | VERIFIED, Medium |
+| TRANSMITS | < 1 - `CONF_ACT` (0.25) | PRUNED, High (strong evidence of a false positive) |
+| TRANSMITS | otherwise | MANUAL_REVIEW, Low |
+| UNCERTAIN | >= `CONF_ACT` | VERIFIED, Medium (the critic saw the flow the battery was unsure about) |
+| UNCERTAIN | otherwise | MANUAL_REVIEW, Low; never PRUNED |
+
+Findings already marked `needs_manual_review` are routed without a model call.
+
+**Structured evidence (WP3).** `finding["evidence"]` reads
+`source@<file>:L<start>-L<end> (L<line>: <matched>) -> sink@L<n> <Symbol> [<CAPS>]`: the
+anchor's whole function, the matched line, and the nearest capability-labelled *transfer*
+sink (`(out of scope)` when it lies outside that function). Files without a transfer sink keep
+the single-line `<file>:L<n> — <matched>` form. `finding["evidence_flow"]` carries the same
+facts as a dict (`source`, `sink`) for downstream tooling; the finding's top-level
+`destination_class` (WP7) says where the sink sends the data.
+
+**Decision trace.** Each finding's `decision_trace` records `scores` (every probability),
+`thresholds` (the values in force), `anchor` (file, line, scope, `scope_capabilities`,
+`rank_tier`, proximity, `lexical` verdict, `destination_hints`, `guard_defaults` (WP8),
+`media_hints` (WP9)), `sinks`, `relevance` (`ok`/`low`), `disclosure_reconciled`,
+`destination` (WP7), `consent` (WP8), `media_access` / `root_folder` (WP9),
+`type_confirmation` / `type_note` (WP10), `model`, `taxonomy_version` and `evaluator_version`.
+
+### 3.4 Triage file (`typesafe_triage.json`)
+
+Written next to the worker files on every run. Keys: `evaluator_version`, `model`,
+`counters` (raw signals, candidates, kept, files analysed, imports first-party skipped,
+third-party, packages, refined, dependencies, capability-cache hits/misses,
+`lexical_pregate{checked, kept_*, dropped_*, files_pruned}`, `cap_exempt_sink_in_scope`,
+`app_purpose_requests` / `app_purpose_error`, and the WP6 hop counters
+`first_party_index{names, ambiguous, packages}`,
+`callee_resolution{enabled, callers_checked, callers_with_callees, references, callee_files, resolution{import, same_package, unique, nearest}}`,
+`callee_refs` (per caller file: the resolved callees with `symbol`, `file`, `lines`,
+`resolution`), `imports_from_callees`, `anchors_with_callees`,
+`anchors_tier_raised_by_callee`, `cap_exempt_callee_only`),
+`app_profile` (WP1), `app_purpose` (WP4: `purpose`, `confidence`, `source`, `probabilities`,
+`digest`), `usage`
+(requests, tokens), `findings_by_severity`, `transfer_decisions`, `capabilities` (label
+histogram and unknown count), `dependency_capabilities`, `sinks_by_file`, `thresholds`,
+`dropped` (every candidate not asked, with reason and rank data), and `type_confirmations`
+(WP10: every finding whose `data_type_confirmed` answer was not `as_labelled`, with the
+counter `type_confirmations{as_labelled, relabelled, not_personal, unknown}`). This is the
+observability surface for the run; the legacy pipeline had none.
+
+## 4. Calibration (`calibrate.py`)
+
+Input is a JSON label set kept **out of the repository** (it names real files of real apps):
+
+```json
+{"description": "...",
+ "worker_dirs": ["/path/to/run_a", "/path/to/run_b"],
+ "cases": [{"file": "Foo.kt", "data_type": "DEVICE_ID", "transfers": true, "p_transmit": 0.87}]}
+```
+
+`p_transmit` may be omitted and is then joined from the worker files by file suffix and data
+type (max probability). The method:
+
+- `T_TRANSMIT_LOW` = highest threshold on the 0.01 grid with recall 1.0 (no true transfer
+  falls into LOCAL).
+- `T_TRANSMIT_HIGH` = lowest threshold with precision >= `--min-precision` (0.90) among
+  findings at or above it.
+- Reliability: Brier score, expected calibration error and per-bin table.
+- Metrics at the derived band and at the constants currently in `constants.py`, plus a
+  `provenance` block ready to paste into `THRESHOLD_PROVENANCE`.
+
+A warning is emitted below `MIN_RECOMMENDED_CASES = 30`.
+
+**Re-join as a recall gate (WP2).** `calibrate <labels> --rejoin --worker-dir A --worker-dir B`
+ignores the frozen `p_transmit` values and re-joins every case to the worker files of a new
+run. A labelled *transfer* with no finding is a recall loss by construction: it is listed in
+`missing_positives`, logged at ERROR, printed as `FAIL`, and the command exits 2. Every work
+package runs this against both development apps before it is committed; the band and
+reliability numbers it reports are recorded but only *applied* to `constants.py` at a
+milestone with the version bump.
+
+**Label schema v2 (WP7).** Every `transfers: true` case may carry `destination_class` (one of
+the five non-`unknown` classes above); non-transfers omit it; v1 label files without the field
+still work. In `--rejoin` mode the join copies the run's own `destination_class`,
+`is_third_party`, `transfer_decision`, `severity`, and the trace's `destination_confirmed` /
+`destination_applied` onto each case (`run_*` fields), and the report gains:
+
+- `reliability_by_class` — Brier / ECE / mean `p_transmit` per labelled class (non-transfers
+  are grouped as `none`), which shows *which kind* of transfer the model is unsure about.
+- `reliability_in_band` (current constants) and `reliability_in_derived_band` — Brier / ECE
+  restricted to the UNCERTAIN band, the number WP7's exit criterion compares against WP6.
+- `destination` — per-class precision / recall / support, the confusion matrix,
+  `sharing_agreement` (labelled sharing class ⇔ run `is_third_party`), `sharing_regressions`
+  (a labelled sharing transfer the run did not mark `is_third_party`; each one is a warning
+  and the command exits 3 — a downgrade that loses a sharing disclosure is a recall loss in
+  the Data Safety sense), `applied_downgrades` and `applied_downgrades_wrong` (a downgrade the
+  run *applied* on a case whose label is a collection class).
+
+### 4.1 Result on the development set
+
+48 hand-adjudicated claims (23 true transfers) drawn from the evaluator's own evidence traces
+on two open-source apps; test source sets and ambiguous anchors excluded; IPC hand-offs
+counted as sharing unless the user chose the recipient (label schema v2).
+
+**At M2 (`2.1.0-capability`, after WP6 + WP7, `calibrate --rejoin` on both apps):**
+
+| | derived | shipped |
+| --- | --- | --- |
+| `T_TRANSMIT_LOW` | 0.41 | 0.35 |
+| `T_TRANSMIT_HIGH` | 0.72 | 0.72 |
+| false negatives in LOCAL (off-device transfers) | 0 | 0 |
+| `platform_component` transfers in LOCAL (recall-exempt) | 1 | 1 |
+| precision of TRANSMITS | 0.933 | 0.933 |
+| recall of TRANSMITS alone | 0.609 | 0.609 |
+| abstention (UNCERTAIN) rate | 0.521 | 0.562 |
+| Brier / ECE, all cases | 0.1797 / 0.2233 | same |
+| Brier / ECE inside the band | 0.2472 / 0.2564 | 0.2387 / 0.2644 |
+| destination accuracy / sharing agreement | 0.826 / 0.783 | same |
+
+0.35 keeps a 0.06 margin under the lowest-scoring off-device true transfer (a file handed to
+a SAF document tree, which has scored 0.38 / 0.40 / 0.41 across three runs). `T_TRANSMIT_HIGH`
+moved 0.70 → 0.72 because one labelled non-transfer (locally stored stream-server credentials)
+scores 0.71: at 0.70 precision is 0.895 against the 0.90 target, and TRANSMITS drives
+Non-Compliant verdicts. Three true transfers sit at exactly 0.71 and are therefore UNCERTAIN
+— surfaced for review and still `is_transferred` — which is why abstention (0.562) misses the
+M2 target of 0.50; on 48 cases the two criteria cannot both hold and precision was preferred
+per the charter ordering. In-band ECE at the shipped band improved from 0.281 (WP5 run) to
+0.264. Every band edge is decided by a single case; revisit once the label set exceeds about
+100 cases.
+
+**At `2.0.0-capability` (before WP6 / WP7), for reference:**
+
+| | derived | shipped |
+| --- | --- | --- |
+| `T_TRANSMIT_LOW` | 0.38 | 0.35 |
+| `T_TRANSMIT_HIGH` | 0.60 | 0.70 |
+| false negatives in LOCAL | 0 | 0 |
+| precision of TRANSMITS | 0.909 | 0.944 |
+| recall of TRANSMITS alone | 0.87 | 0.739 |
+| abstention (UNCERTAIN) rate | 0.479 | 0.625 |
+| Brier / ECE | 0.1785 / 0.2552 | same |
+
+That shipped band was deliberately wider than the derived one: the derived upper bound rested
+on a probability bin with four cases, too thin to move the threshold that drives Non-Compliant
+verdicts, and the 0.5-0.6 bin was over-confident (14 cases, none a real transfer).
+
+## 5. Results on the development set (regression check, not a hold-out)
+
+| | App A (published, VPN/DNS) | App B (unpublished, file manager) |
+| --- | --- | --- |
+| Legacy skill | Non-Compliant (3 Critical: purchase token, device id, crash upload) | Compliant + note to declare User IDs |
+| Hybrid v1 | Compliant (all 3 missed) | Compliant (credential send dropped) |
+| Hybrid v2 | Non-Compliant (13 Important; all 3 legacy items recovered as TRANSMITS + Data Safety discrepancies, plus Emails and Files via IPC) | Needs Review (credential send over a socket p=0.90 VERIFIED; SMB credentials 0.62-0.77; media hand-offs UNCERTAIN) |
+| Raw -> candidates -> evaluated | 691 -> 318 -> 117 | 198 -> 141 -> 87 |
+| Imports: third-party -> packages -> refined | 544 -> 157 -> 143 (2306 first-party skipped) | 303 -> 78 -> 124 |
+| Requests / input tokens (cold) | 129 / 568k | 35 / 123k |
+| Wall time cold / warm | ~30 s + 4 s critic / 7.7 s with 0 requests | ~9 s / ~3 s with 0 requests |
+| Decisions LOCAL / UNCERTAIN / TRANSMITS | 28 / 9 / 16 | 15 / 23 / 4 |
+| Critic VERIFIED / MANUAL_REVIEW | 15 / 10 | 7 / 19 |
+
+Known residual false positive: a Suggestion-level "broad audio-recording access" item anchored
+on a MIME-type table passed the relevance gate at 0.60 on App B. It is left as-is rather than
+adding an app-specific rule.
+
+### 5.1 Time to outcome and cost versus the original agent skill
+
+The original skill's Phase 2 was run on the same two trees exactly as `SKILL.md` prescribes for
+Mode A (one general-purpose sub-agent per `prompt_worker_<goal>.md`, at most 3 concurrently,
+then one per critic chunk) with Claude Fable 5.1 at thinking effort `high`, timed between
+batches, and its 25 sub-agent transcripts were metered afterwards. Phase 1 (`init`, ~2 s) and
+report generation (<1 s) are shared and excluded.
+
+| | App A (220 files) | App B (60 files) |
+| --- | --- | --- |
+| Original skill wall clock, 3-way concurrency as prescribed | 18 min 37 s (13 workers + 2 critics; 330 LLM calls) | 8 min 23 s (10 workers; 175 LLM calls) |
+| Original skill theoretical floor, unlimited parallelism | ~7 min | ~2.5 min |
+| Hybrid v2 cold | 34 s (129 requests) | 10 s (35 requests) |
+| Hybrid v2 warm | 7.7 s (0 requests) | ~3 s (0 requests) |
+| Speed-up, v2 cold vs prescribed skill | 33x | 50x |
+
+Public list prices used (checked 2026-09-27): Claude Fable 5.1 $10 / MTok input, $12.50 5-min
+cache write, $0.25 cache read, $50 output; Jev 1.13 $0.042 / MTok input, output free.
+
+| | App A | App B |
+| --- | --- | --- |
+| Original skill, best case (perfect prompt caching, hidden reasoning excluded) | $30.11 | $13.24 |
+| Original skill, worst case (no caching, hidden reasoning excluded) | $254.50 | $91.46 |
+| Hybrid v2 cold (568k / 123k metered Jev input tokens, no output charge) | $0.024 | $0.005 |
+| Hybrid v2 warm | $0 | $0 |
+| Ratio, original / v2 cold | 1,260x to 10,700x | 2,560x to 17,700x |
+
+The original-skill figures are estimates, not invoices: sub-agent transcripts carry no billing
+fields, so tokens were reconstructed from the files each agent read (5.1 MB across 138 files on
+App A), an assumed 1,500 tokens per un-recorded shell/grep result, visible output, one LLM call
+per assistant step with linearly growing context, 3.5 characters per token, and a 6k-token
+system prompt. Hidden reasoning tokens at effort `high` are billed as output and are not in the
+transcript, so both bounds are low. v2's tokens are the `usage` counts Jev returns.
+
+Two runs of the original skill on the same App A tree also disagreed with each other on
+severity for the same three sends (Critical in one run; Important or discrepancy-table-only in
+the other). v2's decisions are reproducible from cache.
+
+The v1 hybrid prototype used ~78k Jev tokens on App A; v2 uses ~7x more because it classifies
+identifiers and shows the model real code. That is the trade that recovered the three missed
+Criticals, and it is still three orders of magnitude below the agent path.
+
+## 6. Operating the evaluator
+
+```
+python -m typesafe_eval run <temp_dir> --client http \
+    [--capability-cache PATH | --no-capability-cache] [--cache PATH] [--per-finding] [-v]
+python -m typesafe_eval critic <temp_dir> --client http [--cache PATH] [-v]
+python -m typesafe_eval calibrate <labels.json> [--out report.json] [--min-precision 0.90]
+python -m typesafe_eval selftest
+```
+
+- The API key is read only from `TYPESAFE_API_KEY`; nothing is hard-coded.
+- Logging goes to stderr via the `typesafe_eval.*` loggers; `-v` enables DEBUG including
+  per-request question ids, cache decisions and relevance-gate drops.
+- Mock data: the heuristic client and the fixtures in `selftest.py` are the only synthetic
+  inputs. Fixtures may name a library (to test that the *model* labels it), evaluator code
+  may not (`identifier_lint_no_vendor_names`).
+
+## 7. Change control
+
+Bump `EVALUATOR_VERSION` and re-run `calibrate` when any of these change: question wording
+(`questions.py`), the taxonomy (`capabilities.TAXONOMY_VERSION`), the thresholds
+(`constants.py`), or the pinned model. Update `THRESHOLD_PROVENANCE` in the same change.
+
+## 8. Deferred work
+
+- Dynamic evidence from Android CLI Journeys was evaluated and deliberately deferred; the
+  routing is static-only for now.
+- Growing the label set beyond two apps (target > 100 cases) before touching
+  `T_TRANSMIT_HIGH`.
+- Human corrections to the capability cache are supported by the file format but there is no
+  review UI; edit the JSON directly.
+- Generalisations mined from the full legacy-skill runs (identifier-boundary pre-gate,
+  `destination_class`, one-hop first-party call resolution, consent-default and string-resource
+  context, a manifest-derived `AppProfile`) and the per-policy plan for the nine policies v2 does
+  not evaluate yet are specified in
+  [legacy-skill-lessons-and-coverage-plan.md](legacy-skill-lessons-and-coverage-plan.md).
+  Known defect recorded there: the "missing `foregroundServiceType`" branch in
+  `registry._foreground_service_findings` is unreachable because `manifest_details.json` only
+  lists services that already declare a type; the fix is the evaluator-owned manifest parser
+  in that plan (§6.1).

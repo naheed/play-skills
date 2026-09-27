@@ -30,6 +30,9 @@ from __future__ import annotations
 
 from typing import Any
 from typing import Dict
+from typing import Optional
+
+from typesafe_eval import taxonomy
 
 
 def _noul(instructions: str, yes: str, no: str) -> Dict[str, Any]:
@@ -55,12 +58,51 @@ def _severity(subject: str) -> Dict[str, Any]:
   }
 
 
+def _relevance(subject: str, token: str = "") -> Dict[str, Any]:
+  """Semantic match gate: does the snippet really handle this data type?
+
+  Scanner patterns are lexical (``record`` matches a DNS record type, ``track``
+  matches a network trace). One generic question per signal lets code drop the
+  clear misfires before any policy question is composed, without per-type rules.
+
+  The matched token is embedded literally when known: in a batched request the
+  state carries a ``signals`` *list*, so a field path like
+  ``signal.matched_pattern`` would not resolve for the model.
+
+  WP2 wording change: an earlier version listed "a MIME type" among the
+  *unrelated* uses. That taught the model that ``video/*`` inside an
+  ``ACTION_VIEW``/``ACTION_SEND`` chooser is a coincidence, and a labelled
+  media-sharing transfer was answered p=0.09-0.12 while its sibling MIME
+  literals in the same ``switch`` passed. A MIME type or picker filter that
+  selects, opens or shares files of that kind *is* handling the data type
+  (sharing via intent is a transfer by policy); only a MIME string that never
+  reaches any data (a constant table, a comment) is unrelated.
+  """
+  token_ref = f"the matched token `{token}`" if token else "the matched token"
+  return _noul(
+      instructions=(
+          f"Does `code_snippet` actually read, hold, process, select, open or "
+          f"share {subject}, as opposed to an unrelated use of {token_ref} (a "
+          "different meaning of the word, a UI label, a comment, or an "
+          "unrelated API)? A MIME type or file-picker filter used to pick, "
+          "open or hand off files of that kind counts as handling the data "
+          "type; a MIME string that never touches any data does not."
+      ),
+      yes="The snippet genuinely handles this data type.",
+      no="The token is a coincidental match; this data type is not handled here.",
+  )
+
+
 def _disclosure_status(subject: str) -> Dict[str, Any]:
   return {
       "type": "choice",
       "instructions": (
           f"Classify the prominent-disclosure state for {subject} in "
-          "`code_snippet`, considering `co_located_signals.disclosure`."
+          "`code_snippet`, considering `co_located_signals.disclosure` and, "
+          "when present, `strings` (the user-visible text behind the "
+          "`R.string` references in the snippet and on disclosure lines): a "
+          "disclosure counts only if the text a user reads describes the data "
+          "collected and its purpose."
       ),
       "criteria": {
           "DISCLOSED": (
@@ -79,23 +121,197 @@ def _disclosure_status(subject: str) -> Dict[str, Any]:
   }
 
 
-def data_safety_battery(data_type: str, description: str) -> Dict[str, Dict[str, Any]]:
+#: Closed option set for ``destination_class`` (WP7). Replaces the
+#: ``is_third_party`` Noul, which collapsed "the developer's own backend" with
+#: "a third-party SDK" and "the user's own server" with "another app" -- the
+#: reason the worst-calibrated dev-set bin sat in the UNCERTAIN band. The
+#: policy consequence of each class is composed in code
+#: (``evaluate.compose_destination``); the model only picks the class.
+#: ``unknown`` is the escape hatch and always routes to manual review.
+#: Adding an option requires a fixture that exercises it (closed option lists).
+DESTINATION_CLASS_OPTIONS: Dict[str, str] = {
+    "developer_backend": (
+        "A server or service the app developer operates: the endpoint is fixed"
+        " in the code or configuration (not chosen by the user) and belongs to"
+        " the developer, e.g. the app's own API, licensing or sync server."
+    ),
+    "third_party_sdk": (
+        "A library or service run by someone other than the developer that"
+        " receives the data: crash/error reporting, analytics, advertising,"
+        " push, payment or cloud SDKs (`sinks` capabilities THIRD_PARTY_TELEMETRY"
+        " or ADVERTISING_SDK are strong signs)."
+    ),
+    "user_chosen_destination": (
+        "The user decides where the data goes at run time: a server, host, URL"
+        " or account the user typed or configured (read from a preference, a"
+        " text field or a picked URI), or a system share/picker sheet where the"
+        " user selects the receiving app or document. `destination_hints` with"
+        " USER_CHOSEN_DESTINATION is a strong sign."
+    ),
+    "platform_component": (
+        "A component of the operating system on the same device with no"
+        " network hop: the media store, a system content provider, a"
+        " notification, the clipboard, a system settings screen."
+    ),
+    "other_app_ipc": (
+        "Another application on the device receives the data through an"
+        " explicit intent, broadcast, bound service or content provider that"
+        " names or targets that app (not a user-facing chooser)."
+    ),
+    "unknown": (
+        "The snippet does not show where the data goes, or no transfer is"
+        " visible."
+    ),
+}
+
+
+def destination_class_question(subject: str) -> Dict[str, Any]:
+  """The ``destination_class`` Choice for one data type (WP7).
+
+  Asked as part of the data-safety battery so it batches with the other
+  questions; ``evaluate`` reads the answer only when the transfer
+  probability is at or above ``T_TRANSMIT_LOW`` (below the band the data is
+  local and the destination is moot). Instructions point at the state fields
+  that carry the deterministic priors -- ``sinks`` capabilities, ``callees``
+  (WP6) and ``destination_hints`` (WP7) -- and say explicitly that the hints
+  are priors, not the answer.
+  """
+  return {
+      "type": "choice",
+      "instructions": (
+          f"If `code_snippet` sends {subject} off-device or to another app, WHERE "
+          "does it go? Use the capabilities in `sinks`, the helper files in "
+          "`callees` (when present) and the deterministic priors in "
+          "`destination_hints` (when present: USER_CHOSEN_DESTINATION means the "
+          "host/URL or receiving app is chosen by the user at run time; "
+          "DEVELOPER_BACKEND means a literal endpoint under the developer's own "
+          "domain; CONSTANT_ENDPOINT means a literal endpoint elsewhere). Hints "
+          "are priors to weigh against the code, not the answer. Pick the single "
+          "best class; choose `unknown` when the destination is not visible."
+      ),
+      "criteria": dict(DESTINATION_CLASS_OPTIONS),
+  }
+
+
+def consent_default_question(subject: str) -> Dict[str, Any]:
+  """The ``consent_default_on`` Noul for one data type (WP8).
+
+  Asked with the data-safety battery; ``evaluate.compose_consent`` reads it
+  only for a transfer at/above ``T_TRANSMIT_LOW``. The instructions explain
+  the deterministic ``guards`` block: the boolean flags gating the snippet,
+  each with its declaration and ``default_on`` (the literal the flag is
+  initialised to) when the evaluator located it. A guard whose default is
+  false means the user must opt in; true or no guard means the transfer
+  happens unless the user turns it off. Guards are evidence to weigh, not the
+  answer -- the model still reads the code.
+  """
+  return _noul(
+      instructions=(
+          f"Is the transfer of {subject} in `code_snippet` ENABLED BY DEFAULT, "
+          "i.e. does it happen unless the user has turned it off? `guards`, when "
+          "present, lists the boolean flags that gate the snippet: `flag`, the "
+          "condition line, `runs_when` (the flag value under which the transfer "
+          "code runs; an `early_exit` guard such as `if (!flag) return` protects "
+          "the code after it) and, when the evaluator found the declaration, "
+          "`declaration.initialiser`, `default_on` (true = the flag starts on) "
+          "and `runs_by_default` (true = the transfer runs when the flag keeps "
+          "its declared default). `runs_by_default: true` or no guard at all "
+          "means default-on; `runs_by_default: false` (the user must enable a "
+          "setting) means opt-in. `null` means the default could not be read "
+          "from the code -- then judge from the initialiser text and the snippet."
+      ),
+      yes="The transfer is on by default (unconditional, or gated by a flag that starts enabled).",
+      no="The user must opt in first (gated by a flag that starts disabled, or by an explicit consent step).",
+  )
+
+
+#: Fixed options of the ``data_type_confirmed`` Choice (WP10). The sibling
+#: types are added per data type by :func:`data_type_confirmed_question`.
+TYPE_CONFIRMED_AS_LABELLED = "as_labelled"
+TYPE_CONFIRMED_NOT_PERSONAL = "NOT_PERSONAL"
+TYPE_CONFIRMED_UNKNOWN = "unknown"
+
+
+def data_type_confirmed_question(
+    data_type: str, description: str, siblings: Dict[str, str], token: str = ""
+) -> Dict[str, Any]:
+  """The ``data_type_confirmed`` Choice for one data type (WP10, lesson L7).
+
+  The scanner's type comes from a lexical pattern, and a handful of relabels
+  recur: an app ``uid`` is not a user account, a remote peer's country is not
+  the user's location, a server-assigned installation id is a DEVICE_ID. The
+  model is asked which taxonomy label fits the value the snippet actually
+  handles; ``evaluate.compose_type_confirmation`` decides what that means for
+  the finding (relabel, cap, review) and only for a transfer at/above
+  ``T_TRANSMIT_LOW``. Options are closed: ``as_labelled``, one per sibling type
+  (``taxonomy.siblings``), ``NOT_PERSONAL`` and ``unknown``.
+  """
+  token_ref = f" (matched token `{token}`)" if token else ""
+  criteria: Dict[str, str] = {
+      TYPE_CONFIRMED_AS_LABELLED: (
+          f"The value really is {data_type} — {description} — belonging to the app's user."
+      ),
+  }
+  for sibling, text in siblings.items():
+    criteria[sibling] = f"The value is better described as {sibling} — {text}"
+  criteria[TYPE_CONFIRMED_NOT_PERSONAL] = (
+      "The value is not personal or user data at all: an app or process id "
+      "(Android app UID, pid), a remote peer's or server's address or country, "
+      "an app-internal constant or enum, a resource id, test or placeholder data."
+  )
+  criteria[TYPE_CONFIRMED_UNKNOWN] = "The snippet does not show what the value is."
+  return {
+      "type": "choice",
+      "instructions": (
+          f"`code_snippet` was labelled as handling {data_type}{token_ref}. Looking "
+          "at what the value actually is — where it is read from, what it "
+          "identifies, whose data it is — which Data Safety label fits it? Pick "
+          f"`{TYPE_CONFIRMED_AS_LABELLED}` when the scanner's label is right, the "
+          "sibling type when a different label fits better, "
+          f"`{TYPE_CONFIRMED_NOT_PERSONAL}` when the value is not about the user "
+          f"at all, and `{TYPE_CONFIRMED_UNKNOWN}` when the snippet does not show it."
+      ),
+      "criteria": criteria,
+  }
+
+
+def data_safety_battery(
+    data_type: str, description: str, token: str = "",
+    siblings: Optional[Dict[str, str]] = None,
+) -> Dict[str, Dict[str, Any]]:
   """Battery for a single data-safety finding (one detected data type).
 
   Produces the typed inputs the existing ``worker_<goal>.json`` schema expects:
-  the four data-safety booleans, a disclosure-status choice, and a severity
-  score. Instructions embed the literal data type so the battery works whether
-  the state holds one signal or a whole file's worth (see request batching).
+  the data-safety Nouls (relevance, transfer, user-initiated, consent default
+  (WP8), disclosure), the ``destination_class`` Choice (WP7; ``is_third_party``
+  is derived from it in code), the ``data_type_confirmed`` Choice (WP10;
+  ``siblings`` is the closed ``{TYPE: description}`` list from
+  ``taxonomy.siblings``, empty when the caller has none), a disclosure-status
+  choice, and a severity score. Instructions embed the literal data type (and
+  the scanner token that anchored the signal, when given) so the battery works
+  whether the state holds one signal or a whole file's worth (see request
+  batching).
   """
   subject = f"the data type {data_type} ({description})"
+  if siblings is None:
+    siblings = taxonomy.siblings(data_type)
   return {
+      "signal_relevant": _relevance(subject, token),
+      "data_type_confirmed": data_type_confirmed_question(data_type, description, siblings, token),
       "transmits_offdevice": _noul(
           instructions=(
-              f"Does `code_snippet` cause {subject} to leave the device — sent "
-              "over the network, to a third-party SDK, or written to a shared "
-              "log? Consider `co_located_signals.network_transmission`."
+              f"Does `code_snippet` cause {subject} to leave the device or the "
+              "app's own sandbox — sent over the network, handed to a third-party "
+              "SDK, or shared with another app via an intent, content provider, "
+              "or the clipboard? `sinks` lists the imported symbols in this file "
+              "and the capabilities they are known to provide; a sink labelled "
+              "UNKNOWN may or may not transmit. `callees`, when present, lists "
+              "the app's own helper files called from `code_snippet` together "
+              "with the sinks those helpers reach (one call away) — data handed "
+              "to such a helper reaches its sinks. Consider "
+              "`co_located_signals.network_transmission`."
           ),
-          yes="The data is transmitted off-device or shared to a third party.",
+          yes="The data is transmitted off-device or shared with another party.",
           no="The data is only used locally on the device.",
       ),
       "user_initiated": _noul(
@@ -107,19 +323,13 @@ def data_safety_battery(data_type: str, description: str) -> Dict[str, Dict[str,
           yes="An explicit user action triggers the transfer.",
           no="The transfer happens automatically without a user action.",
       ),
-      "is_third_party": _noul(
-          instructions=(
-              f"Does `code_snippet` send {subject} to a destination outside the "
-              "developer's own control, such as an analytics/ads SDK or the "
-              "Android share sheet?"
-          ),
-          yes="The sink is a third party outside the developer's control.",
-          no="The sink is the developer's own backend, or there is no sink.",
-      ),
+      "consent_default_on": consent_default_question(subject),
+      "destination_class": destination_class_question(subject),
       "has_prominent_disclosure": _noul(
           instructions=(
               f"For {subject}, does `code_snippet` (with "
-              "`co_located_signals.disclosure`) show a prominent disclosure or "
+              "`co_located_signals.disclosure` and the resolved text in "
+              "`strings`, when present) show a prominent disclosure or "
               "consent dialog BEFORE the data is accessed, that the user must "
               "accept to continue?"
           ),
@@ -131,15 +341,20 @@ def data_safety_battery(data_type: str, description: str) -> Dict[str, Dict[str,
   }
 
 
-def permission_battery(policy_id: str, data_type: str) -> Dict[str, Dict[str, Any]]:
+def permission_battery(
+    policy_id: str, data_type: str, token: str = ""
+) -> Dict[str, Dict[str, Any]]:
   """Battery for a permission-hygiene finding (location, contacts, audio, ...).
 
   Focuses on whether a restricted permission is justified by core functionality
   and whether a scoped alternative should be used. Severity and disclosure reuse
-  the shared rubrics.
+  the shared rubrics. ``token`` is the scanner pattern that anchored the signal
+  (embedded in the relevance gate; see :func:`_relevance`).
   """
+  del policy_id  # the policy is applied in code (evaluate.py), not in the question
   subject = f"the data type {data_type}"
   return {
+      "signal_relevant": _relevance(subject, token),
       "is_core_functionality": _noul(
           instructions=(
               f"Given the app `app.name` in store category `app.store_category`, "
@@ -151,8 +366,11 @@ def permission_battery(policy_id: str, data_type: str) -> Dict[str, Dict[str, An
       ),
       "transmits_offdevice": _noul(
           instructions=(
-              f"Does `code_snippet` send {subject} off-device? Consider "
-              "`co_located_signals.network_transmission`."
+              f"Does `code_snippet` send {subject} off-device or to another app? "
+              "`sinks` lists imported symbols and their known capabilities; "
+              "`callees`, when present, lists the app's own helper files called "
+              "from `code_snippet` and the sinks they reach one call away. "
+              "Consider `co_located_signals.network_transmission`."
           ),
           yes="The data is transmitted off-device.",
           no="The data is used only locally.",
@@ -212,16 +430,202 @@ def account_deletion_gate(data_type: str, description: str) -> Dict[str, Dict[st
   }
 
 
-def critic_battery() -> Dict[str, Dict[str, Any]]:
-  """One cheap Noul: does the cited evidence support the claim?
+def account_deletion_lifecycle_battery() -> Dict[str, Dict[str, Any]]:
+  """Two Nouls on one *deletion candidate* file (WP11).
 
-  With Jev answering atomic questions against the real snippet and severity
-  composed in code, a separate multi-question critic pass is redundant. The
-  aggregate step only routes non-SUGGESTION (IMPORTANT/CRITICAL) findings here,
-  so this single false-positive check runs only where it matters (citation-check
-  pattern). ``evaluate.py`` turns the probability into VERIFIED / MANUAL_REVIEW /
-  PRUNED in code.
+  Asked only when the deterministic identity-lifecycle scan found both a
+  provisioning site (the app registers an account / customer / device on a
+  server) and a deletion-shaped call somewhere in shipped source. The state
+  is ``{"signal": {"file", "lines", "tokens"}, "code_snippet": ...,
+  "network_indicators": [...], "persistence_indicators": [...],
+  "provisioning": [{file, line, token, evidence}, ...]}``. The two questions
+  are deliberately complementary so the composer can tell "deletes on the
+  server" from "only clears local state" from "cannot tell":
+
+  * ``is_remote_delete`` >= ``T_REMOTE_DELETE`` -> compliant path (traced).
+  * ``clears_local_state_only`` >= ``T_LOCAL_ONLY_DELETE`` -> IMPORTANT, the
+    partial-deletion trap (sign-out or local wipe presented as deletion).
+  * neither -> IMPORTANT + review (the provisioning is real; the deletion is
+    unconfirmed).
   """
+  return {
+      "is_remote_delete": _noul(
+          instructions=(
+              "Does `code_snippet` (from `signal.file`) delete or unregister the "
+              "user's ACCOUNT or server-side identity ON THE SERVER — an HTTP "
+              "DELETE, a call to a deletion / unregistration / close-account "
+              "endpoint, or a request whose path or method name denotes deleting "
+              "the account, customer, device or installation that `provisioning` "
+              "shows being registered? Cancelling a subscription, deactivating a "
+              "feature, signing out or clearing local data is NOT a remote delete."
+          ),
+          yes="It sends a request that removes the account / identity on the server.",
+          no="It does not remove the identity on the server (local, sign-out, feature, subscription).",
+      ),
+      "clears_local_state_only": _noul(
+          instructions=(
+              "Does `code_snippet` ONLY clear local state — preferences, database "
+              "rows, cached tokens, a sign-out — with no request that removes the "
+              "account or identity on the server? Use `network_indicators` and "
+              "`persistence_indicators` as evidence to weigh, not as the answer."
+          ),
+          yes="Only local state is cleared; nothing is removed on the server.",
+          no="A server-side removal is requested (or the snippet does neither).",
+      ),
+  }
+
+
+LOGIN_GATE_OPTIONS = {
+    "app_account": (
+        "Users sign in to an account the DEVELOPER operates (email / phone /"
+        " username + password, own backend session, paid tier login) and features"
+        " are gated behind it."
+    ),
+    "user_remote_server_credentials": (
+        "Users enter credentials for THEIR OWN server or service (FTP / SFTP / SMB /"
+        " WebDAV / IMAP / self-hosted) which the app stores on the device; the"
+        " developer runs no account system."
+    ),
+    "third_party_sign_in_bridge": (
+        "Users sign in through an identity provider (federated / OAuth / platform"
+        " sign-in) that establishes an account with the developer's app or backend."
+    ),
+    "none": (
+        "No feature is gated behind a login; the login-shaped tokens are incidental"
+        " (a password field for encryption, a 'credentials' helper, test code)."
+    ),
+    "unknown": "The evidence does not show which kind of login gate, if any, exists.",
+}
+
+
+def login_gate_battery() -> Dict[str, Dict[str, Any]]:
+  """One closed Choice, asked once per app when login-shaped evidence exists (WP11).
+
+  The state is ``{"app": {...}, "login_files": [{file, hits, tokens,
+  remote_server_tokens}], "semantic_files": [...], "snippets": {file: text},
+  "declared_capabilities": [...]}``. Composition (``engine._ask_login_gate``):
+  ``app_account`` / ``third_party_sign_in_bridge`` at/above
+  ``CONF_LOGIN_GATE`` -> IMPORTANT ``login_credentials`` (reviewer credentials +
+  deletion link); ``user_remote_server_credentials`` -> no finding, recorded;
+  ``none`` -> nothing; below the bar -> SUGGESTION + review.
+  """
+  return {
+      "login_gate_type": {
+          "type": "choice",
+          "instructions": (
+              "From `login_files` (shipped source files with login / sign-in / "
+              "credential tokens, their `remote_server_tokens` counts), the "
+              "`snippets`, `semantic_files` (layouts or classes named like a "
+              "login screen) and `app`, what kind of login gate does this app "
+              "have? Pick the single best option; `user_remote_server_credentials` "
+              "when the credentials are for the user's own server (host / port / "
+              "protocol fields), `none` when nothing is gated, `unknown` only when "
+              "the evidence does not show it."
+          ),
+          "criteria": dict(LOGIN_GATE_OPTIONS),
+      }
+  }
+
+
+def photo_video_battery(data_type: str, token: str = "") -> Dict[str, Dict[str, Any]]:
+  """Battery for one media code site under ``photo_video_access_policy`` (WP9).
+
+  Asked once per file that anchors a MEDIA / PHOTOS / VIDEOS signal, and only
+  when the app ships a broad media permission (the planner gates on the
+  manifest; the model is never asked to read XML). The relevance gate is the
+  shared one; the single policy question separates "enumerates the user's
+  media library" (what a gallery or backup tool does, and what a broad media
+  permission is for) from "the user picks one item" (what the Photo Picker
+  does without any permission). ``media_access_hints`` in the state are the
+  deterministic priors (MediaStore collection queries vs picker intents); the
+  model weighs them against the code.
+  """
+  subject = f"the data type {data_type}"
+  return {
+      "signal_relevant": _relevance(subject, token),
+      "accesses_full_media_library": _noul(
+          instructions=(
+              "Does `code_snippet` enumerate or scan the user's photo / video "
+              "library as a whole — querying a MediaStore collection, listing "
+              "media folders, generating thumbnails for every item, indexing or "
+              "syncing all media — rather than handling one or a few items the "
+              "user explicitly selected (a picker intent, a Photo Picker result, "
+              "a shared URI)? `media_access_hints`, when present, lists "
+              "deterministic clues: LIBRARY_QUERY (a MediaStore collection is "
+              "queried) and USER_PICK (a picker or activity-result contract). "
+              "Judge the code itself; the hints are priors."
+          ),
+          yes="The code enumerates, scans or indexes the media library (needs broad media access).",
+          no="The code handles only items the user selected or that were shared to it.",
+      ),
+  }
+
+
+def files_and_docs_battery(data_type: str, token: str = "") -> Dict[str, Dict[str, Any]]:
+  """Battery for one shared-storage code site under ``files_and_docs_policy`` (WP9).
+
+  Asked once per file, and only for files where the structure layer found a
+  path composed from the external-storage root (``external_storage_paths`` in
+  the state, each with ``strength``: ``writes`` / ``composes`` /
+  ``references``). There is no relevance gate: the deterministic hint *is*
+  the activation. The question is whether the app creates its own folder or
+  files at the root of shared storage (``/sdcard/MyApp``) instead of an
+  app-specific directory (``getExternalFilesDir``), a public collection
+  (``Downloads/`` via MediaStore) or a location the user picked through the
+  Storage Access Framework.
+  """
+  del data_type, token  # the deterministic hint anchors this question, not the scanner token
+  return {
+      "creates_root_level_external_folder": _noul(
+          instructions=(
+              "Does `code_snippet` (or the file lines quoted in "
+              "`external_storage_paths`) create or write a custom folder or file "
+              "directly under the external-storage root — e.g. "
+              "`Environment.getExternalStorageDirectory()` + \"/my_folder\" followed "
+              "by mkdir / mkdirs / a FileOutputStream — for the app's own outputs, "
+              "temp files, logs or config? Answer no when the path is an "
+              "app-specific directory (getExternalFilesDir / getExternalCacheDir), "
+              "a standard public collection (Downloads, Pictures, DCIM) used "
+              "through MediaStore, a location the user chose (SAF tree / document "
+              "URI), or when the root is only read, compared or displayed."
+          ),
+          yes="The app creates or writes its own folder / files at the external-storage root.",
+          no="No root-level folder is created (app-specific, public collection, user-chosen, or read-only).",
+      ),
+  }
+
+
+def critic_battery(claim_kind: str = "generic") -> Dict[str, Dict[str, Any]]:
+  """One cheap Noul that verifies only the *atomic* claim a finding rests on.
+
+  The aggregate step routes non-SUGGESTION findings here (citation-check
+  pattern) and ``evaluate.py`` turns the probability into VERIFIED /
+  MANUAL_REVIEW / PRUNED in code.
+
+  ``claim_kind == "transfer"`` (data-safety findings): the critic is asked only
+  whether the evidence shows the data reaching an off-device or cross-app sink.
+  It is deliberately *not* asked about disclosure: no single snippet can prove a
+  disclosure is absent elsewhere in the app, so asking that question produced
+  systematic false prunes of true transfers.
+
+  Any other ``claim_kind``: the generic "does the evidence support the summary"
+  question, used for permission-hygiene findings.
+  """
+  if claim_kind == "transfer":
+    return {
+        "evidence_shows_transfer": _noul(
+            instructions=(
+                "`finding.claim` states that a data type is sent off-device or "
+                "shared with another app. Does `finding.evidence_snippet` show "
+                "that data (or a value derived from it) reaching one of the sinks "
+                "in `finding.sinks`, or any other network, third-party SDK, or "
+                "cross-app call? Judge only what is visible in the snippet; do "
+                "not require the disclosure to be visible."
+            ),
+            yes="The snippet shows the data reaching an off-device or cross-app sink.",
+            no="The snippet shows only local use, or no flow to a sink is visible.",
+        ),
+    }
   return {
       "evidence_supports_claim": _noul(
           instructions=(
@@ -232,4 +636,74 @@ def critic_battery() -> Dict[str, Dict[str, Any]]:
           yes="The snippet concretely supports the claimed violation.",
           no="The snippet does not support the claim, or is too abstract.",
       ),
+  }
+
+
+# ---------------------------------------------------------------------------
+# Once-per-app question (WP4)
+# ---------------------------------------------------------------------------
+
+#: Closed option set for ``declared_core_purpose``. Drawn from the policy
+#: matrices that condition severity on the app's *primary* purpose
+#: (all-files access, package visibility, exact alarms, default handlers,
+#: accessibility, media). ``other`` is a real answer ("none of the listed
+#: purposes"); ``unknown`` is the escape hatch that always means "not
+#: justified" downstream. Adding an option requires a fixture app that
+#: exercises it (plan §3, closed option lists).
+APP_PURPOSE_OPTIONS: Dict[str, str] = {
+    "file_manager": (
+        "Browsing, copying, moving and opening arbitrary files across storage is"
+        " the app's main job (file explorer, archive/FTP/SMB client)."
+    ),
+    "backup_or_antivirus": (
+        "Whole-device backup/restore, anti-malware or device-cleaning is the main job."
+    ),
+    "alarm_or_timer": (
+        "The app exists to fire alarms, timers or reminders at exact wall-clock times."
+    ),
+    "calendar": "Calendar or agenda management is the main job.",
+    "messaging_default_handler": (
+        "The app is meant to be the user's default SMS/MMS, dialer or call-screening app."
+    ),
+    "accessibility_tool": (
+        "The app is an assistive tool for users with disabilities (screen reader,"
+        " switch access, magnification, voice control)."
+    ),
+    "media_gallery_or_editor": (
+        "Browsing, organising or editing the user's photos/videos/audio is the main job."
+    ),
+    "launcher": "The app replaces the home screen / app drawer.",
+    "per_app_network_control": (
+        "The app filters, routes or monitors other apps' network traffic (firewall,"
+        " DNS changer, VPN-based blocker, traffic monitor)."
+    ),
+    "other": "A clear primary purpose that is none of the above (game, shopping, news, ...).",
+    "unknown": "The facts given do not make the primary purpose clear.",
+}
+
+
+def app_purpose_battery() -> Dict[str, Dict[str, Any]]:
+  """One Choice, asked once per app and cached by the profile digest.
+
+  The state is ``{"app": {name, package, target_sdk, store_category,
+  store_description}, "profile": <AppProfile.render_compact()>}``. The answer's
+  option and calibrated confidence are placed in every later request's
+  ``app.purpose`` line and read by ``evaluate.purpose_in`` when a policy's
+  severity depends on the primary purpose (WP5+). Low confidence never
+  lowers a severity: ``purpose_in`` returns False below
+  ``constants.CONF_APP_PURPOSE``.
+  """
+  return {
+      "declared_core_purpose": {
+          "type": "choice",
+          "instructions": (
+              "From `app` (store listing facts) and `profile` (the merged Android "
+              "manifest: permissions, components, launcher, file-handling and "
+              "default-handler roles), what is this app's PRIMARY purpose — the "
+              "job a user installs it for? Pick the single best option; choose "
+              "`other` when the purpose is clear but not listed, and `unknown` "
+              "only when the facts do not show it."
+          ),
+          "criteria": dict(APP_PURPOSE_OPTIONS),
+      }
   }

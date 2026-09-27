@@ -323,6 +323,11 @@ class HeuristicJevClient(JevClient):
     approx_chars = len(json.dumps({"state": state, "questions": questions}))
     self.total_input_tokens += approx_chars // 4
 
+    # Capability classification requests carry a ``symbols`` list; answer them
+    # from generic behavioural keywords in the identifier (stand-in only).
+    if isinstance(state, dict) and "symbols" in state and "capability_definitions" in state:
+      return self._classify_symbols(state["symbols"], questions)
+
     signal = state.get("signal", {}) if isinstance(state, dict) else {}
     co = state.get("co_located_signals", {}) if isinstance(state, dict) else {}
     app = state.get("app", {}) if isinstance(state, dict) else {}
@@ -330,9 +335,23 @@ class HeuristicJevClient(JevClient):
 
     data_type = signal.get("data_type", "")
     has_network = bool(co.get("network_transmission"))
+    # WP11 lifecycle states carry the deterministic network reach instead of
+    # co-located scanner signals.
+    if isinstance(state, dict) and state.get("network_indicators"):
+      has_network = True
+    # Critic states carry the finding instead of a signal; treat labelled sinks
+    # (or a snippet that mentions related data-flow lines) as network evidence.
+    finding = state.get("finding", {}) if isinstance(state, dict) else {}
+    if finding:
+      has_network = has_network or bool(finding.get("sinks")) or (
+          "Related data-flow lines" in str(finding.get("evidence_snippet", "")))
+      snippet = snippet or str(finding.get("evidence_snippet", ""))
     has_disclosure = any(
         gate in (co.get("disclosure") or []) for gate in self._DISCLOSURE_GATES
     )
+    destination = self._destination_prior(state) if isinstance(state, dict) else "unknown"
+    consent_prior = self._consent_prior(state) if isinstance(state, dict) else 0.5
+    storage_priors = self._storage_priors(state) if isinstance(state, dict) else {}
     category = str(app.get("store_category", "")).strip().lower()
 
     core_categories = self._CORE_BY_CATEGORY.get(data_type, set())
@@ -361,8 +380,77 @@ class HeuristicJevClient(JevClient):
           is_core=is_core,
           snippet=snippet,
           signal=signal,
+          destination=destination,
+          consent_prior=consent_prior,
+          storage_priors=storage_priors,
       )
     return answers
+
+  @staticmethod
+  def _storage_priors(state: Dict[str, Any]) -> Dict[str, float]:
+    """Offline stand-ins for the WP9 storage Nouls.
+
+    ``media``: from ``media_access_hints`` -- any ``LIBRARY_QUERY`` -> 0.85,
+    only ``USER_PICK`` -> 0.15, none -> 0.5. ``root_folder``: from
+    ``external_storage_paths`` -- a hint with ``strength == "writes"`` -> 0.85,
+    ``composes`` -> 0.5, references only -> 0.15, none -> 0.5. Heuristics for
+    hermetic runs; the live model reads the code.
+    """
+    out: Dict[str, float] = {}
+    kinds = {h.get("hint") for h in state.get("media_access_hints") or [] if isinstance(h, dict)}
+    if kinds:
+      out["media"] = 0.85 if "LIBRARY_QUERY" in kinds else 0.15
+    strengths = {h.get("strength") for h in state.get("external_storage_paths") or [] if isinstance(h, dict)}
+    if strengths:
+      out["root_folder"] = 0.85 if "writes" in strengths else (0.5 if "composes" in strengths else 0.15)
+    return out
+
+  @staticmethod
+  def _consent_prior(state: Dict[str, Any]) -> float:
+    """Offline stand-in for the ``consent_default_on`` Noul (WP8).
+
+    Reads the deterministic ``guards`` list that ``context.build_file_state``
+    attaches to the state: any guard with ``runs_by_default == False`` -> lean
+    opt-in (0.15); any guard with ``True`` -> lean default-on (0.85); guards
+    with unknown defaults -> 0.5; no guards at all -> the code path is
+    unconditional, so default-on (0.85). This is a heuristic for hermetic
+    runs, not a judgement of the toggle text.
+    """
+    guards = state.get("guards") or []
+    if not guards:
+      return 0.85
+    defaults = [g.get("runs_by_default") for g in guards if isinstance(g, dict)]
+    if any(d is False for d in defaults):
+      return 0.15
+    if any(d is True for d in defaults):
+      return 0.85
+    return 0.5
+
+  @staticmethod
+  def _destination_prior(state: Dict[str, Any]) -> str:
+    """Offline stand-in for the ``destination_class`` Choice (WP7).
+
+    Reads only what the state already carries: a ``USER_CHOSEN_DESTINATION``
+    hint wins, then the strongest sink capability (telemetry/advertising ->
+    third-party SDK, IPC only -> another app, network -> developer backend),
+    else ``unknown``. This is a heuristic for hermetic runs, not a judgement.
+    """
+    hints = {h.get("hint") for h in state.get("destination_hints") or []}
+    if "USER_CHOSEN_DESTINATION" in hints:
+      return "user_chosen_destination"
+    caps: set = set()
+    for s in state.get("sinks") or []:
+      caps.update(s.get("capabilities") or [])
+    for c in state.get("callees") or []:
+      for s in c.get("sinks") or []:
+        caps.update(s.get("capabilities") or [])
+    if caps & {"THIRD_PARTY_TELEMETRY", "ADVERTISING_SDK"}:
+      return "third_party_sdk"
+    if "NETWORK_EGRESS" in caps:
+      return "developer_backend"
+    if "IPC_SHARING" in caps:
+      return "other_app_ipc"
+    return "unknown"
 
   def _answer(
       self,
@@ -375,6 +463,9 @@ class HeuristicJevClient(JevClient):
       is_core: bool,
       snippet: str,
       signal: Dict[str, Any],
+      destination: str = "unknown",
+      consent_prior: float = 0.5,
+      storage_priors: Optional[Dict[str, float]] = None,
   ) -> JevAnswer:
     qtype = question.get("type")
 
@@ -388,13 +479,16 @@ class HeuristicJevClient(JevClient):
               is_core=is_core,
               snippet=snippet,
               signal=signal,
+              consent_prior=consent_prior,
+              storage_priors=storage_priors,
           ),
       )
 
     if qtype == "choice":
       options = list((question.get("criteria") or {}).keys())
       probs = self._choice_probs(
-          qid, options, has_network=has_network, has_disclosure=has_disclosure
+          qid, options, has_network=has_network, has_disclosure=has_disclosure,
+          destination=destination,
       )
       choice = max(probs, key=probs.get) if probs else (options[0] if options else "")
       return JevAnswer(
@@ -425,6 +519,42 @@ class HeuristicJevClient(JevClient):
 
     return JevAnswer(type=str(qtype))
 
+  # Generic *behavioural* keywords (not product names) that hint at a capability
+  # in an identifier such as ``java.net.Socket`` or ``some.sdk.analytics.Tracker``.
+  # This is the offline stand-in for the model's knowledge; it is deliberately
+  # crude and exists only so the pipeline runs hermetically in tests.
+  _CAPABILITY_HINTS = {
+      "NETWORK_EGRESS": (".net", "net.", "http", "socket", "url", "request",
+                         "websocket", "grpc", "dns", "client", "api."),
+      "THIRD_PARTY_TELEMETRY": ("analytics", "crash", "telemetry", "metrics",
+                                "tracking", "tracker", "report"),
+      "ADVERTISING_SDK": ("ads", "advert", "adview", "admanager"),
+      "IPC_SHARING": ("intent", "clipboard", "broadcast", "content", "provider",
+                      "resolver", "share"),
+      "LOCAL_PERSISTENCE": ("sqlite", "database", "prefs", "preferences", "persist",
+                            "file", "storage", "datastore", "cache"),
+      "LOGGING": ("log", "print"),
+      "USER_DISCLOSURE_UI": ("dialog", "alert", "consent", "permission", "rationale"),
+  }
+
+  def _classify_symbols(
+      self, symbols: list, questions: Dict[str, Dict[str, Any]]
+  ) -> Dict[str, JevAnswer]:
+    answers: Dict[str, JevAnswer] = {}
+    by_id = {int(s["id"]): str(s.get("identifier", "")).lower() for s in symbols}
+    for qid in questions:
+      try:
+        idx_str, cap = qid.split("__", 1)
+        idx = int(idx_str.lstrip("s"))
+      except ValueError:
+        answers[qid] = JevAnswer(type="noul", noul=0.5)
+        continue
+      ident = by_id.get(idx, "")
+      hints = self._CAPABILITY_HINTS.get(cap, ())
+      answers[qid] = JevAnswer(
+          type="noul", noul=0.85 if any(h in ident for h in hints) else 0.1)
+    return answers
+
   @staticmethod
   def _noul_value(
       qid: str,
@@ -434,9 +564,28 @@ class HeuristicJevClient(JevClient):
       is_core: bool,
       snippet: str,
       signal: Dict[str, Any],
+      consent_prior: float = 0.5,
+      storage_priors: Optional[Dict[str, float]] = None,
   ) -> float:
+    storage_priors = storage_priors or {}
     if qid == "transmits_offdevice":
       return 0.9 if has_network else 0.1
+    if qid == "consent_default_on":
+      # WP8 stand-in: derived from the deterministic guard defaults in state.
+      return consent_prior
+    if qid == "accesses_full_media_library":
+      # WP9 stand-in: the deterministic media hints decide (LIBRARY_QUERY ->
+      # 0.85, USER_PICK only -> 0.15, neither -> 0.5).
+      return storage_priors.get("media", 0.5)
+    if qid == "creates_root_level_external_folder":
+      # WP9 stand-in: a deterministic write on a root-composed path -> 0.85;
+      # composition only -> 0.5; bare references -> 0.15.
+      return storage_priors.get("root_folder", 0.5)
+    if qid == "signal_relevant":
+      # The stand-in cannot judge semantics; lean relevant (recall-safe).
+      return 0.8
+    if qid == "evidence_shows_transfer":
+      return 0.9 if has_network else 0.2
     if qid == "has_prominent_disclosure":
       return 0.85 if has_disclosure else 0.05
     if qid == "is_core_functionality":
@@ -445,6 +594,7 @@ class HeuristicJevClient(JevClient):
       # The scanner cannot see intent; stay near "unknown" leaning no.
       return 0.4
     if qid == "is_third_party":
+      # Retired in WP7 (``destination_class`` Choice); kept for older batteries.
       return 0.5
     if qid == "evidence_supports_claim":
       pattern = str(signal.get("matched_pattern", ""))
@@ -455,6 +605,14 @@ class HeuristicJevClient(JevClient):
       strong = ("deleteaccount", "purgeuserdata", "closeaccount", "removeuser",
                 "requestdelete", "destroy_account", "delete_profile")
       return 0.9 if any(s in pattern for s in strong) else 0.15
+    if qid == "is_remote_delete":
+      # WP11 stand-in: a deletion candidate that the deterministic scan found
+      # to reach the network (``network_indicators`` non-empty) is read as a
+      # remote delete; one that does not is not. The live model reads the code.
+      return 0.85 if has_network else 0.15
+    if qid == "clears_local_state_only":
+      # WP11 stand-in: the complement of the above.
+      return 0.15 if has_network else 0.85
     if qid == "declaration_covers":
       return 0.5
     return 0.5
@@ -466,8 +624,12 @@ class HeuristicJevClient(JevClient):
       *,
       has_network: bool,
       has_disclosure: bool,
+      destination: str = "unknown",
   ) -> Dict[str, float]:
     probs = {opt: 0.0 for opt in options}
+    if qid == "destination_class" and probs:
+      # WP7 stand-in: peak on the deterministic prior (see ``_destination_prior``).
+      return _peak(probs, destination if destination in probs else "unknown")
     if qid == "disclosure_status" and probs:
       if has_disclosure:
         winner = "DISCLOSED"
@@ -479,6 +641,26 @@ class HeuristicJevClient(JevClient):
     if qid == "critic_verdict" and probs:
       # The heuristic critic is permissive: verify what the scanner surfaced.
       return _peak(probs, "VERIFIED")
+    if qid == "data_type_confirmed" and probs:
+      # WP10 stand-in: the offline client cannot judge what a value really is,
+      # so it confirms the scanner's label (the recall-safe default; nothing is
+      # relabelled or capped). Tests exercise the other branches with fixed
+      # answers.
+      return _peak(probs, "as_labelled" if "as_labelled" in probs else options[0])
+    if qid == "login_gate_type" and probs:
+      # WP11 stand-in for the once-per-app login-gate Choice: it cannot read
+      # the snippets, so it answers ``unknown`` (peaked), which the engine
+      # composes as SUGGESTION + review -- the recall-safe default. Tests
+      # that need a specific gate type use a fixed client.
+      return _peak(probs, "unknown" if "unknown" in probs else options[-1])
+    if qid == "declared_core_purpose" and probs:
+      # Offline stand-in for the once-per-app purpose question (WP4): it has
+      # no store listing to read, so it answers ``unknown`` with a peaked
+      # distribution. Downstream reads ``unknown`` as "purpose not
+      # established" (never as a justification), which is the recall-safe
+      # default for hermetic runs. Tests that need a specific purpose use a
+      # fixed client.
+      return _peak(probs, "unknown" if "unknown" in probs else options[-1])
     # Uniform when we have no opinion.
     if options:
       even = 1.0 / len(options)

@@ -34,42 +34,72 @@ Run the commands from the `scripts/` directory (or put it on `PYTHONPATH`).
 ## Commands
 
 ```bash
-python -m typesafe_eval run <temp_dir> [--client heuristic|http] [--model ID] [--goals ...] [--batch]
-python -m typesafe_eval critic <temp_dir> [--client heuristic|http]
+python -m typesafe_eval run <temp_dir> [--client heuristic|http] [--model ID] [--goals ...] \
+    [--cache PATH] [--capability-cache PATH | --no-capability-cache] [--per-finding] [-v]
+python -m typesafe_eval critic <temp_dir> [--client heuristic|http] [--cache PATH] [-v]
+python -m typesafe_eval calibrate <labels.json> [--out report.json] [--min-precision 0.90]
 python -m typesafe_eval benchmark <temp_dir> [--client http]   # per-finding vs batched: requests/tokens/latency/agreement
 python -m typesafe_eval selftest                 # offline unit checks
 python -m typesafe_eval smoketest                # live smoke test (SKIPs without a key)
 python -m typesafe_eval.eval.run_eval [--client heuristic|http] [--sweep]  # recall/precision + threshold sweep
 ```
 
-`--batch` sends **one request per source file** (fanning out every policy
-question about that file) instead of one per finding — Jev has no cross-request
-cache, so batching questions that share a file's code is the way to avoid
-re-sending it. See
+Batching by source file is the default: one request per file chunk of up to
+`MAX_ASKS_PER_REQUEST` data types (fanning out every policy question about that
+file) instead of one per finding — Jev has no cross-request cache, so batching
+questions that share a file's code is the way to avoid re-sending it.
+`--per-finding` restores one request per (policy, finding); `--batch` is
+accepted for backwards compatibility and is a no-op. See
 [`../../docs/request-batching-optimization.md`](../../docs/request-batching-optimization.md).
+
+`--cache` memoizes Jev answers by (model, questions, state). `--capability-cache`
+is the persistent, human-reviewable JSON of identifier -> capability labels
+(default `$PPI_CAPABILITY_CACHE` or `~/.cache/play_policy_insights/capabilities.json`);
+human-authored entries always win over model entries. `-v` enables DEBUG logging
+on the `typesafe_eval.*` loggers (per-request question ids, cache decisions,
+relevance-gate drops).
+
+`calibrate` reads a label set kept **outside the repository** (it names real
+files of real apps) and derives `T_TRANSMIT_LOW`/`T_TRANSMIT_HIGH`, Brier/ECE and
+a provenance block for `constants.THRESHOLD_PROVENANCE`; see
+[`../../docs/capability-based-evaluation.md`](../../docs/capability-based-evaluation.md) §4
+for the label format and method.
 
 See [`../../docs/evaluation-charter.md`](../../docs/evaluation-charter.md) for the
 quality dimensions and bars, and
 [`../../docs/policy-coverage-evolution.md`](../../docs/policy-coverage-evolution.md)
-for the plan to reach parity across all policies and select models.
+for the plan to reach parity across all policies and select models. The
+per-policy expansion plan and the generalisations mined from the legacy-skill
+runs are in
+[`../../docs/legacy-skill-lessons-and-coverage-plan.md`](../../docs/legacy-skill-lessons-and-coverage-plan.md);
+the work packages and milestone gates that implement them are in
+[`../../docs/v2-improvement-execution-plan.md`](../../docs/v2-improvement-execution-plan.md).
 
 ## Files
 
 | File | Purpose |
 | --- | --- |
-| `registry.py` | **Single source of truth**: one `PolicySpec` per policy (id, kind, activation, battery, compose). Add a policy here. |
-| `engine.py` | Generic evaluator: reads raw scan artifacts, activates the registry, batches by file, isolates failures, writes `worker_*.json`. |
-| `constants.py` | All tunable thresholds + sensitivity/risk tables + model id. |
-| `questions.py` | The typed question batteries (Choice/Score/Noul). |
-| `client.py` | `HttpJevClient` (real API) + `HeuristicJevClient` (offline). |
+| `registry.py` | **Single source of truth**: one `PolicySpec` per policy (id, kind, activation, battery, compose, `compose_manifest`). Add a policy here. `MANIFEST` specs receive `ManifestInputs` (profile, legacy manifest dict, app purpose, app root); WP5 ships the wave-1 deterministic policies (`foreground_services_policy` over the profile, `all_files_access_policy`, `package_visibility_policy`, `exact_alarm_policy`, `target_api_level`) with purpose-conditioned severity via `evaluate.purpose_in`. WP9: `PolicySpec.requires_permissions` / `applies_file` / `one_per_file` / `needs_app_purpose` planner gates; `photo_video_access_policy` and `files_and_docs_policy` as a manifest spec + a per-file code spec each (`_photo_video_findings`, `_files_and_docs_findings`, `_photo_video_code_spec`, `_files_and_docs_code_spec`). |
+| `engine.py` | Cascade evaluator: reads raw scan artifacts, loads the `AppProfile`, asks the once-per-app `declared_core_purpose` question (WP4: `_ask_app_purpose`, cached per app, degrades to `unknown`/`unavailable` on failure, label copied into `app_facts["purpose"]`), filters candidates, analyses file structure, classifies identifiers, resolves one-hop first-party callees for surviving candidate files (WP6: `_resolve_callees`, callee imports classified like callers'; the index skips non-prioritised flavour sources so a stub in an unshipped flavour cannot shadow the real dependency), triages by capability tier (callee capabilities included; the per-type `MAX_FINDINGS_PER_TYPE` budget is charged only to candidates that are not cap-exempt, counters `kept_budgeted` / `cap_exempt_sink_in_scope` / `cap_exempt_callee_only`), batches by file, isolates failures, writes `worker_*.json` + `typesafe_triage.json` (incl. `app_purpose`, `first_party_index`, `callee_resolution`, `callee_refs`, `anchors_with_callees`, `anchors_tier_raised_by_callee`). WP8: `_file_state` hands the first-party index and the profile's `ResourceIndex` to `context.build_file_state` (guards + strings); `_attribute_sources` sets `manifest_sources` on manifest findings (trace `permission` / `service`) and on permission-goal code findings (`POLICY_PERMISSIONS`) when the declaring source sets are flavour-only (counter `manifest_sources_attributed`). WP9: `_plan_from_candidates(kept, ctx)` applies the three planner gates (drops recorded in `dropped`, counters `planner_gated` / `tasks_per_policy`); `_compose_task` passes `app_purpose=` to specs that declare `needs_app_purpose`. WP10: `_write_triage` lists every non-`as_labelled` answer under `type_confirmations` and the per-action counter `type_confirmations`. |
+| `structure.py` | Deterministic structure layer: language, imports, declared package, scopes (control-flow headers are not declarations), symbol references (every call site; comments/imports demoted), dependency inventory, first-party detection helpers, and the identifier-boundary lexical pre-gate (WP2: `boundary_matches`, `is_type_position`, `lexical_hits` → per-file `value` / `type_only` / `substring_only` / `demoted_only` verdict); `find_class_files` / `value_reference_lines` (WP5: locate a component's class file and exact-identifier references such as `startForeground`); `FirstPartyIndex` / `build_first_party_index` / `callee_references` (WP6: per-app `simple class name → file` index of shipped `.kt`/`.java`/`.cs` source with `excluded_flavors`, resolution by caller import → same package → unique → nearest directory; platform-name shadows are not resolved; each `CalleeRef` records `members_by_line`, the `Symbol.member(` names called on every reference line) plus `called_members` / `member_declaration_lines` / `declaration_scope` for locating a member's body in the callee; `DestinationHint` / `destination_hints` / `developer_domains` (WP7: deterministic destination priors per scope — `preference_or_ui_field` when a user-source token meets a destination-shaped identifier split at camel/snake boundaries, `chooser` for share-sheet / document-picker tokens, `developer_backend` vs `constant_endpoint` for URL literals by host against the package domain; comments and imports skipped). `GuardFlag` / `guard_flags` / `Declaration` / `declaration_of` / `string_references` (WP8: boolean flags guarding an anchor scope — bare/negated/dotted identifiers, no-arg member calls, inline `getBoolean(key, default)` reads, multi-line conditions, early-exit bodies (`if (!x) return` inverts the sense, `early_exit`), standard-library predicates (`isEmpty()`, `exists()`, …) and `when` subjects excluded, `MAX_GUARDS_IN_STATE` — with their declaration and `default_on` resolved `inline` → `same_file` → `receiver_type` one first-party hop; `R.string.<name>` references on given lines). `code_portion` / `StorageHint` / `external_storage_paths` / `MediaHint` / `media_access_hints` (WP9: trailing-comment stripping before lexical classification; shared-storage root and public-directory hints with `writes` > `composes` > `references` strength; MediaStore `LIBRARY_QUERY` / picker `USER_PICK` hints per scope). |
+| `android_manifest.py` | Evaluator-owned manifest parser (WP1): discovers every `AndroidManifest.xml`, picks the primary module, merges `main` + flavor/build-type source sets into one `AppProfile` (permissions with `maxSdkVersion` and per-source-set attribution, all components incl. typeless services, `<property>`, `<queries>`, `tools:node="remove"`, accessibility `isAccessibilityTool`, Gradle `namespace`/`targetSdk` fallback). `manifest_details.json` is only a fallback. Stored on `RunContext.profile`, summarised in `typesafe_triage.json["app_profile"]`. `partial_sources(entry)` (WP8): the shipped source sets declaring a permission/component when they are a strict subset of the build (None for `main`, all-shipped or unattributed entries). |
+| `taxonomy.py` | Data Safety taxonomy reader (WP10): `load()` (cached, from `resources/policies.json`; empty on failure with a warning), `category_of` / `display_name` / `description`, and `siblings(data_type)` — confusion siblings first, then same-category types, capped at `MAX_TYPE_SIBLING_OPTIONS` — the option set of the `data_type_confirmed` question. |
+| `resources.py` | Default-locale resource index: `res/values/*.xml` strings (+ string arrays) and `res/xml/<name>.xml` paths; resolves `@string/` and `R.string.` references so policies can reason about disclosure *text*. |
+| `triage_diff.py` | `triage-diff <before> <after>`: finding-level and counter-level diff of two runs against a recorded baseline (WP0). |
+| `capabilities.py` | Behavioural capability taxonomy (`NETWORK_EGRESS`, `THIRD_PARTY_TELEMETRY`, `ADVERTISING_SDK`, `IPC_SHARING`, `LOCAL_PERSISTENCE`, `LOGGING`, `USER_DISCLOSURE_UI`, `UNKNOWN`), model-driven classification, `CapabilityCache` (identifier profiles plus, since WP4, per-app answers under `app|…` keys: `get_app_answer` / `put_app_answer`; human entries are model-independent and never overwritten). No vendor names. |
+| `context.py` | Sinks (transfer-capable identifiers referenced in a file; every reference is used for ranking, the state lists the `MAX_SINK_REF_LINES_IN_STATE` nearest the anchors) and anchors (every occurrence ranked by sink tier then proximity, exact-case first; carries the lexical verdict); `related_lines` are the sink lines nearest an anchor; builds the per-file state. `Callee` / `CalleeView` / `file_callees` (WP6): first-party files reached in one hop with their own sinks; each anchor gets a `CalleeView` at **member granularity** when every in-scope reference names a member whose declaration was located (only the sinks inside those member bodies count) and at **file granularity** otherwise; attached per anchor strongest-first (`MAX_CALLEES_PER_ANCHOR`), counted in the anchor tier and `reach_in_scope`, rendered as `state["callees"]` (`members`, `granularity`, `sinks`, `called_at`) plus a `// First-party callee …` section (sink lines only past `MAX_CALLEE_SNIPPET_LINES`; states without hops are byte-identical to the pre-WP6 state). `Anchor.destination_hints` / `destination_hint_kinds` and `state["destination_hints"]` (WP7: flat `{data_type, hint, line, detail, evidence}` list, present only when non-empty; the per-ask mini-state carries the anchor's own hint kinds). `GuardState` / `anchor_guards` / `resolved_strings` and `Anchor.guards` / `guard_defaults` (WP8): the chosen scope's guard flags with located declarations and `runs_by_default` (the declared literal folded with the flag's sense: does the transfer run when the flag keeps its default) → `state["guards"]` (flat, `data_type`-tagged, present only when non-empty) and mini-state `guards` + `anchor.guard_defaults`; `R.string` references on scope and disclosure lines resolved through the profile's `ResourceIndex` → `state["strings"]` (`name -> text|null`, `MAX_STRINGS_IN_STATE`, present only when non-empty). `file_storage_hints` / `has_storage_write_hint` / `Anchor.media_hints` (WP9): `state["external_storage_paths"]` (per file, strongest first) and `state["media_access_hints"]` (per anchor), present only when non-empty. |
+| `constants.py` | All tunable thresholds + sensitivity/risk tables + model id + `THRESHOLD_PROVENANCE` + `EVALUATOR_VERSION`; WP5 purpose tables (`ALL_FILES_ACCESS_PURPOSES`, `PACKAGE_VISIBILITY_PURPOSES`, `EXACT_ALARM_PURPOSES`, `FGS_TYPE_MISALIGNED_PURPOSES`) and the dated Play target-SDK requirement (`PLAY_REQUIRED_TARGET_SDK`, `PLAY_TARGET_SDK_PROVENANCE`); WP6 hop bounds (`CALLEE_RESOLUTION_ENABLED`, `MAX_CALLEE_HOPS`, `MAX_CALLEES_PER_ANCHOR`, `MAX_CALLEE_FILES_PER_CALLER`, `MAX_CALLEE_SNIPPET_LINES`); WP7 destination composition (`DESTINATION_CLASS_ENABLED`, `CONF_DESTINATION_ACT`, `SHARING_DESTINATION_CLASSES`, `T_SHARING_MASS`, `NON_COLLECTION_DESTINATION_CLASSES`, `DESTINATION_HINTS_ENABLED`; `T_THIRD_PARTY` is now the legacy Noul threshold kept for eval-harness compatibility); WP8 consent / strings / attribution (`CONSENT_DEFAULT_ENABLED`, `GUARDS_ENABLED`, `STRING_RESOLUTION_ENABLED`, `PERMISSION_ATTRIBUTION_ENABLED`, `T_CONSENT_DEFAULT_ON`, `CONF_CONSENT_ACT`, `MAX_GUARDS_IN_STATE`, `MAX_STRINGS_IN_STATE`, `DISCLOSURE_STRING_WINDOW`, `MAX_GUARD_DECLARATION_HOPS`, `POLICY_PERMISSIONS`). WP9 storage policies (`PHOTO_VIDEO_POLICY_ENABLED`, `FILES_AND_DOCS_POLICY_ENABLED`, `STORAGE_HINTS_ENABLED`, `MEDIA_HINTS_ENABLED`, `PHOTO_PICKER_TARGET_SDK`, `LEGACY_READ_STORAGE_MAX_SDK`, `PARTIAL_MEDIA_ACCESS_TARGET_SDK`, `SCOPED_STORAGE_TARGET_SDK`, `LEGACY_WRITE_STORAGE_MAX_SDK`, `T_FULL_MEDIA_LIBRARY`, `T_ROOT_LEVEL_FOLDER`, `STORAGE_HINT_WINDOW`, `MAX_STORAGE_HINTS_IN_STATE`, `MAX_MEDIA_HINTS_IN_STATE`, `PHOTO_VIDEO_PURPOSES`, `BROAD_MEDIA_PERMISSION_SHORT_NAMES`). WP10 type confirmation (`DATA_TYPE_CONFIRMED_ENABLED`, `CONF_TYPE_CONFIRM`, `MAX_TYPE_SIBLING_OPTIONS`, `NOT_PERSONAL`, `TYPE_CONFUSION_SIBLINGS`). |
+| `questions.py` | The typed question batteries (Choice/Score/Noul); the relevance question embeds the literal matched token. `APP_PURPOSE_OPTIONS` + `app_purpose_battery()` (WP4): the closed once-per-app `declared_core_purpose` Choice (`unknown` always present). The `transmits_offdevice` questions explain `callees` (WP6). `DESTINATION_CLASS_OPTIONS` + `destination_class_question()` (WP7): the closed `destination_class` Choice (`developer_backend`, `third_party_sdk`, `user_chosen_destination`, `platform_component`, `other_app_ipc`, `unknown`) that replaces the `is_third_party` Noul in the data-safety battery; its instructions explain `sinks`, `callees` and `destination_hints` as evidence to weigh. `consent_default_question()` (WP8): the `consent_default_on` Noul ("does the transfer happen unless the user turned it off?") whose instructions explain the `guards` block; the disclosure questions name the resolved `strings`. `photo_video_battery()` (`signal_relevant` + Noul `accesses_full_media_library`) and `files_and_docs_battery()` (Noul `creates_root_level_external_folder`) (WP9); their instructions explain the `media_access_hints` / `external_storage_paths` blocks. `data_type_confirmed_question()` (WP10): the closed `data_type_confirmed` Choice (`as_labelled`, the taxonomy siblings, `NOT_PERSONAL`, `unknown`) inserted after `signal_relevant` in the data-safety battery. |
+| `client.py` | `HttpJevClient` (real API) + `HeuristicJevClient` (offline, labelled stand-in; WP7: `_destination_prior` answers `destination_class` from the state's hints and strongest in-scope capability so offline runs exercise every composition branch; WP8: `_consent_prior` answers `consent_default_on` from the guard defaults in the state). WP9: `_storage_priors` answers the two storage Nouls from the hint blocks. WP10: `data_type_confirmed` is answered `as_labelled` (peaked) so offline runs compose as before. |
 | `cache.py` | `ResultCache` + `CachingClient`: memoize by (model, questions, state). |
-| `snippets.py` | Deterministic code-snippet + co-located data-flow extraction. |
-| `templates.py` | Deterministic `issue_summary` / `recommendation`. |
-| `evaluate.py` | Compose functions + code-derived severity + critic; `run` delegates to the engine. |
+| `snippets.py` | Legacy deterministic code-snippet + co-located data-flow extraction (v1 path). |
+| `templates.py` | Deterministic `issue_summary` / `recommendation` (per policy, per severity where remediation differs; wave-1 manifest policies included). WP9: `media_access_summary` / `root_folder_summary` and per-severity recommendations for the two storage policies. |
+| `evaluate.py` | Compose functions: relevance gate (soft when an egress/IPC sink is in the anchor's scope or a strong egress sink is anywhere in the file — `relevance` trace `low` / `low_file_egress`; hard below `T_RELEVANCE_FLOOR`), `purpose_in()` (WP4: is the app's established purpose in a policy's allowed set — `False` for `unknown`, missing or confidence < `CONF_APP_PURPOSE` unless human-pinned), three-way transfer decision, disclosure-status reconciliation against the battery's own Noul, code-derived severity, structured `source@…:Lstart-Lend -> sink@Ln Symbol [CAPS]` evidence (+ `evidence_flow` dict; WP6: `-> sink@<callee file>:Ln Symbol [CAPS] (via Class called at Lk)` when the sink is one hop away, `files_involved` then lists the callee file, `sharing_sinks_in_scope` includes callee IPC sinks, `file_has_strong_egress` counts callee sinks), decision trace (incl. `callees`), critic on the atomic transfer claim. `Destination` / `destination_from_answers` / `compose_destination` (WP7): closed-class composition table — `is_third_party` when the probability mass on the sharing classes reaches `T_SHARING_MASS` or an IPC sink is in scope (a sharing argmax below the mass is review-flagged `[sharing unconfirmed …]`, not flipped); `user_chosen_destination` / `platform_component` downgrade to SUGGESTION + EXEMPT and clear `is_third_party` only behind the double gate (confidence ≥ `CONF_DESTINATION_ACT` **and** corroboration by an in-scope hint, `user_initiated`, or no strong egress in scope); unconfirmed or `unknown` on a transfer keeps severity + review + `[destination … unconfirmed]` suffix; legacy `is_third_party` Noul still composes (`legacy: true`); everything recorded in `decision_trace.destination`. `Consent` / `compose_consent` (WP8): asymmetric composition of the `consent_default_on` Noul against the guards' `runs_by_default` — raise IMPORTANT → CRITICAL (TRANSMITS only; UNCERTAIN stays capped, `band_capped`) at `p >= T_CONSENT_DEFAULT_ON` unless a guard keeps the transfer off by default (`vetoed_by_guard`, review), lower to SUGGESTION + review only at `p <= 1 - CONF_CONSENT_ACT` **and** such a guard; evidence suffix `[guard <flag> default=<…> [init="…"] [runs when false] @file:Ln]`, `evidence_flow.guards`, finding `consent_default_on`, `decision_trace.consent` / `consent_note`. `compose_photo_video_finding` / `compose_files_and_docs_finding` (WP9): mode bands (`media_access_mode`, `root_folder_mode`), corroboration against the deterministic hints, purpose-conditioned severity, double-gated downgrades, traces `decision_trace.media_access` / `root_folder`. `TypeConfirmation` / `type_confirmation_from_answers` / `compose_type_confirmation` (WP10): read only in band; a sibling type at/above `CONF_TYPE_CONFIRM` relabels the finding (raise applies fully, lower one step + review), `NOT_PERSONAL` keeps the finding and caps at IMPORTANT + review, `unknown` → review; `compose_consent(type_disputed=)` caps a consent raise on a disputed type; finding `scanner_data_type` / `confirmed_type` / `data_type_confirmed`, trace `type_confirmation` / `type_note`. |
+| `calibrate.py` | Derives the transfer band and reliability metrics from an out-of-tree label set. `--rejoin --worker-dir DIR…` re-joins the frozen labels to a new run and exits 2 if any labelled transfer has no finding (the recall-1.0 check used at every WP gate). Label schema v2 (WP7): optional `destination_class` on transfer cases; `--rejoin` copies the run's `run_destination_class` / `run_is_third_party` / `run_transfer_decision` / `run_severity` / `destination_confirmed` / `destination_applied` onto each case and reports `reliability_by_class`, `reliability_in_band` / `reliability_in_derived_band` (UNCERTAIN-band ECE) and a `destination` block (per-class precision/recall, confusion, `sharing_agreement`, `sharing_regressions` → exit 3, `applied_downgrades_wrong`); the joined per-case rows are written under `cases` so two reports can be diffed. WP10: labels join through `scanner_data_type`, optional `confirmed_type` on a case, `type_confirmation` block (confusion table, `accuracy`, `missed_relabels`, `wrong_relabels` → warning, `not_read`). |
 | `batch.py` | File-state builder + namespacing used by the engine's batched path. |
 | `benchmark.py` | Per-finding vs batched: requests / tokens / latency / agreement. |
 | `eval/` | Labeled cases + `run_eval.py` precision/recall harness. |
-| `livetest.py` / `selftest.py` | Live smoke test / offline unit checks. |
+| `livetest.py` / `selftest.py` | Live smoke test / offline unit checks (including the vendor-name lint). |
 
 The evaluator reads the **raw** artifacts `orchestrator.py init` writes
 (`data_safety_scan.json`, `manifest_details.json`, `play_store_info.json`) and
@@ -80,9 +110,26 @@ memoize calls (a warm re-run makes zero API calls).
 Evaluation kinds: `code_signal` (per-file battery), `deterministic` (code, with
 an optional model "evidence gate" that filters generic-pattern false positives),
 `play_declaration` (detected off-device collection vs the developer's Play Data
-Safety declaration — semantic coverage), and `manifest` (reserved). Activation
-prioritizes the Play build flavor, caps findings per data type, and skips
-`res/values*` string catalogs (translations caused false positives).
+Safety declaration — semantic coverage; runs only for TRANSMITS findings), and
+`manifest` (deterministic checks on `AndroidManifest.xml`, currently
+foreground-service types). Activation prioritizes the Play build flavor, skips
+`res/values*` string catalogs and `src/test*` source sets, caps candidates and
+findings per data type, and ranks candidates by capability tier (explicit egress
+in scope > IPC in scope > unknown sink > none) then sink proximity.
+
+### Transfer decision and observability (v2)
+
+`transmits_offdevice` is composed into a three-way decision rather than a single
+cliff: `LOCAL` (p < `T_TRANSMIT_LOW`), `UNCERTAIN` (in the band; reported as
+transferred, severity at least IMPORTANT, `needs_manual_review`, never pruned,
+title suffixed `[transfer uncertain: p=..; verify]`), `TRANSMITS`
+(p >= `T_TRANSMIT_HIGH`). IPC hand-offs to other apps count as sharing. Every
+finding carries a `decision_trace` (scores, thresholds, anchor with
+`scope_capabilities` and `rank_tier`, sinks, model, taxonomy and evaluator
+version), and every run writes `typesafe_triage.json` with counters, decision and
+severity histograms, capability summaries, cache statistics, token usage and the
+full list of dropped candidates with reasons. Details in
+[`../../docs/capability-based-evaluation.md`](../../docs/capability-based-evaluation.md).
 
 ## Status
 
@@ -102,3 +149,27 @@ lines in the state, composing severity in code from Jev's atomic booleans
 threshold sweep. The earlier offline-heuristic "0.94" was circular (the
 heuristic is derived from the same signals); the live numbers are the real
 signal. Growth to full policy parity is planned in the coverage-evolution doc.
+
+### Validated on real applications (v2, `2.0.0-capability`; re-calibrated at M2 as `2.1.0-capability`)
+
+The v2 cascade was run end-to-end with live `jev-1.13.0` on two open-source
+Android applications and compared against the legacy agent skill on the same
+trees. v2 recovers every Critical the legacy skill found and v1 had missed
+(purchase token, device id and crash-log uploads, now TRANSMITS findings plus
+Data Safety discrepancies) and surfaces a credential sent over a raw socket
+(p=0.90) that v1 had dropped in triage. Against 48 hand-adjudicated transfer
+labels (23 true transfers) the shipped band has **zero false negatives**;
+TRANSMITS alone has precision 0.944. At M2 (after one-hop callee resolution and
+`destination_class`, label schema v2) the band was re-derived by `calibrate
+--rejoin`: shipped `[0.35, 0.72]`, zero off-device false negatives, TRANSMITS
+precision 0.933, destination-class accuracy 0.826, seven user-directed transfers
+downgraded to inventory with none wrong. The label set lives outside the
+repository; the method and numbers are in the capability-based-evaluation doc
+§4-5 and in `constants.THRESHOLD_PROVENANCE`.
+
+Time to outcome and cost, measured against the original skill run as `SKILL.md`
+prescribes (Claude Fable 5.1, effort high, 3 sub-agents at a time) on the same
+trees: Phase 2 took 18 min 37 s / 8 min 23 s on the two apps at an estimated
+$30-$255 / $13-$91 per audit at public list prices; v2 took 34 s / 10 s cold
+(7.7 s / ~3 s warm) at $0.024 / $0.005 in metered Jev input tokens. Details and
+the estimation method are in the capability-based-evaluation doc §5.1.

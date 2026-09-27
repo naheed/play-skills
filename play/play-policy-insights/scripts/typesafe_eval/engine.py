@@ -14,36 +14,70 @@
 
 """Generic evaluation engine driven by the policy registry.
 
-The engine owns the workflow; policies are data (``registry.py``). It:
+The engine owns the workflow; policies are data (``registry.py``). One run is a
+fixed cascade (see ``docs/capability-based-evaluation.md``):
 
-1. reads the *raw* deterministic artifacts ``orchestrator.py init`` produced
-   (``data_safety_scan.json``, ``manifest_details.json``, ``play_store_info.json``)
-   rather than the agent-oriented ``input_worker_*.json`` prompt files;
-2. activates policies from the registry per evaluation kind;
-3. evaluates them (batched by file for ``code_signal``), isolating failures so
-   one bad unit becomes a MANUAL_REVIEW finding instead of crashing the scan; and
-4. writes the same ``worker_<goal>.json`` schema the rest of the pipeline
-   consumes (``aggregate`` globs every ``worker_*.json``).
+1. **Load** the *raw* deterministic artifacts ``orchestrator.py init`` produced
+   (``data_safety_scan.json``, ``manifest_details.json``,
+   ``play_store_info.json``) and build the evaluator-owned
+   :class:`~typesafe_eval.android_manifest.AppProfile` by parsing and merging
+   the app's own ``AndroidManifest.xml`` files (``manifest_details.json`` is
+   the fallback for ``package_name`` / ``target_sdk``).
+2. **Filter candidates** (deterministic, free): prioritize the Play build
+   flavor, drop string-catalog resources, bound each data type at
+   ``MAX_CANDIDATES_PER_TYPE`` raw signals.
+3. **Structure** (deterministic, free): index every candidate file — imports,
+   symbol references, and the project's declared dependencies.
+4. **Semantics** (model, cached): classify the imported packages, then the
+   individual imports inside transfer-capable packages, and the declared
+   dependencies onto the capability taxonomy. Results are memoized in a
+   persistent, human-reviewable cache so the cost amortizes across apps.
+5. **Triage** (deterministic, free): anchor each candidate at the occurrence
+   whose enclosing scope is nearest a capability-labelled sink and keep the
+   top ``MAX_FINDINGS_PER_TYPE`` per data type (and ``MAX_PER_FILE_PER_TYPE``
+   per file). Everything dropped is recorded with its rank and reason.
+6. **Policy** (model, batched by file): run the registry batteries against the
+   enriched state and compose findings in code (three-way transfer decision,
+   relevance gate, decision trace). Manifest-kind policies run with no model
+   call; the Play-declaration cross-check runs last over confirmed transfers.
+7. **Write** the same ``worker_<goal>.json`` schema the rest of the pipeline
+   consumes, plus ``typesafe_triage.json`` with every counter a reviewer needs
+   to audit what was and was not sent to the model.
+
+Every stage isolates failures: a bad file, a failed classification batch, or a
+failed battery becomes a MANUAL_REVIEW finding or an UNKNOWN profile, never a
+crash and never a silent drop.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
+import logging
 import os
 import re
 from typing import Any
 from typing import Dict
 from typing import List
 from typing import Optional
+from typing import Sequence
+from typing import Tuple
 
-from typesafe_eval import batch
+from typesafe_eval import android_manifest
+from typesafe_eval import capabilities as caps
 from typesafe_eval import constants
+from typesafe_eval import context
 from typesafe_eval import evaluate
+from typesafe_eval import identity
+from typesafe_eval import questions as q
 from typesafe_eval import registry
 from typesafe_eval import snippets
+from typesafe_eval import structure
 from typesafe_eval import templates
 from typesafe_eval.client import JevClient
+
+log = logging.getLogger("typesafe_eval.engine")
 
 _FLAVOR_RE = re.compile(r"/src/([^/]+)/")
 
@@ -53,20 +87,85 @@ _GOAL_DOMAIN = {
     "data_safety": "Data Safety and Privacy",
 }
 
+TRIAGE_FILENAME = "typesafe_triage.json"
+
+
+@dataclasses.dataclass
+class Candidate:
+  """One raw scanner signal that survived candidate filtering."""
+
+  data_type: str
+  finding_str: str
+  relpath: str
+  pattern: str
+  order: int                                 # position in scanner output
+  anchor: Optional[context.Anchor] = None    # filled by triage
+  lexical: Optional[structure.LexicalHits] = None   # filled by the pre-gate (WP2)
+
 
 @dataclasses.dataclass
 class Task:
+  """One (policy, candidate) unit of model work."""
+
   spec: registry.PolicySpec
   data_type: str
   finding_str: str
   relpath: str
+  pattern: str = ""
+
+
+@dataclasses.dataclass
+class RunContext:
+  """Everything the stages share for one app run."""
+
+  temp_dir: str
+  app_dir: str
+  app_facts: Dict[str, Any]
+  manifest: Dict[str, Any]
+  # Evaluator-owned merged manifest facts (WP1). ``None`` only in unit tests
+  # that construct a context by hand; ``run()`` always builds one. Not part of
+  # the model-facing ``app_facts`` so request states (and the capability cache)
+  # are unchanged by its presence.
+  profile: Optional[android_manifest.AppProfile] = None
+  files: Dict[str, structure.FileStructure] = dataclasses.field(default_factory=dict)
+  # Files whose every candidate the lexical pre-gate dropped (WP2). Kept apart
+  # so their declared packages still count as first-party, while their imports
+  # are not sent for capability classification.
+  pruned_files: Dict[str, structure.FileStructure] = dataclasses.field(default_factory=dict)
+  profiles: Dict[str, caps.CapabilityProfile] = dataclasses.field(default_factory=dict)
+  dependency_profiles: Dict[str, caps.CapabilityProfile] = dataclasses.field(default_factory=dict)
+  counters: Dict[str, Any] = dataclasses.field(default_factory=dict)
+  dropped: List[Dict[str, Any]] = dataclasses.field(default_factory=list)
+  # Once-per-app ``declared_core_purpose`` answer (WP4); see ``_ask_app_purpose``.
+  app_purpose: Dict[str, Any] = dataclasses.field(default_factory=lambda: {
+      "purpose": "unknown", "confidence": 0.0, "source": "unavailable"})
+  # One-hop callee resolution (WP6). ``first_party_index`` maps the app's own
+  # class names to files; ``callee_refs`` holds, per surviving candidate file,
+  # the first-party classes referenced inside its candidate scopes; and
+  # ``callee_files`` is the structure of every callee file so its imports can
+  # be classified and its sinks computed exactly like a caller's.
+  first_party_index: Optional[structure.FirstPartyIndex] = None
+  callee_refs: Dict[str, List[structure.CalleeRef]] = dataclasses.field(default_factory=dict)
+  callee_files: Dict[str, structure.FileStructure] = dataclasses.field(default_factory=dict)
+  # WP11: the whole-app identity-lifecycle assessment (``account_deletion``)
+  # and the once-per-app ``login_gate_type`` answer, both written to the
+  # triage file so a reviewer can reproduce the app-level findings.
+  identity_trace: Dict[str, Any] = dataclasses.field(default_factory=dict)
+  login_gate: Dict[str, Any] = dataclasses.field(default_factory=lambda: {
+      "gate_type": "unknown", "confidence": 0.0, "source": "not_asked"})
+
+
+# ---------------------------------------------------------------------------
+# Stage 1: load
+# ---------------------------------------------------------------------------
 
 
 def _load_json(path: str) -> dict:
   try:
     with open(path, "r", encoding="utf-8") as f:
       return json.load(f)
-  except Exception:  # pylint: disable=broad-exception-caught
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    log.debug("could not read %s: %s", path, exc)
     return {}
 
 
@@ -87,13 +186,127 @@ def load_artifacts(temp_dir: str):
   return data_sources, manifest, app_facts, app_dir
 
 
-def _reduce_noise(data_sources: Dict[str, List[str]]) -> Dict[str, List[str]]:
-  """Prioritizes the Play flavor and caps findings per data type.
+def _load_profile(ctx: RunContext) -> android_manifest.AppProfile:
+  """Builds the merged manifest profile; never raises.
 
-  Mirrors the orchestrator's smart filtering so the evaluator processes the same
-  bounded set the agent path would, instead of every raw signal.
+  A profile failure must not abort a run (recall first): the fallback profile
+  is built from ``manifest_details.json`` alone and the failure is recorded in
+  the triage counters so a reviewer can see the manifest layer was degraded.
   """
-  # Detect build flavors present; only filter when a Play flavor exists.
+  try:
+    profile = android_manifest.load_profile(ctx.app_dir, ctx.manifest)
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    log.exception("manifest profile failed; continuing with manifest_details.json only")
+    profile = android_manifest.AppProfile(app_dir=ctx.app_dir)
+    profile.warnings.append(f"profile build failed: {type(exc).__name__}: {exc}")
+    android_manifest._apply_fallback(profile, ctx.manifest)  # pylint: disable=protected-access
+  ctx.counters["manifests_merged"] = len(profile.manifests)
+  ctx.counters["manifest_warnings"] = len(profile.warnings)
+  ctx.counters["manifest_other_modules"] = list(profile.other_modules)
+  return profile
+
+
+# ---------------------------------------------------------------------------
+# Stage 1b: once-per-app question (WP4)
+# ---------------------------------------------------------------------------
+
+APP_PURPOSE_QID = "declared_core_purpose"
+_STORE_DESCRIPTION_MAX = 600  # characters of the store description sent with the question
+
+
+def _app_purpose_state(ctx: RunContext) -> Dict[str, Any]:
+  """The compact state for the per-app purpose question.
+
+  Store facts come from ``play_store_info.json`` via ``app_facts`` plus the
+  description (truncated); manifest facts are the profile digest. Nothing
+  else — the answer must be reproducible from facts a reviewer can read in
+  the triage file.
+  """
+  store = evaluate._load_json(os.path.join(ctx.temp_dir, "play_store_info.json"))  # pylint: disable=protected-access
+  desc = store.get("description") or ""
+  if len(desc) > _STORE_DESCRIPTION_MAX:
+    desc = desc[:_STORE_DESCRIPTION_MAX - 1] + "…"
+  return {
+      "app": {
+          "name": ctx.app_facts.get("name"),
+          "package": ctx.app_facts.get("package"),
+          "target_sdk": ctx.app_facts.get("target_sdk"),
+          "store_category": ctx.app_facts.get("store_category"),
+          "store_description": desc or None,
+      },
+      "profile": ctx.profile.render_compact() if ctx.profile is not None else "",
+  }
+
+
+def _ask_app_purpose(
+    ctx: RunContext,
+    client: JevClient,
+    cache: Optional[caps.CapabilityCache],
+    model: Optional[str],
+) -> Dict[str, Any]:
+  """Asks ``declared_core_purpose`` once per app (or reads it from the cache).
+
+  Result (also stored on ``ctx.app_purpose`` and in the triage file)::
+
+    {"purpose": "file_manager", "confidence": 0.91, "source": "model"|"cache"|"human"|"unavailable",
+     "probabilities": {...}, "digest": "<sha256 of the question state + battery>"}
+
+  The option label alone is appended to ``ctx.app_facts["purpose"]`` so every
+  later request carries it; the confidence stays out of the model-facing
+  state (it is a routing input for :func:`evaluate.purpose_in`, not evidence).
+  A client failure degrades to ``unknown`` / confidence 0 / ``unavailable``,
+  which downstream reads as "not justified" — never as a reason to lower a
+  severity. Never raises.
+  """
+  battery = q.app_purpose_battery()
+  state = _app_purpose_state(ctx)
+  # The digest covers everything the model sees (manifest profile, store facts,
+  # question wording), so a changed store listing or reworded option re-asks
+  # instead of silently reusing a stale answer.
+  digest_src = json.dumps(state, sort_keys=True, ensure_ascii=False) + "\n" + json.dumps(battery, sort_keys=True)
+  digest = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
+  result: Dict[str, Any] = {"purpose": "unknown", "confidence": 0.0, "source": "unavailable",
+                            "probabilities": None, "digest": digest}
+  cached = cache.get_app_answer(APP_PURPOSE_QID, digest, model) if cache is not None else None
+  if cached is not None:
+    result.update({k: cached.get(k, result.get(k)) for k in ("purpose", "confidence", "probabilities")})
+    result["source"] = "human" if cached.get("source") == "human" else "cache"
+    log.info("app purpose (from %s): %s (confidence %.2f)", result["source"], result["purpose"], result["confidence"])
+  else:
+    try:
+      answers = client.system_one(state, battery, model=model)
+      a = answers.get(APP_PURPOSE_QID)
+      if a is None or a.type != "choice" or not a.choice:
+        raise ValueError(f"no choice answer for {APP_PURPOSE_QID}: {a}")
+      purpose = a.choice if a.choice in q.APP_PURPOSE_OPTIONS else "unknown"
+      if purpose != a.choice:
+        log.warning("app purpose answer %r not in the closed option set; recorded as unknown", a.choice)
+      result.update({"purpose": purpose, "confidence": float(a.confidence or 0.0),
+                     "probabilities": a.probabilities, "source": "model"})
+      ctx.counters["app_purpose_requests"] = ctx.counters.get("app_purpose_requests", 0) + 1
+      if cache is not None:
+        cache.put_app_answer(APP_PURPOSE_QID, digest, model, {
+            "purpose": result["purpose"], "confidence": result["confidence"],
+            "probabilities": result["probabilities"], "source": "model", "model": model})
+        cache.save()  # classify() only saves when it had a batch to ask
+      log.info("app purpose (model): %s (confidence %.2f) top=%s", result["purpose"], result["confidence"],
+               sorted((a.probabilities or {}).items(), key=lambda kv: -kv[1])[:3])
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      log.warning("app purpose question failed (%s: %s); recorded as unknown/unavailable",
+                  type(exc).__name__, exc)
+      ctx.counters["app_purpose_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+  ctx.app_purpose = result
+  ctx.app_facts["purpose"] = result["purpose"]
+  return result
+
+
+# ---------------------------------------------------------------------------
+# Stage 2: candidate filtering (deterministic)
+# ---------------------------------------------------------------------------
+
+
+def _excluded_flavors(data_sources: Dict[str, List[str]]) -> set:
+  """Non-prioritized product flavors, only when a ``play`` flavor exists."""
   flavors = set()
   for findings in data_sources.values():
     if isinstance(findings, list):
@@ -102,8 +315,516 @@ def _reduce_noise(data_sources: Dict[str, List[str]]) -> Dict[str, List[str]]:
         if m:
           flavors.add(m.group(1))
   prioritized = set(constants.PRIORITIZED_FLAVORS)
-  excluded = (flavors - prioritized) if ("play" in flavors) else set()
+  return (flavors - prioritized) if ("play" in flavors) else set()
 
+
+def _filter_candidates(
+    data_sources: Dict[str, List[str]], ctx: Optional[RunContext] = None
+) -> Dict[str, List[Candidate]]:
+  """Stage 2: flavor + resource filtering and the raw per-type cost bound.
+
+  Unlike the previous "first N in scanner order" cap, this keeps up to
+  ``MAX_CANDIDATES_PER_TYPE`` signals so triage can *rank* them by sink
+  proximity before the much smaller model cap is applied.
+  """
+  excluded = _excluded_flavors(data_sources)
+  out: Dict[str, List[Candidate]] = {}
+  raw = 0
+  for data_type, findings in data_sources.items():
+    if not isinstance(findings, list):
+      continue
+    kept: List[Candidate] = []
+    for order, f in enumerate(findings):
+      raw += 1
+      path = "/" + f
+      if any(f"/src/{flavor}/" in path for flavor in excluded):
+        _drop(ctx, data_type, f, "non-prioritized build flavor")
+        continue
+      if any(frag in path for frag in constants.EXCLUDED_PATH_SUBSTRINGS):
+        _drop(ctx, data_type, f, "excluded path (string-catalog resource or test source set)")
+        continue
+      relpath_only, _ = snippets.parse_finding(f)
+      if (relpath_only or f).lower().endswith(constants.EXCLUDED_PATH_SUFFIXES):
+        _drop(ctx, data_type, f, "excluded path (localisation catalog)")
+        continue
+      if len(kept) >= constants.MAX_CANDIDATES_PER_TYPE:
+        _drop(ctx, data_type, f, f"over MAX_CANDIDATES_PER_TYPE={constants.MAX_CANDIDATES_PER_TYPE}")
+        continue
+      relpath, pattern = snippets.parse_finding(f)
+      kept.append(Candidate(data_type, f, relpath or f, pattern or "", order))
+    if kept:
+      out[data_type] = kept
+  if ctx is not None:
+    ctx.counters["raw_signals"] = raw
+    ctx.counters["candidates"] = sum(len(v) for v in out.values())
+    ctx.counters["excluded_flavors"] = sorted(excluded)
+  log.info("candidates: %d raw signals -> %d candidates across %d data types",
+           raw, sum(len(v) for v in out.values()), len(out))
+  return out
+
+
+def _drop(ctx: Optional[RunContext], data_type: str, finding_str: str, reason: str,
+          **extra: Any) -> None:
+  if ctx is None:
+    return
+  ctx.dropped.append({"data_type": data_type, "finding": finding_str, "reason": reason, **extra})
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 + 4: structure and semantics
+# ---------------------------------------------------------------------------
+
+
+def _first_party_packages(
+    manifest: Dict[str, Any],
+    files: Dict[str, structure.FileStructure],
+    profile: Optional[android_manifest.AppProfile] = None,
+) -> Tuple[str, ...]:
+  """Packages that are the app's own code (never classified as a sink).
+
+  Deterministic sources, all language-level facts rather than guesses: the
+  app's package -- the merged manifest profile's value when available (WP6;
+  it reflects the primary module's ``applicationId``/``namespace`` rather than
+  whichever manifest ``init`` happened to read), else the legacy manifest
+  ``package_name`` -- plus every ``package`` declared by an analysed
+  *candidate* source file (callers and pruned files; not WP6 callee files).
+  An import is first-party when it *is* one of these packages, sits directly
+  in one (``package_of(import)`` matches), or lies beneath one (``pkg.``).
+  Sibling first-party libraries under an unrelated namespace are deliberately
+  *not* excluded (neither the class index nor callee files are used as a
+  package source): whether they transmit is exactly the question the semantic
+  layer should answer, and a vendored or flavour-stubbed SDK copied into the
+  tree must keep being classified as a sink.
+  """
+  app_pkg = ""
+  if profile is not None and profile.package_name:
+    app_pkg = profile.package_name.strip()
+  if not app_pkg:
+    app_pkg = (manifest.get("package_name") or "").strip()
+  pkgs = {app_pkg}
+  pkgs.update(fs.package for fs in files.values() if fs.package)
+  return tuple(sorted(p for p in pkgs if p))
+
+
+def _is_first_party(mod: str, packages: Sequence[str]) -> bool:
+  pkg = structure.package_of(mod)
+  return any(mod == p or pkg == p or mod.startswith(p + ".") for p in packages)
+
+
+def _analyze_files(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> None:
+  """Stage 3: structural index of every candidate file (deterministic)."""
+  relpaths = sorted({c.relpath for cs in candidates.values() for c in cs})
+  for rp in relpaths:
+    ctx.files[rp] = structure.analyze_file(ctx.app_dir, rp)
+  ctx.counters["files_analyzed"] = len(relpaths)
+  ctx.counters["files_unreadable"] = sum(1 for fs in ctx.files.values() if not fs.lines)
+  log.info("structure: %d files indexed (%d unreadable)",
+           len(relpaths), ctx.counters["files_unreadable"])
+  if constants.CALLEE_RESOLUTION_ENABLED and ctx.app_dir:
+    # WP6: the per-app class index is built once here; callee references are
+    # resolved after the lexical pre-gate so hops are only followed from files
+    # that still have a candidate (``_resolve_callees``).
+    excluded = ctx.counters.get("excluded_flavors") or []
+    ctx.first_party_index = structure.build_first_party_index(ctx.app_dir, excluded_flavors=excluded)
+    ctx.counters["first_party_index"] = {
+        "names": len(ctx.first_party_index),
+        "ambiguous": sum(1 for v in ctx.first_party_index.by_name.values() if len(v) > 1),
+        "packages": len(ctx.first_party_index.packages),
+        "excluded_flavors": list(excluded),
+    }
+
+
+def _candidate_scope_lines(fs: structure.FileStructure, patterns: Sequence[str]) -> set:
+  """Union of the enclosing scopes of every occurrence of ``patterns`` in ``fs``.
+
+  This is where an anchor *can* land after triage, computed before triage
+  (which needs the callees' capabilities to rank). Bounded per pattern by
+  ``MAX_OCCURRENCES_RANKED`` like anchor selection itself.
+  """
+  lines: set = set()
+  for pattern in patterns:
+    hits = structure.all_occurrences(fs.lines, pattern, cap=constants.MAX_OCCURRENCES_RANKED,
+                                     prefer_boundary=constants.LEXICAL_PREGATE_ENABLED)
+    for h in hits:
+      lo, hi = structure.enclosing_scope(fs.lines, h, fs.language)
+      lines.update(range(lo, hi))
+  return lines
+
+
+def _resolve_callees(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> None:
+  """Stage 3c (WP6): one-hop first-party callee references for surviving files.
+
+  For every file that still has a candidate after the pre-gate, the
+  first-party classes referenced *inside the enclosing scopes of its candidate
+  hits* are resolved through the class index and each resolved file is
+  structurally analysed once (``ctx.callee_files``). Their imports are then
+  classified alongside the callers' in :func:`_classify_semantics`, so by
+  triage time ``context.file_sinks`` can label the callee's sinks. Everything
+  recorded here is deterministic; the counters and the per-file reference list
+  go into ``typesafe_triage.json`` so a reviewer can see which hops were
+  followed and why (``resolution``).
+
+  Disabled (no-op, counters say so) when ``CALLEE_RESOLUTION_ENABLED`` is
+  False or no index could be built.
+  """
+  if not constants.CALLEE_RESOLUTION_ENABLED or ctx.first_party_index is None:
+    ctx.counters["callee_resolution"] = {"enabled": False}
+    return
+  index = ctx.first_party_index
+  patterns_by_file: Dict[str, List[str]] = {}
+  for cands in candidates.values():
+    for c in cands:
+      pats = patterns_by_file.setdefault(c.relpath, [])
+      if c.pattern and c.pattern not in pats:
+        pats.append(c.pattern)
+  stats = {"enabled": True, "hops": constants.MAX_CALLEE_HOPS, "callers_checked": 0,
+           "callers_with_callees": 0, "references": 0, "callee_files": 0,
+           "callee_files_unreadable": 0, "resolution": {}}
+  for relpath in sorted(patterns_by_file):
+    fs = ctx.files.get(relpath)
+    if fs is None or not fs.lines:
+      continue
+    stats["callers_checked"] += 1
+    within = _candidate_scope_lines(fs, patterns_by_file[relpath])
+    refs = structure.callee_references(fs, index, within=within)
+    if not refs:
+      continue
+    stats["callers_with_callees"] += 1
+    stats["references"] += len(refs)
+    ctx.callee_refs[relpath] = refs
+    for ref in refs:
+      stats["resolution"][ref.resolution] = stats["resolution"].get(ref.resolution, 0) + 1
+      if ref.relpath not in ctx.callee_files:
+        # A callee that is itself a candidate file is already indexed; reuse it
+        # so its structure is computed once.
+        ctx.callee_files[ref.relpath] = (ctx.files.get(ref.relpath)
+                                         or ctx.pruned_files.get(ref.relpath)
+                                         or structure.analyze_file(ctx.app_dir, ref.relpath))
+    log.info("callees for %s: %s", relpath,
+             [(r.symbol, r.relpath, [ln + 1 for ln in r.lines[:5]], r.resolution) for r in refs])
+  stats["callee_files"] = len(ctx.callee_files)
+  stats["callee_files_unreadable"] = sum(1 for fs in ctx.callee_files.values() if not fs.lines)
+  ctx.counters["callee_resolution"] = stats
+  ctx.counters["callee_refs"] = {
+      rp: [{"symbol": r.symbol, "file": r.relpath, "lines": [ln + 1 for ln in r.lines],
+            "resolution": r.resolution} for r in refs]
+      for rp, refs in sorted(ctx.callee_refs.items())
+  }
+  log.info("callee resolution: %d callers checked, %d with first-party callees, %d references, "
+           "%d callee files analysed (%d unreadable); resolution=%s",
+           stats["callers_checked"], stats["callers_with_callees"], stats["references"],
+           stats["callee_files"], stats["callee_files_unreadable"], stats["resolution"])
+
+
+def _lexical_pregate(
+    ctx: RunContext, candidates: Dict[str, List[Candidate]]
+) -> Dict[str, List[Candidate]]:
+  """Stage 3b (WP2): drops candidates whose pattern never occurs as an identifier.
+
+  Deterministic and free. For every identifier-shaped pattern the structure
+  layer classifies each occurrence in the file as a value use, a type-position
+  use, a mid-word substring (``recorder`` is a value use, ``dobiti`` is a
+  substring) or a comment/import mention. A candidate survives when the file
+  has at least one value or type use; a candidate whose file has only mid-word
+  substring hits is dropped with the reason ``no identifier-boundary match``
+  and one example line, so recall can be audited from ``typesafe_triage.json``.
+
+  Non-identifier patterns (MIME types, paths) and unreadable files are never
+  dropped here: there is nothing lexical to decide. Files left with no
+  surviving candidate move to ``ctx.pruned_files`` so their imports are not
+  classified (the model-call saving this WP is measured by).
+  """
+  if not constants.LEXICAL_PREGATE_ENABLED:
+    ctx.counters["lexical_pregate"] = {"enabled": False}
+    return candidates
+  out: Dict[str, List[Candidate]] = {}
+  stats = {"enabled": True, "checked": 0, "kept_value": 0, "kept_type_only": 0,
+           "kept_non_identifier": 0, "kept_unreadable": 0, "kept_demoted_only": 0,
+           "kept_no_occurrence": 0, "dropped_substring_only": 0, "dropped_type_only": 0}
+  for data_type, cands in candidates.items():
+    kept: List[Candidate] = []
+    for c in cands:
+      fs = ctx.files.get(c.relpath)
+      if fs is None or not fs.lines:
+        stats["kept_unreadable"] += 1
+        kept.append(c)
+        continue
+      if not structure.is_identifier_pattern(c.pattern):
+        stats["kept_non_identifier"] += 1
+        kept.append(c)
+        continue
+      stats["checked"] += 1
+      lex = structure.lexical_hits(fs.lines, c.pattern)
+      c.lexical = lex
+      verdict = lex.verdict
+      if verdict == "value":
+        stats["kept_value"] += 1
+        kept.append(c)
+      elif verdict == "type_only":
+        if constants.LEXICAL_TYPE_ONLY_DROP:
+          stats["dropped_type_only"] += 1
+          _drop(ctx, data_type, c.finding_str, "type position only",
+                example=lex.examples.get("type"), lines=lex.type_lines[:5])
+        else:
+          stats["kept_type_only"] += 1
+          kept.append(c)
+      elif verdict == "substring_only":
+        stats["dropped_substring_only"] += 1
+        _drop(ctx, data_type, c.finding_str, "no identifier-boundary match",
+              example=lex.examples.get("substring"), lines=lex.substring_lines[:5])
+      elif verdict == "demoted_only":
+        # Only comments / imports mention it. The scanner strips comments, so
+        # this is normally an import of a type with the word in its name; the
+        # old anchor logic already fell back to these lines. Keep (recall).
+        stats["kept_demoted_only"] += 1
+        kept.append(c)
+      else:
+        # The scanner saw the pattern but this reader did not (encoding or
+        # line-splitting difference). Keep and let the model see the file.
+        stats["kept_no_occurrence"] += 1
+        kept.append(c)
+    if kept:
+      out[data_type] = kept
+
+  active = {c.relpath for cs in out.values() for c in cs}
+  for rp in list(ctx.files):
+    if rp not in active:
+      ctx.pruned_files[rp] = ctx.files.pop(rp)
+  stats["files_pruned"] = len(ctx.pruned_files)
+  stats["candidates_after"] = sum(len(v) for v in out.values())
+  ctx.counters["lexical_pregate"] = stats
+  log.info("lexical pre-gate: %d identifier candidates checked; kept value=%d type_only=%d "
+           "demoted_only=%d; dropped substring_only=%d type_only=%d; %d non-identifier and "
+           "%d unreadable passed through; %d files pruned before classification",
+           stats["checked"], stats["kept_value"], stats["kept_type_only"],
+           stats["kept_demoted_only"], stats["dropped_substring_only"], stats["dropped_type_only"],
+           stats["kept_non_identifier"], stats["kept_unreadable"], stats["files_pruned"])
+  return out
+
+
+def _classify_semantics(
+    ctx: RunContext,
+    client: JevClient,
+    cache: Optional[caps.CapabilityCache],
+    model: Optional[str],
+) -> None:
+  """Stage 4: capability profiles for imports (package -> class) and dependencies.
+
+  Package-level first: a package the model confidently says provides no
+  transfer capability prunes all of its classes in one answer (they inherit the
+  package profile with ``source="package"``). Only packages that are transfer-
+  capable or UNKNOWN are refined to class level, where the profile actually
+  drives sink detection and proximity ranking.
+  """
+  # Callee files deliberately do *not* contribute packages here: a resolved
+  # callee may live in a package that mirrors a third-party SDK (a flavour
+  # stub, a vendored copy), and treating that package as first-party would
+  # silence the real SDK import elsewhere (found on a dev app, WP6).
+  first_party = _first_party_packages(
+      ctx.manifest, {**ctx.pruned_files, **ctx.files}, ctx.profile)
+  imports: List[str] = []
+  skipped_first_party = 0
+  callee_imports = 0
+  # Callee files (WP6) are classified like callers so their sinks can be
+  # labelled; ``imports_from_callees`` counts how many identifiers the hop
+  # added to the classification set (the cost of the WP, visible in triage).
+  for fs in list(ctx.files.values()) + [f for rp, f in ctx.callee_files.items() if rp not in ctx.files]:
+    is_callee = fs.relpath not in ctx.files
+    for mod in fs.imports:
+      if _is_first_party(mod, first_party):
+        skipped_first_party += 1
+        continue
+      if mod not in imports:
+        imports.append(mod)
+        if is_callee:
+          callee_imports += 1
+  packages = sorted({structure.package_of(m) for m in imports})
+  ctx.counters["first_party_packages"] = list(first_party)
+  ctx.counters["imports_first_party_skipped"] = skipped_first_party
+  ctx.counters["imports_third_party"] = len(imports)
+  ctx.counters["imports_from_callees"] = callee_imports
+  ctx.counters["packages"] = len(packages)
+
+  pkg_profiles = caps.classify(
+      [{"identifier": p, "kind": "package"} for p in packages],
+      client, cache, ctx.app_facts, model=model,
+  )
+  refine = [m for m in imports
+            if (pkg_profiles.get(structure.package_of(m)) or _unknown(m)).is_transfer_sink]
+  ctx.counters["imports_refined"] = len(refine)
+  cls_profiles = caps.classify(
+      [{"identifier": m, "kind": "import"} for m in refine],
+      client, cache, ctx.app_facts, model=model,
+  )
+  for m in imports:
+    if m in cls_profiles:
+      ctx.profiles[m] = cls_profiles[m]
+      continue
+    pkg = pkg_profiles.get(structure.package_of(m))
+    if pkg is None:
+      ctx.profiles[m] = _unknown(m)
+      continue
+    ctx.profiles[m] = caps.CapabilityProfile(
+        identifier=m, kind="import", probabilities=dict(pkg.probabilities),
+        labels=list(pkg.labels), source=f"package:{pkg.source}", model=pkg.model,
+        taxonomy_version=pkg.taxonomy_version, recorded_at=pkg.recorded_at,
+    )
+
+  deps = structure.dependency_inventory(ctx.app_dir) if ctx.app_dir else []
+  ctx.dependency_profiles = caps.classify(
+      [{"identifier": d.coordinate, "kind": "dependency"} for d in deps],
+      client, cache, ctx.app_facts, model=model,
+  )
+  declared = sorted({
+      l for p in ctx.dependency_profiles.values() for l in p.labels
+  })
+  # App-level context for the battery: which capability classes the project
+  # declares at all (e.g. no ADVERTISING_SDK dependency anywhere).
+  ctx.app_facts["declared_capabilities"] = declared
+  ctx.counters["dependencies"] = len(deps)
+  if cache is not None:
+    ctx.counters["capability_cache"] = {"hits": cache.hits, "misses": cache.misses,
+                                        "entries": len(cache), "path": cache.path}
+  log.info("semantics: %d packages, %d imports refined (%d imports came from callee files), "
+           "%d dependencies; declared caps=%s",
+           len(packages), len(refine), callee_imports, len(deps), declared)
+
+
+def _unknown(identifier: str) -> caps.CapabilityProfile:
+  return caps.CapabilityProfile(identifier, "import", {}, [caps.UNKNOWN], "missing", None)
+
+
+# ---------------------------------------------------------------------------
+# Stage 5: triage (deterministic ranking + caps)
+# ---------------------------------------------------------------------------
+
+
+def _triage(ctx: RunContext, candidates: Dict[str, List[Candidate]]) -> Dict[str, List[Candidate]]:
+  """Ranks candidates by sink proximity and applies the model caps.
+
+  Rank key (``context.rank_key``): a sink reference inside the hit's own scope
+  first, then nearest sink distance, then scanner order. Per-file and per-type
+  caps then apply. Dropped candidates are recorded with their rank so a reviewer
+  can see exactly what was not evaluated and why.
+
+  The per-type cap (``MAX_FINDINGS_PER_TYPE``) is a cost control. With
+  ``CAP_EXEMPTS_SINK_IN_SCOPE`` (default on) it only trims candidates whose own
+  scope has *no* capability-labelled sink (tier 3): a hit whose function calls
+  an egress/IPC/unknown-labelled symbol is exactly what the model is for and is
+  kept regardless of how many siblings of the same data type precede it. The
+  number of candidates kept outside the budget is counted
+  (``cap_exempt_sink_in_scope``; ``kept_budgeted`` is the complement) so the
+  cost effect is visible in triage.
+
+  Since WP6 a first-party callee referenced inside the scope that itself
+  reaches a sink counts the same way (``Anchor.reach_in_scope``): the call
+  site is in the function, the sink is one hop away. Exemptions granted only
+  because of a callee are counted separately (``cap_exempt_callee_only``).
+
+  Exempt candidates do not consume the per-type budget: ``MAX_FINDINGS_PER_TYPE``
+  bounds the number of *no-reach* (tier 3) candidates asked, and a candidate
+  with a reachable sink is asked in addition. Before WP6 exempt candidates were
+  counted against the budget, so any change that made more anchors exempt
+  (the hop did) silently displaced tier-3 candidates that had been asked
+  before -- three labelled transfers on a dev app. The cap is a cost bound on
+  the uninformative tail, never a reason to drop evidence, so the accounting
+  now matches the docstring above.
+  """
+  sinks_by_file: Dict[str, List[context.Sink]] = {}
+  callees_by_file: Dict[str, List[context.Callee]] = {}
+  for rp, fs in ctx.files.items():
+    sinks_by_file[rp] = context.file_sinks(fs, ctx.profiles)
+    callees_by_file[rp] = _file_callees(ctx, rp)
+
+  kept: Dict[str, List[Candidate]] = {}
+  exempt_total = 0
+  exempt_callee_only = 0
+  anchors_with_callees = 0
+  tier_raised_by_callee = 0
+  for data_type, cands in candidates.items():
+    for c in cands:
+      fs = ctx.files[c.relpath]
+      c.anchor = context.anchor_signal(fs, c.pattern, data_type, sinks_by_file[c.relpath],
+                                       callees_by_file.get(c.relpath, ()))
+      if c.anchor.callees:
+        anchors_with_callees += 1
+        same_file_tier = context.Anchor(
+            data_type, c.pattern, [], None, c.anchor.scope, None, c.anchor.sink_in_scope,
+            c.anchor.scope_capabilities).tier
+        if c.anchor.tier < same_file_tier:
+          tier_raised_by_callee += 1
+    ranked = sorted(cands, key=lambda c: context.rank_key(c.anchor, c.order))
+    per_file: Dict[str, int] = {}
+    out: List[Candidate] = []
+    budgeted = 0   # kept candidates that count against MAX_FINDINGS_PER_TYPE
+    for rank, c in enumerate(ranked):
+      why = None
+      exempt = constants.CAP_EXEMPTS_SINK_IN_SCOPE and c.anchor.reach_in_scope
+      over_cap = budgeted >= constants.MAX_FINDINGS_PER_TYPE
+      if over_cap and not exempt:
+        why = f"over MAX_FINDINGS_PER_TYPE={constants.MAX_FINDINGS_PER_TYPE}"
+      elif per_file.get(c.relpath, 0) >= constants.MAX_PER_FILE_PER_TYPE:
+        why = f"over MAX_PER_FILE_PER_TYPE={constants.MAX_PER_FILE_PER_TYPE}"
+      if why:
+        _drop(ctx, data_type, c.finding_str, why, rank=rank, tier=c.anchor.tier,
+              sink_in_scope=c.anchor.sink_in_scope, proximity=c.anchor.proximity,
+              scope_capabilities=c.anchor.scope_capabilities,
+              callee_capabilities=c.anchor.callee_capabilities)
+        continue
+      if exempt:
+        exempt_total += 1
+        if not c.anchor.sink_in_scope:
+          exempt_callee_only += 1
+        if over_cap:
+          log.info("triage: %s %s kept over MAX_FINDINGS_PER_TYPE (rank %d, tier %d, sink in scope %s, "
+                   "callee capabilities %s)", data_type, c.finding_str, rank, c.anchor.tier,
+                   c.anchor.scope_capabilities, c.anchor.callee_capabilities)
+      else:
+        budgeted += 1
+      out.append(c)
+      per_file[c.relpath] = per_file.get(c.relpath, 0) + 1
+    if out:
+      kept[data_type] = out
+  ctx.counters["kept_per_type"] = {dt: len(v) for dt, v in sorted(kept.items())}
+  ctx.counters["kept"] = sum(len(v) for v in kept.values())
+  ctx.counters["cap_exempt_sink_in_scope"] = exempt_total
+  ctx.counters["cap_exempt_callee_only"] = exempt_callee_only
+  ctx.counters["kept_budgeted"] = ctx.counters["kept"] - exempt_total
+  ctx.counters["anchors_with_callees"] = anchors_with_callees
+  ctx.counters["anchors_tier_raised_by_callee"] = tier_raised_by_callee
+  ctx.counters["files_with_sinks"] = sum(1 for s in sinks_by_file.values() if s)
+  log.info("triage: kept %d of %d candidates (%d within the per-type budget, %d outside it with a "
+           "reachable sink, %d of those only through a callee; %d files have labelled sinks; %d anchors "
+           "reach a callee, %d ranked higher because of it)",
+           ctx.counters["kept"], ctx.counters.get("candidates", 0), ctx.counters["kept_budgeted"],
+           exempt_total, exempt_callee_only, ctx.counters["files_with_sinks"], anchors_with_callees,
+           tier_raised_by_callee)
+  return kept
+
+
+def _file_callees(ctx: RunContext, relpath: str) -> List[context.Callee]:
+  """The resolved one-hop callees of ``relpath`` with their sinks (WP6), or ``[]``."""
+  refs = ctx.callee_refs.get(relpath)
+  if not refs:
+    return []
+  fs = ctx.files.get(relpath)
+  if fs is None:
+    return []
+  return context.file_callees(fs, refs, ctx.callee_files, ctx.profiles)
+
+
+# ---------------------------------------------------------------------------
+# Backward-compatible helpers (older callers and tests)
+# ---------------------------------------------------------------------------
+
+
+def _reduce_noise(data_sources: Dict[str, List[str]]) -> Dict[str, List[str]]:
+  """Legacy scanner-order cap (flavor, resource, per-file, per-type).
+
+  Kept for callers that only have raw signals and no app source (e.g. ``plan``).
+  The engine itself uses :func:`_filter_candidates` + :func:`_triage`.
+  """
+  excluded = _excluded_flavors(data_sources)
   reduced: Dict[str, List[str]] = {}
   for data_type, findings in data_sources.items():
     if not isinstance(findings, list):
@@ -114,7 +835,6 @@ def _reduce_noise(data_sources: Dict[str, List[str]]) -> Dict[str, List[str]]:
       path = "/" + f
       if any(f"/src/{flavor}/" in path for flavor in excluded):
         continue
-      # Skip string-catalog / UI-text resources (translations cause FPs).
       if any(frag in path for frag in constants.EXCLUDED_PATH_SUBSTRINGS):
         continue
       relpath, _ = snippets.parse_finding(f)
@@ -131,17 +851,91 @@ def _reduce_noise(data_sources: Dict[str, List[str]]) -> Dict[str, List[str]]:
 
 
 def plan(data_sources: Dict[str, List[str]]) -> List[Task]:
-  """Turns raw signals into per-(policy, finding) tasks via the registry."""
+  """Turns raw signals into per-(policy, finding) tasks via the registry.
+
+  Source-free planning (scanner order); the engine plans from triaged
+  candidates instead (:func:`_plan_from_candidates`).
+  """
   tasks: List[Task] = []
   specs = registry.code_signal_specs() + registry.deterministic_specs()
   for data_type, findings in _reduce_noise(data_sources).items():
     for finding_str in findings:
-      relpath, _ = snippets.parse_finding(finding_str)
-      relpath = relpath or finding_str
+      relpath, pattern = snippets.parse_finding(finding_str)
       for spec in specs:
         if spec.applies_data_type(data_type):
-          tasks.append(Task(spec, data_type, finding_str, relpath))
+          tasks.append(Task(spec, data_type, finding_str, relpath or finding_str, pattern or ""))
   return tasks
+
+
+def _spec_permission_ships(ctx: Optional[RunContext], spec: registry.PolicySpec) -> bool:
+  """WP9 planner gate: at least one of ``spec.requires_permissions`` ships.
+
+  Reads the merged profile (Play build only); falls back to the legacy
+  ``manifest_details.permissions`` list; with neither available the spec is
+  planned (unknowns err towards recall).
+  """
+  if not spec.requires_permissions or ctx is None:
+    return True
+  if ctx.profile is not None and ctx.profile.permissions:
+    return any(p is not None and ctx.profile.ships_in_play_build(p)
+               for p in (ctx.profile.permission(n) for n in spec.requires_permissions))
+  legacy = [str(n).rsplit(".", 1)[-1] for n in (ctx.manifest.get("permissions") or [])]
+  if legacy:
+    return any(n in legacy for n in spec.requires_permissions)
+  return True
+
+
+def _plan_from_candidates(kept: Dict[str, List[Candidate]], ctx: Optional[RunContext] = None) -> List[Task]:
+  """Turns triaged candidates into (policy, candidate) tasks.
+
+  WP9 adds three deterministic planner gates a spec may declare, each
+  recorded in ``ctx.dropped`` so the triage file shows what was not asked:
+  ``requires_permissions`` (the policy's permission must ship),
+  ``applies_file`` (a structural fact about the candidate file) and
+  ``one_per_file`` (a per-file question is asked once; the first candidate
+  in triage rank order carries it).
+  """
+  tasks: List[Task] = []
+  specs = registry.code_signal_specs() + registry.deterministic_specs()
+  permission_ok = {spec.policy_id: _spec_permission_ships(ctx, spec) for spec in specs}
+  asked_per_file: set = set()
+  skipped: Dict[str, int] = {}
+  for data_type, cands in kept.items():
+    for c in cands:
+      for spec in specs:
+        if not spec.applies_data_type(data_type):
+          continue
+        if not permission_ok[spec.policy_id]:
+          _drop(ctx, data_type, c.finding_str,
+                f"{spec.policy_id}: none of {list(spec.requires_permissions)} ships in the Play build")
+          skipped[spec.policy_id] = skipped.get(spec.policy_id, 0) + 1
+          continue
+        if spec.applies_file is not None and ctx is not None:
+          fs = ctx.files.get(c.relpath)
+          if fs is None or not spec.applies_file(fs):
+            _drop(ctx, data_type, c.finding_str, f"{spec.policy_id}: file does not meet the structural activation")
+            skipped[spec.policy_id] = skipped.get(spec.policy_id, 0) + 1
+            continue
+        if spec.one_per_file:
+          key = (spec.policy_id, c.relpath)
+          if key in asked_per_file:
+            _drop(ctx, data_type, c.finding_str, f"{spec.policy_id}: asked once per file")
+            continue
+          asked_per_file.add(key)
+        tasks.append(Task(spec, data_type, c.finding_str, c.relpath, c.pattern))
+  if ctx is not None:
+    ctx.counters["planner_gated"] = skipped
+    ctx.counters["tasks_per_policy"] = {}
+    for t in tasks:
+      ctx.counters["tasks_per_policy"][t.spec.policy_id] = ctx.counters["tasks_per_policy"].get(t.spec.policy_id, 0) + 1
+  if skipped:
+    log.info("planner: gated tasks per policy %s", skipped)
+  return tasks
+
+
+# ---------------------------------------------------------------------------
+# Stage 6: policy evaluation
+# ---------------------------------------------------------------------------
 
 
 def _description(data_type: str) -> str:
@@ -150,7 +944,8 @@ def _description(data_type: str) -> str:
 
 def _error_finding(task: Task, mini_state: Dict[str, Any], exc: Exception) -> Dict[str, Any]:
   """A recall-safe placeholder when evaluation fails: surface, do not drop."""
-  file = mini_state.get("signal", {}).get("file", task.relpath)
+  file = (mini_state.get("signal") or {}).get("file", task.relpath)
+  log.warning("evaluation failed for %s in %s: %s", task.data_type, file, exc)
   return {
       "policy_id": task.spec.policy_id,
       "psl_constant": task.data_type,
@@ -162,11 +957,21 @@ def _error_finding(task: Task, mini_state: Dict[str, Any], exc: Exception) -> Di
       "client": "error",
       "error": str(exc)[:200],
       "needs_manual_review": True,
+      "decision_trace": {"evaluator_version": constants.EVALUATOR_VERSION,
+                         "error": str(exc)[:200]},
   }
 
 
-def _compose_task(task: Task, mini_state: Dict[str, Any], answers, client_name: str):
+def _compose_task(task: Task, mini_state: Dict[str, Any], answers, client_name: str,
+                  ctx: Optional[RunContext] = None):
+  """Composes one finding; specs with ``needs_app_purpose`` also receive the
+  once-per-app purpose answer (WP9) as ``app_purpose=``."""
   try:
+    if task.spec.needs_app_purpose:
+      return task.spec.compose(
+          task.data_type, task.finding_str, mini_state, answers, client_name,
+          app_purpose=ctx.app_purpose if ctx is not None else None,
+      )
     return task.spec.compose(
         task.data_type, task.finding_str, mini_state, answers, client_name
     )
@@ -174,27 +979,11 @@ def _compose_task(task: Task, mini_state: Dict[str, Any], answers, client_name: 
     return _error_finding(task, mini_state, exc)
 
 
-def run(
-    temp_dir: str,
-    client: JevClient,
-    model: Optional[str] = None,
-    batched: bool = True,
-) -> List[str]:
-  """Evaluates all registry policies for an app and writes worker files."""
-  data_sources, _manifest, app_facts, app_dir = load_artifacts(temp_dir)
-  tasks = plan(data_sources)
-
-  findings_by_goal: Dict[str, List[Dict[str, Any]]] = {
-      g: [] for g in registry.goals()
-  }
-
-  code_tasks = [t for t in tasks if t.spec.kind == registry.CODE_SIGNAL]
-  det_tasks = [t for t in tasks if t.spec.kind == registry.DETERMINISTIC]
-
-  # Deterministic policies: no model call, except an optional evidence gate that
-  # filters generic-pattern false positives.
-  for task in det_tasks:
-    state = snippets.build_state(app_dir, task.finding_str, task.data_type, app_facts)
+def _run_deterministic(ctx: RunContext, tasks: Sequence[Task], client: JevClient,
+                       model: Optional[str], findings_by_goal) -> None:
+  """Deterministic policies: no battery, but an optional false-positive gate."""
+  for task in tasks:
+    state = snippets.build_state(ctx.app_dir, task.finding_str, task.data_type, ctx.app_facts)
     if task.spec.gate_battery is not None:
       try:
         gate = client.system_one(
@@ -202,9 +991,11 @@ def run(
             model=model,
         )
         passed = (gate[task.spec.gate_key].noul or 0.0) >= task.spec.gate_threshold
-      except Exception:  # pylint: disable=broad-exception-caught
+      except Exception as exc:  # pylint: disable=broad-exception-caught
+        log.warning("gate call failed for %s (%s); keeping finding", task.data_type, exc)
         passed = True  # recall-safe: keep the finding if the gate call failed
       if not passed:
+        _drop(ctx, task.data_type, task.finding_str, f"{task.spec.gate_key} gate below threshold")
         continue
     try:
       finding = task.spec.compose_deterministic(task.data_type, task.finding_str, state)
@@ -213,40 +1004,454 @@ def run(
     if finding:
       findings_by_goal[task.spec.goal].append(finding)
 
-  if batched:
-    _run_batched(code_tasks, app_dir, app_facts, client, model, findings_by_goal)
+
+def _run_manifest(ctx: RunContext, findings_by_goal) -> None:
+  """Manifest-kind policies: app-level facts, no model call.
+
+  Each spec receives :class:`registry.ManifestInputs` (WP5): the merged
+  profile, the legacy manifest dict, the once-per-app purpose answer and the
+  app root. A failing policy is isolated into one review finding so the other
+  policies still run.
+  """
+  inputs = registry.ManifestInputs(manifest=ctx.manifest, profile=ctx.profile,
+                                   app_purpose=ctx.app_purpose, app_dir=ctx.app_dir)
+  for spec in registry.manifest_specs():
+    try:
+      found = spec.compose_manifest(inputs) if spec.compose_manifest else []
+      for f in found:
+        _attribute_sources(ctx, f, spec.policy_id)
+      log.info("manifest policy %s: %d finding(s) %s", spec.policy_id, len(found),
+               sorted(f.get("severity", "?") for f in found))
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      log.warning("manifest policy %s failed: %s", spec.policy_id, exc)
+      found = [{
+          "policy_id": spec.policy_id,
+          "issue_summary": "Manifest check failed; manual review required",
+          "severity": "IMPORTANT", "files_involved": ["AndroidManifest.xml"],
+          "evidence": str(exc)[:200], "recommendation": "Review the manifest manually.",
+          "client": "error", "needs_manual_review": True,
+      }]
+    findings_by_goal[spec.goal].extend(found)
+    ctx.counters.setdefault("manifest_findings", {})[spec.policy_id] = len(found)
+
+
+# ---------------------------------------------------------------------------
+# Stage 6b: identity lifecycle + login gate (WP11, wave 3)
+# ---------------------------------------------------------------------------
+
+LOGIN_GATE_QID = "login_gate_type"
+
+
+def _lifecycle_lookups(ctx: RunContext, cache: Optional[caps.CapabilityCache], model: Optional[str]):
+  """The two read-only lookups :func:`identity.assess` needs.
+
+  ``structure_of`` reuses the structures the run already built (candidate,
+  callee and pruned files) and analyses any other shipped file on demand,
+  memoised. ``labels_of`` returns the capability labels of an import as the
+  run (``ctx.profiles``) or the persistent cache already classified them --
+  never a new model call; an unclassified import has no labels, so the
+  in-file HTTP / persistence shapes carry those files.
+  """
+  memo: Dict[str, Optional[structure.FileStructure]] = {}
+
+  def structure_of(relpath: str) -> Optional[structure.FileStructure]:
+    fs = ctx.files.get(relpath) or ctx.callee_files.get(relpath) or ctx.pruned_files.get(relpath)
+    if fs is not None:
+      return fs
+    if relpath not in memo:
+      try:
+        memo[relpath] = structure.analyze_file(ctx.app_dir, relpath)
+      except Exception as exc:  # pylint: disable=broad-exception-caught
+        log.debug("identity: cannot analyse %s: %s", relpath, exc)
+        memo[relpath] = None
+    return memo[relpath]
+
+  def labels_of(module: str) -> set:
+    profile = ctx.profiles.get(module)
+    if profile is None and cache is not None:
+      hits, misses = cache.hits, cache.misses
+      profile = cache.get(module, model)
+      # A lookup on behalf of this stage is not a classification miss.
+      cache.hits, cache.misses = hits, misses
+    return set(profile.labels) if profile is not None else set()
+
+  return structure_of, labels_of
+
+
+def _semantic_files(ctx: RunContext, category: str) -> List[str]:
+  """The scanner's ``semantic_files[<category>]`` (file names matched by name pattern)."""
+  scan = _load_json(os.path.join(ctx.temp_dir, "data_safety_scan.json"))
+  return [str(x) for x in ((scan.get("semantic_files") or {}).get(category) or [])]
+
+
+def _identity_assessment(ctx: RunContext, cache: Optional[caps.CapabilityCache],
+                         model: Optional[str]) -> Optional[identity.Assessment]:
+  """Runs the deterministic identity-lifecycle scan over the shipped source (WP11).
+
+  Uses the WP6 first-party index as the file list (building it when callee
+  resolution is off). Returns None -- and records why -- when there is no app
+  directory to scan. Never raises.
+  """
+  if not ctx.app_dir:
+    ctx.counters["identity_lifecycle"] = {"skipped": "no app dir"}
+    return None
+  try:
+    if ctx.first_party_index is None:
+      excluded = ctx.counters.get("excluded_flavors") or []
+      ctx.first_party_index = structure.build_first_party_index(ctx.app_dir, excluded_flavors=excluded)
+    scan = identity.scan_app(ctx.app_dir, ctx.first_party_index.package_by_file.keys())
+    structure_of, labels_of = _lifecycle_lookups(ctx, cache, model)
+    assessment = identity.assess(scan, structure_of, labels_of, ctx.first_party_index,
+                                 _semantic_files(ctx, "USER_ACCOUNT"))
+  except Exception as exc:  # pylint: disable=broad-exception-caught
+    log.warning("identity lifecycle scan failed (%s: %s); stage skipped", type(exc).__name__, exc)
+    ctx.counters["identity_lifecycle"] = {"error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    return None
+  ctx.counters["identity_lifecycle"] = {
+      **assessment.scan,
+      "provisioning_sites": len(assessment.provisioning),
+      "deletion_candidates": len(assessment.deletions),
+      "remote_shaped_candidates": sum(1 for d in assessment.deletions if d.remote_shaped),
+      "login_files": len(assessment.login.files),
+  }
+  return assessment
+
+
+def _lifecycle_finding(mode: str, severity: str, assessment: identity.Assessment,
+                       evidence: str, trace: Dict[str, Any], review: bool,
+                       client_name: str) -> Dict[str, Any]:
+  """The app-level ``account_deletion`` finding in the report's shape."""
+  files = {p.relpath for p in assessment.provisioning}
+  if trace.get("candidate_file"):
+    files.add(str(trace["candidate_file"]))
+  files = sorted(files)
+  finding = {
+      "policy_id": "account_deletion",
+      "issue_summary": templates.lifecycle_summary(mode).replace("|", "¦"),
+      "severity": severity,
+      "files_involved": files,
+      "evidence": evidence.replace("|", "¦").replace("\n", " "),
+      "recommendation": templates.recommendation("account_deletion", severity),
+      "client": client_name,
+      "kind": "identity_lifecycle",
+      "lifecycle_mode": mode,
+      "decision_trace": {"evaluator_version": constants.EVALUATOR_VERSION, "mode": mode,
+                         "thresholds": {"T_REMOTE_DELETE": constants.T_REMOTE_DELETE,
+                                        "T_LOCAL_ONLY_DELETE": constants.T_LOCAL_ONLY_DELETE},
+                         **trace},
+  }
+  if review:
+    finding["needs_manual_review"] = True
+  return finding
+
+
+def _run_identity_lifecycle(ctx: RunContext, assessment: Optional[identity.Assessment],
+                            client: JevClient, model: Optional[str], findings_by_goal) -> None:
+  """``account_deletion`` from the whole-app lifecycle facts (WP11).
+
+  Composition (see the WP11 block in :mod:`constants`):
+
+  * no provisioning site -> nothing (the user's own server credentials
+    stored locally, or no account system at all).
+  * provisioning, no deletion candidate -> IMPORTANT ``no_deletion_path``
+    (SUGGESTION + review ``persistence_unconfirmed`` when no site is seen to
+    persist the identity: the evaluator does not assert an Important it
+    cannot support).
+  * provisioning + candidates -> the two Nouls on up to
+    ``MAX_DELETION_CANDIDATES`` candidates, strongest first. Any candidate
+    with ``is_remote_delete >= T_REMOTE_DELETE`` is the compliant path:
+    nothing is composed, the confirmation is traced. Otherwise the best
+    candidate decides: ``clears_local_state_only >= T_LOCAL_ONLY_DELETE`` ->
+    IMPORTANT ``local_only``; else IMPORTANT + review ``unconfirmed``. A
+    client failure keeps the finding (recall-safe) and is traced.
+  The whole assessment goes to ``typesafe_triage.json["identity_lifecycle"]``.
+  """
+  if not constants.IDENTITY_LIFECYCLE_ENABLED or assessment is None:
+    return
+  trace: Dict[str, Any] = {"assessment": assessment.to_dict(), "asked": []}
+  ctx.counters.setdefault("identity_lifecycle", {})["enabled"] = True
+  if not assessment.provisioning:
+    log.info("account_deletion lifecycle: no provisioning site -> no finding")
+    trace["outcome"] = "no_provisioning"
+    ctx.counters["identity_lifecycle"]["outcome"] = "no_provisioning"
+    ctx.identity_trace = trace
+    return
+  prov_evidence = "; ".join(p.evidence for p in assessment.provisioning[:constants.MAX_PROVISIONING_IN_STATE])
+  persisted = any(p.persisted for p in assessment.provisioning)
+  if not assessment.deletions:
+    mode = "no_deletion_path" if persisted else "persistence_unconfirmed"
+    severity = "IMPORTANT" if persisted else "SUGGESTION"
+    log.info("account_deletion lifecycle: %d provisioning site(s), no deletion candidate -> %s %s",
+             len(assessment.provisioning), severity, mode)
+    trace["outcome"] = mode
+    finding = _lifecycle_finding(mode, severity, assessment,
+                                 f"provisioning: {prov_evidence}; no deletion-shaped call in shipped source",
+                                 trace, review=not persisted, client_name="deterministic")
+    findings_by_goal["user_account"].append(finding)
+    ctx.counters["identity_lifecycle"]["outcome"] = mode
+    ctx.identity_trace = trace
+    return
+  structure_of, _ = _lifecycle_lookups(ctx, None, model)
+  battery = q.account_deletion_lifecycle_battery()
+  best: Optional[Dict[str, Any]] = None
+  confirmed: Optional[Dict[str, Any]] = None
+  failed = False
+  for cand in assessment.deletions[:constants.MAX_DELETION_CANDIDATES]:
+    state = identity.deletion_state(cand, structure_of(cand.relpath), assessment.provisioning, ctx.app_facts)
+    row: Dict[str, Any] = {"file": cand.relpath, "lines": [l + 1 for l in cand.lines],
+                           "remote_shaped": cand.remote_shaped}
+    try:
+      answers = client.system_one(state, battery, model=model)
+      ctx.counters["identity_lifecycle"]["requests"] = ctx.counters["identity_lifecycle"].get("requests", 0) + 1
+      row["p_remote_delete"] = round(float(answers["is_remote_delete"].noul or 0.0), 3)
+      row["p_local_only"] = round(float(answers["clears_local_state_only"].noul or 0.0), 3)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      log.warning("account_deletion lifecycle: question failed on %s (%s); keeping the finding", cand.relpath, exc)
+      row["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+      failed = True
+    trace["asked"].append(row)
+    if row.get("p_remote_delete", 0.0) >= constants.T_REMOTE_DELETE:
+      confirmed = row
+      break
+    if best is None or row.get("p_local_only", 0.0) > best.get("p_local_only", 0.0):
+      best = row
+  if confirmed is not None:
+    log.info("account_deletion lifecycle: remote delete confirmed in %s (p=%.2f) -> compliant",
+             confirmed["file"], confirmed["p_remote_delete"])
+    trace["outcome"] = "remote_delete_confirmed"
+    trace["confirmed"] = confirmed
+    ctx.counters["identity_lifecycle"]["outcome"] = "remote_delete_confirmed"
+    ctx.identity_trace = trace
+    return
+  best = best or trace["asked"][0]
+  if best.get("p_local_only", 0.0) >= constants.T_LOCAL_ONLY_DELETE:
+    mode, review = "local_only", False
   else:
-    _run_per_finding(code_tasks, app_dir, app_facts, client, model, findings_by_goal)
-
-  # play_declaration kind: cross-reference detected off-device collection against
-  # the developer's Play declaration (runs after code_signal; needs its results).
-  for spec in registry.play_declaration_specs():
-    _run_play_declaration(temp_dir, spec, client, model, findings_by_goal)
-
-  written: List[str] = []
-  for goal in registry.goals():
-    out = {
-        "domain": _GOAL_DOMAIN.get(goal, "Data Safety and Privacy"),
-        "findings": findings_by_goal.get(goal, []),
-    }
-    with open(os.path.join(temp_dir, f"worker_{goal}.json"), "w", encoding="utf-8") as f:
-      json.dump(out, f, indent=2, sort_keys=True)
-    written.append(goal)
-  return written
+    mode, review = "unconfirmed", True
+  if failed:
+    review = True
+  log.info("account_deletion lifecycle: %d candidate(s) asked, none confirms a remote delete -> IMPORTANT %s%s",
+           len(trace["asked"]), mode, " (review)" if review else "")
+  trace["outcome"] = mode
+  trace["candidate_file"] = best["file"]
+  trace["candidate"] = best
+  evidence = (f"provisioning: {prov_evidence}; deletion candidate {best['file']}:L{best['lines'][0] if best['lines'] else '?'} "
+              f"p_remote_delete={best.get('p_remote_delete', 'n/a')} p_local_only={best.get('p_local_only', 'n/a')}")
+  finding = _lifecycle_finding(mode, "IMPORTANT", assessment, evidence, trace, review, client_name=client.name)
+  findings_by_goal["user_account"].append(finding)
+  ctx.counters["identity_lifecycle"]["outcome"] = mode
+  ctx.identity_trace = trace
 
 
-def _run_per_finding(tasks, app_dir, app_facts, client, model, findings_by_goal) -> None:
+def _ask_login_gate(ctx: RunContext, assessment: Optional[identity.Assessment], client: JevClient,
+                    cache: Optional[caps.CapabilityCache], model: Optional[str], findings_by_goal) -> Dict[str, Any]:
+  """``login_credentials`` from one closed Choice per app (WP11).
+
+  Asked only when the deterministic scan found login-shaped evidence (login
+  files or semantic USER_ACCOUNT files); cached by the digest of the state
+  and question text like ``declared_core_purpose``. Result (also on
+  ``ctx.login_gate`` and in the triage file)::
+
+    {"gate_type": "user_remote_server_credentials", "confidence": 0.93,
+     "source": "model"|"cache"|"human"|"unavailable"|"not_asked", "probabilities": {...}}
+
+  Composition: ``app_account`` / ``third_party_sign_in_bridge`` at/above
+  ``CONF_LOGIN_GATE`` -> IMPORTANT; ``user_remote_server_credentials`` /
+  ``none`` at/above the bar -> no finding (recorded); anything else,
+  including a client failure -> SUGGESTION + review (evidence was found; the
+  reviewer decides). The option label is copied to ``app_facts["login_gate"]``
+  so later requests see it.
+  """
+  result: Dict[str, Any] = {"gate_type": "unknown", "confidence": 0.0, "source": "not_asked",
+                            "probabilities": None, "evidence": None}
+  if not constants.LOGIN_GATE_ENABLED or assessment is None or not assessment.login.found:
+    log.info("login gate: %s", "disabled" if not constants.LOGIN_GATE_ENABLED else "no login-shaped evidence; not asked")
+    ctx.login_gate = result
+    return result
+  battery = q.login_gate_battery()
+  state = identity.login_state(assessment.login, ctx.app_facts, ctx.app_facts.get("declared_capabilities") or [])
+  digest_src = json.dumps(state, sort_keys=True, ensure_ascii=False) + "\n" + json.dumps(battery, sort_keys=True)
+  digest = hashlib.sha256(digest_src.encode("utf-8")).hexdigest()
+  result["digest"] = digest
+  result["evidence"] = assessment.login.to_dict()
+  cached = cache.get_app_answer(LOGIN_GATE_QID, digest, model) if cache is not None else None
+  if cached is not None:
+    result.update({k: cached.get(k, result.get(k)) for k in ("gate_type", "confidence", "probabilities")})
+    result["source"] = "human" if cached.get("source") == "human" else "cache"
+    log.info("login gate (from %s): %s (confidence %.2f)", result["source"], result["gate_type"], result["confidence"])
+  else:
+    try:
+      answers = client.system_one(state, battery, model=model)
+      a = answers.get(LOGIN_GATE_QID)
+      if a is None or a.type != "choice" or not a.choice:
+        raise ValueError(f"no choice answer for {LOGIN_GATE_QID}: {a}")
+      gate = a.choice if a.choice in q.LOGIN_GATE_OPTIONS else "unknown"
+      if gate != a.choice:
+        log.warning("login gate answer %r not in the closed option set; recorded as unknown", a.choice)
+      result.update({"gate_type": gate, "confidence": float(a.confidence or 0.0),
+                     "probabilities": a.probabilities, "source": "model"})
+      ctx.counters["login_gate_requests"] = ctx.counters.get("login_gate_requests", 0) + 1
+      if cache is not None:
+        cache.put_app_answer(LOGIN_GATE_QID, digest, model, {
+            "gate_type": gate, "confidence": result["confidence"],
+            "probabilities": result["probabilities"], "source": "model", "model": model})
+        cache.save()
+      log.info("login gate (model): %s (confidence %.2f) top=%s", gate, result["confidence"],
+               sorted((a.probabilities or {}).items(), key=lambda kv: -kv[1])[:3])
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      log.warning("login gate question failed (%s: %s); recorded as unknown/unavailable", type(exc).__name__, exc)
+      result["source"] = "unavailable"
+      ctx.counters["login_gate_error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+  ctx.login_gate = result
+  ctx.app_facts["login_gate"] = result["gate_type"]
+  gate, conf = result["gate_type"], result["confidence"]
+  established = conf >= constants.CONF_LOGIN_GATE
+  files = [f["file"] for f in assessment.login.files] or list(assessment.login.semantic_files)
+  ev = "; ".join(f"{f['file']} ({f['hits']} login tokens, {f['remote_server_tokens']} remote-server tokens)"
+                 for f in assessment.login.files[:3])
+  if assessment.login.semantic_files:
+    ev = f"{ev}; semantic files: {', '.join(assessment.login.semantic_files[:4])}" if ev else \
+         f"semantic files: {', '.join(assessment.login.semantic_files[:4])}"
+  trace = {"evaluator_version": constants.EVALUATOR_VERSION, "login_gate": {k: v for k, v in result.items() if k != "evidence"},
+           "evidence": result["evidence"], "thresholds": {"CONF_LOGIN_GATE": constants.CONF_LOGIN_GATE}}
+  if established and gate in ("app_account", "third_party_sign_in_bridge"):
+    severity, review, summary = "IMPORTANT", False, templates.login_gate_summary(gate)
+  elif established and gate in ("user_remote_server_credentials", "none"):
+    log.info("login gate: %s (p=%.2f) -> no login_credentials finding", gate, conf)
+    ctx.counters["login_gate_outcome"] = gate
+    return result
+  else:
+    severity, review, summary = "SUGGESTION", True, templates.login_gate_summary("unknown")
+  finding = {
+      "policy_id": "login_credentials",
+      "issue_summary": summary.replace("|", "¦"),
+      "severity": severity,
+      "files_involved": files[:6],
+      "evidence": f"login_gate_type={gate} (p={conf:.2f}, {result['source']}); {ev}".replace("|", "¦"),
+      "recommendation": templates.recommendation("login_credentials", severity),
+      "client": client.name if result["source"] in ("model", "unavailable") else result["source"],
+      "kind": "login_gate",
+      "login_gate_type": gate,
+      "decision_trace": trace,
+  }
+  if review:
+    finding["needs_manual_review"] = True
+  findings_by_goal["user_account"].append(finding)
+  ctx.counters["login_gate_outcome"] = f"{gate}:{severity}"
+  log.info("login gate: %s (p=%.2f) -> %s login_credentials%s", gate, conf, severity, " (review)" if review else "")
+  return result
+
+
+def _file_state(ctx: RunContext, relpath: str, file_tasks: Sequence[Task]):
+  fs = ctx.files.get(relpath) or structure.analyze_file(ctx.app_dir, relpath)
+  asks = [(t.data_type, t.pattern) for t in file_tasks]
+  # WP8: the first-party index locates guard declarations one hop away; the
+  # profile's default-locale resource index resolves ``R.string`` references.
+  resources = ctx.profile.resource_index if ctx.profile is not None else None
+  return context.build_file_state(fs, asks, ctx.profiles, ctx.app_facts, ctx.app_dir,
+                                  callees=_file_callees(ctx, relpath),
+                                  first_party_index=ctx.first_party_index,
+                                  resources=resources if constants.STRING_RESOLUTION_ENABLED else None)
+
+
+def _attribute_sources(ctx: RunContext, finding: Dict[str, Any], policy_id: str) -> None:
+  """Adds ``manifest_sources`` to a finding whose permission / component is flavour-only (WP8).
+
+  Manifest findings name their subject in the trace (``permission`` or
+  ``service``); permission-goal code findings are attributed through
+  ``constants.POLICY_PERMISSIONS``. The field is set only when the declaring
+  shipped source sets are a strict subset of the build
+  (``AppProfile.partial_sources``), so most findings are unchanged.
+  """
+  if not constants.PERMISSION_ATTRIBUTION_ENABLED or ctx.profile is None or not finding:
+    return
+  profile = ctx.profile
+  trace = finding.get("decision_trace") or {}
+  entries: List[Any] = []
+  if trace.get("permission"):
+    perm = profile.permission(str(trace["permission"]))
+    if perm is not None:
+      entries.append(perm)
+  if trace.get("service"):
+    entries.extend(c for c in profile.components if c.kind == "service" and c.name == trace["service"])
+  for name in constants.POLICY_PERMISSIONS.get(policy_id, ()):
+    perm = profile.permission(name)
+    if perm is not None and profile.ships_in_play_build(perm):
+      entries.append(perm)
+  sources: List[str] = []
+  for entry in entries:
+    partial = profile.partial_sources(entry)
+    if partial:
+      for src in partial:
+        if src not in sources:
+          sources.append(src)
+  if sources:
+    finding["manifest_sources"] = sources
+    finding.setdefault("decision_trace", {})["manifest_sources"] = sources
+    ctx.counters["manifest_sources_attributed"] = ctx.counters.get("manifest_sources_attributed", 0) + 1
+    log.info("finding %s in %s attributed to source sets %s", policy_id,
+             (finding.get("files_involved") or ["?"])[0], sources)
+
+
+def _run_batched(ctx: RunContext, tasks: Sequence[Task], client: JevClient,
+                 model: Optional[str], findings_by_goal) -> None:
+  """One request per (file, chunk of asks); question ids namespaced ``a<i>__``."""
+  by_file: Dict[str, List[Task]] = {}
   for task in tasks:
-    state = snippets.build_state(app_dir, task.finding_str, task.data_type, app_facts)
-    battery = task.spec.make_battery(task.data_type, _description(task.data_type))
+    by_file.setdefault(task.relpath, []).append(task)
+
+  requests = 0
+  for relpath, file_tasks in sorted(by_file.items()):
+    for start in range(0, len(file_tasks), constants.MAX_ASKS_PER_REQUEST):
+      chunk = file_tasks[start:start + constants.MAX_ASKS_PER_REQUEST]
+      state, per_task = _file_state(ctx, relpath, chunk)
+      questions: Dict[str, Any] = {}
+      for i, task in enumerate(chunk):
+        battery = task.spec.make_battery(task.data_type, _description(task.data_type), task.pattern)
+        questions.update({f"a{i}__{qid}": qd for qid, qd in battery.items()})
+      requests += 1
+      try:
+        answers = client.system_one(state, questions, model=model)
+      except Exception as exc:  # pylint: disable=broad-exception-caught
+        # One file's failure is isolated: mark its tasks for review, keep scanning.
+        for i, task in enumerate(chunk):
+          findings_by_goal[task.spec.goal].append(_error_finding(task, per_task[i], exc))
+        continue
+      for i, task in enumerate(chunk):
+        prefix = f"a{i}__"
+        sub = {qid[len(prefix):]: a for qid, a in answers.items() if qid.startswith(prefix)}
+        finding = _compose_task(task, per_task[i], sub, client.name, ctx)
+        if finding:
+          _attribute_sources(ctx, finding, task.spec.policy_id)
+          findings_by_goal[task.spec.goal].append(finding)
+        else:
+          _drop(ctx, task.data_type, task.finding_str,
+                f"{task.spec.policy_id}: compliant or relevance gate")
+  ctx.counters["battery_requests"] = requests
+
+
+def _run_per_finding(ctx: RunContext, tasks: Sequence[Task], client: JevClient,
+                     model: Optional[str], findings_by_goal) -> None:
+  """One request per (policy, finding); the state is the per-ask mini-state."""
+  requests = 0
+  for task in tasks:
+    _, per_task = _file_state(ctx, task.relpath, [task])
+    state = per_task[0]
+    battery = task.spec.make_battery(task.data_type, _description(task.data_type), task.pattern)
+    requests += 1
     try:
       answers = client.system_one(state, battery, model=model)
     except Exception as exc:  # pylint: disable=broad-exception-caught
       findings_by_goal[task.spec.goal].append(_error_finding(task, state, exc))
       continue
-    finding = _compose_task(task, state, answers, client.name)
+    finding = _compose_task(task, state, answers, client.name, ctx)
     if finding:
+      _attribute_sources(ctx, finding, task.spec.policy_id)
       findings_by_goal[task.spec.goal].append(finding)
+    else:
+      _drop(ctx, task.data_type, task.finding_str,
+            f"{task.spec.policy_id}: compliant or relevance gate")
+  ctx.counters["battery_requests"] = requests
 
 
 def _declared_types(store: dict) -> List[str]:
@@ -263,23 +1468,31 @@ def _declared_types(store: dict) -> List[str]:
   return sorted(set(declared))
 
 
-def _run_play_declaration(temp_dir, spec, client, model, findings_by_goal) -> None:
-  """Flag detected, transmitted data types that the Play declaration omits.
+def _run_play_declaration(ctx: RunContext, spec, client, model, findings_by_goal) -> None:
+  """Flag detected, *confirmed* transmitted data types the declaration omits.
 
-  Prefers a provided/scraped ``play_store_info.json``. If no usable declaration
-  exists, skips (a reliable declaration is a prerequisite — see the docs).
+  Only findings whose transfer decision is TRANSMITS participate: an UNCERTAIN
+  transfer is already routed to manual review and must not additionally assert
+  a declaration mismatch. Skips when there is no usable declaration (unpublished
+  app, or a ``play_store_info.json`` without a ``data_safety`` block — a missing
+  block is a scrape failure, not a "no data collected" declaration).
   """
-  store = _load_json(os.path.join(temp_dir, "play_store_info.json"))
+  store = _load_json(os.path.join(ctx.temp_dir, "play_store_info.json"))
   if not store or not store.get("is_published", False):
+    log.info("play_declaration: skipped (app not published / no store info)")
+    return
+  if "data_safety" not in store:
+    log.info("play_declaration: skipped (store info has no data_safety block)")
     return
   declared = _declared_types(store)
 
-  # Detected, off-device-transmitted data types from the code-signal pass.
   transmitted = {}
   for finding in list(findings_by_goal.get(spec.goal, [])):
-    if finding.get("is_transferred") and finding.get("psl_constant"):
+    if (finding.get("is_transferred") and finding.get("psl_constant")
+        and finding.get("transfer_decision", evaluate.TRANSMITS) == evaluate.TRANSMITS):
       transmitted.setdefault(finding["psl_constant"], finding)
 
+  mismatches = 0
   for data_type, finding in sorted(transmitted.items()):
     name = evaluate._taxonomy().get(data_type, {}).get("data_type", data_type)  # pylint: disable=protected-access
     state = {
@@ -291,9 +1504,11 @@ def _run_play_declaration(temp_dir, spec, client, model, findings_by_goal) -> No
     try:
       answers = client.system_one(state, spec.make_battery(data_type, name), model=model)
       covers = answers["declaration_covers"].noul or 0.0
-    except Exception:  # pylint: disable=broad-exception-caught
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+      log.warning("play_declaration coverage call failed for %s: %s", data_type, exc)
       continue  # a failed coverage check should not fabricate a mismatch
     if covers < constants.T_DECLARATION_COVERS:
+      mismatches += 1
       findings_by_goal[spec.goal].append({
           "policy_id": spec.policy_id,
           "psl_constant": data_type,
@@ -305,35 +1520,163 @@ def _run_play_declaration(temp_dir, spec, client, model, findings_by_goal) -> No
           "recommendation": templates.declaration_mismatch_recommendation(name),
           "client": client.name,
           "kind": "play_declaration",
+          "decision_trace": {
+              "evaluator_version": constants.EVALUATOR_VERSION,
+              "declaration_covers": round(covers, 4),
+              "T_DECLARATION_COVERS": constants.T_DECLARATION_COVERS,
+              "source_transfer_decision": finding.get("transfer_decision"),
+          },
       })
+  ctx.counters["play_declaration"] = {"transmitted_types": len(transmitted),
+                                      "mismatches": mismatches}
 
 
-def _run_batched(tasks, app_dir, app_facts, client, model, findings_by_goal) -> None:
-  by_file: Dict[str, List[Task]] = {}
-  for task in tasks:
-    by_file.setdefault(task.relpath, []).append(task)
+# ---------------------------------------------------------------------------
+# Stage 7: write
+# ---------------------------------------------------------------------------
 
-  for relpath, file_tasks in sorted(by_file.items()):
-    # Reuse the file-state builder; it only needs (data_type, finding_str).
-    asks = [batch.Ask(t.spec.goal, t.data_type, None, t.finding_str, "") for t in file_tasks]
-    state, per_task = batch.build_file_state(app_dir, relpath, asks, app_facts)
 
-    questions: Dict[str, Any] = {}
-    for i, task in enumerate(file_tasks):
-      battery = task.spec.make_battery(task.data_type, _description(task.data_type))
-      questions.update({f"a{i}__{qid}": qd for qid, qd in battery.items()})
+def _write_triage(ctx: RunContext, findings_by_goal, client: JevClient) -> str:
+  """The observability record: what was evaluated, what was not, and why."""
+  severities: Dict[str, int] = {}
+  decisions: Dict[str, int] = {}
+  # WP10: how the ``data_type_confirmed`` answers composed (per action) and
+  # every relabel as ``scanner_type -> effective_type`` for the review log.
+  type_actions: Dict[str, int] = {}
+  relabels: List[Dict[str, Any]] = []
+  for fs in findings_by_goal.values():
+    for f in fs:
+      severities[f.get("severity", "?")] = severities.get(f.get("severity", "?"), 0) + 1
+      d = f.get("transfer_decision")
+      if d:
+        decisions[d] = decisions.get(d, 0) + 1
+      tc = (f.get("decision_trace") or {}).get("type_confirmation")
+      if tc and tc.get("read"):
+        type_actions[tc["action"]] = type_actions.get(tc["action"], 0) + 1
+        if tc["action"] != evaluate.TYPE_AS_LABELLED:
+          relabels.append({"file": (f.get("files_involved") or [None])[0],
+                           "scanner_type": tc.get("labelled"), "answer": tc.get("answer"),
+                           "effective_type": tc.get("effective_type"),
+                           "confidence": tc.get("confidence"), "lowered": tc.get("lowered")})
+  if type_actions:
+    ctx.counters["type_confirmations"] = type_actions
+    log.info("data_type_confirmed composed on %d transfer findings: %s (%d relabel/dispute/unknown)",
+             sum(type_actions.values()), type_actions, len(relabels))
+  out = {
+      "evaluator_version": constants.EVALUATOR_VERSION,
+      "client": client.name,
+      "counters": ctx.counters,
+      "findings_by_severity": severities,
+      "transfer_decisions": decisions,
+      "type_confirmations": relabels,
+      "identity_lifecycle": ctx.identity_trace,
+      "login_gate": ctx.login_gate,
+      "capabilities": caps.summarize(ctx.profiles),
+      "dependency_capabilities": {
+          k: v.labels for k, v in sorted(ctx.dependency_profiles.items())
+      },
+      "sinks_by_file": {
+          rp: [{"symbol": s.symbol, "module": s.module, "capabilities": s.capabilities,
+                "lines": [l + 1 for l in s.lines]}
+               for s in context.file_sinks(fs, ctx.profiles)]
+          for rp, fs in sorted(ctx.files.items())
+          if context.file_sinks(fs, ctx.profiles)
+      },
+      "thresholds": {
+          "T_TRANSMIT_LOW": constants.T_TRANSMIT_LOW,
+          "T_TRANSMIT_HIGH": constants.T_TRANSMIT_HIGH,
+          "T_RELEVANCE": constants.T_RELEVANCE,
+          "T_CAPABILITY": constants.T_CAPABILITY,
+          "provenance": constants.THRESHOLD_PROVENANCE,
+      },
+      "usage": {"requests": client.request_count,
+                "input_tokens": client.total_input_tokens,
+                "output_tokens": client.total_output_tokens},
+      "dropped": ctx.dropped,
+      # WP1: the merged manifest facts every manifest-kind policy reads from.
+      # Recorded so a reviewer can audit *which* source sets and modules were
+      # merged and what the parser could not resolve.
+      "app_profile": ctx.profile.summary() if ctx.profile is not None else None,
+      "app_purpose": ctx.app_purpose,
+  }
+  path = os.path.join(ctx.temp_dir, TRIAGE_FILENAME)
+  with open(path, "w", encoding="utf-8") as f:
+    json.dump(out, f, indent=2, sort_keys=True, default=str)
+  return path
 
-    try:
-      answers = client.system_one(state, questions, model=model)
-    except Exception as exc:  # pylint: disable=broad-exception-caught
-      # One file's failure is isolated: mark its tasks for review, keep scanning.
-      for i, task in enumerate(file_tasks):
-        findings_by_goal[task.spec.goal].append(_error_finding(task, per_task[i], exc))
-      continue
 
-    for i, task in enumerate(file_tasks):
-      prefix = f"a{i}__"
-      sub = {qid[len(prefix):]: a for qid, a in answers.items() if qid.startswith(prefix)}
-      finding = _compose_task(task, per_task[i], sub, client.name)
-      if finding:
-        findings_by_goal[task.spec.goal].append(finding)
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
+def run(
+    temp_dir: str,
+    client: JevClient,
+    model: Optional[str] = None,
+    batched: bool = True,
+    capability_cache: Optional[caps.CapabilityCache] = None,
+) -> List[str]:
+  """Evaluates all registry policies for an app and writes worker files.
+
+  Args:
+    temp_dir: Scratch dir produced by ``orchestrator.py init``.
+    client: The Jev client (HTTP or the offline heuristic stand-in).
+    model: Model id recorded in the cache key and sent with each request.
+    batched: One request per file chunk (default) or one per finding.
+    capability_cache: Persistent capability memo. ``None`` disables caching
+      (every identifier is classified in this run; used by hermetic tests).
+
+  Returns:
+    The goal names whose ``worker_<goal>.json`` was written.
+  """
+  data_sources, manifest, app_facts, app_dir = load_artifacts(temp_dir)
+  ctx = RunContext(temp_dir, app_dir, app_facts, manifest)
+  ctx.counters["evaluator_version"] = constants.EVALUATOR_VERSION
+  ctx.counters["model"] = model
+  log.info("run: app=%s package=%s app_dir=%s client=%s batched=%s",
+           app_facts.get("name"), app_facts.get("package"), app_dir, client.name, batched)
+  ctx.profile = _load_profile(ctx)
+  _ask_app_purpose(ctx, client, capability_cache, model)
+
+  candidates = _filter_candidates(data_sources, ctx)
+  _analyze_files(ctx, candidates)
+  candidates = _lexical_pregate(ctx, candidates)
+  _resolve_callees(ctx, candidates)
+  _classify_semantics(ctx, client, capability_cache, model)
+  kept = _triage(ctx, candidates)
+  tasks = _plan_from_candidates(kept, ctx)
+  ctx.counters["tasks"] = len(tasks)
+
+  findings_by_goal: Dict[str, List[Dict[str, Any]]] = {g: [] for g in registry.goals()}
+  code_tasks = [t for t in tasks if t.spec.kind == registry.CODE_SIGNAL]
+  det_tasks = [t for t in tasks if t.spec.kind == registry.DETERMINISTIC]
+
+  _run_deterministic(ctx, det_tasks, client, model, findings_by_goal)
+  _run_manifest(ctx, findings_by_goal)
+  # WP11: whole-app facts (provisioning vs deletion paths; login gate).
+  assessment = _identity_assessment(ctx, capability_cache, model) if (
+      constants.IDENTITY_LIFECYCLE_ENABLED or constants.LOGIN_GATE_ENABLED) else None
+  _run_identity_lifecycle(ctx, assessment, client, model, findings_by_goal)
+  _ask_login_gate(ctx, assessment, client, capability_cache, model, findings_by_goal)
+  if batched:
+    _run_batched(ctx, code_tasks, client, model, findings_by_goal)
+  else:
+    _run_per_finding(ctx, code_tasks, client, model, findings_by_goal)
+  for spec in registry.play_declaration_specs():
+    _run_play_declaration(ctx, spec, client, model, findings_by_goal)
+
+  written: List[str] = []
+  for goal in registry.goals():
+    out = {
+        "domain": _GOAL_DOMAIN.get(goal, "Data Safety and Privacy"),
+        "findings": findings_by_goal.get(goal, []),
+        "evaluator_version": constants.EVALUATOR_VERSION,
+    }
+    with open(os.path.join(temp_dir, f"worker_{goal}.json"), "w", encoding="utf-8") as f:
+      json.dump(out, f, indent=2, sort_keys=True)
+    written.append(goal)
+  triage_path = _write_triage(ctx, findings_by_goal, client)
+  log.info("run complete: %d findings, %d dropped, triage -> %s",
+           sum(len(v) for v in findings_by_goal.values()), len(ctx.dropped), triage_path)
+  return written

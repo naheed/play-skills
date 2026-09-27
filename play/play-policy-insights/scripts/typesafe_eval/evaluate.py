@@ -30,18 +30,26 @@ from __future__ import annotations
 import functools
 import glob
 import json
+import logging
 import os
 from typing import Any
 from typing import Dict
+from typing import Iterable
 from typing import List
 from typing import Optional
+from typing import Sequence
+from typing import Tuple
 
 from typesafe_eval import constants
 from typesafe_eval import questions as q
 from typesafe_eval import snippets
+from typesafe_eval import structure
+from typesafe_eval import taxonomy
 from typesafe_eval import templates
 from typesafe_eval.client import JevAnswer
 from typesafe_eval.client import JevClient
+
+log = logging.getLogger("typesafe_eval.evaluate")
 
 # Data types that map onto a permission-hygiene policy (Permissions & APIs goal).
 PERMISSION_POLICY = {
@@ -65,34 +73,769 @@ _LINKED_CATEGORIES = {
 
 
 def _repo_root() -> str:
-  return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+  return taxonomy._repo_root()  # pylint: disable=protected-access
 
 
-@functools.lru_cache(maxsize=1)
 def _taxonomy() -> Dict[str, dict]:
-  path = os.path.join(_repo_root(), "resources", "policies.json")
-  try:
-    with open(path, "r", encoding="utf-8") as f:
-      data = json.load(f)
-    return data.get("data_safety_section", {}).get("taxonomy", {})
-  except Exception:  # pylint: disable=broad-exception-caught
-    return {}
+  """The Data Safety taxonomy (see :mod:`typesafe_eval.taxonomy`; kept as the
+  historical name used across the engine, batch and registry modules)."""
+  return taxonomy.load()
+
+
+# Transfer decisions produced by :func:`transfer_decision`.
+TRANSMITS = "TRANSMITS"
+LOCAL = "LOCAL"
+UNCERTAIN = "UNCERTAIN"
+
+
+def transfer_decision(p_transmit: float) -> str:
+  """Three-way decision on the calibrated transfer probability.
+
+  ``p >= T_TRANSMIT_HIGH`` -> TRANSMITS; ``p < T_TRANSMIT_LOW`` -> LOCAL;
+  otherwise UNCERTAIN. UNCERTAIN findings are never silently downgraded: they are
+  emitted at IMPORTANT and routed to MANUAL_REVIEW by the critic, so the report
+  lands on "Needs review" rather than a false "Compliant". This is the fix for
+  the single 0.55 cliff that turned 0.52/0.54 answers on real transmissions into
+  local-only suggestions.
+  """
+  if p_transmit >= constants.T_TRANSMIT_HIGH:
+    return TRANSMITS
+  if p_transmit < constants.T_TRANSMIT_LOW:
+    return LOCAL
+  return UNCERTAIN
 
 
 def derive_data_safety_severity(
-    data_type: str, transmits: bool, disclosure_status: str
+    data_type: str, transmits: bool, disclosure_status: str, decision: str = ""
 ) -> str:
   """Severity for a data-safety finding, composed in code from Jev's booleans.
 
   Local-only or properly disclosed/exempt collection is a SUGGESTION (inventory).
   Undisclosed off-device transfer is CRITICAL for sensitive data types and
-  IMPORTANT otherwise.
+  IMPORTANT otherwise. An UNCERTAIN transfer is capped at IMPORTANT: it must be
+  reviewed, but the evaluator does not assert a Critical it cannot support.
   """
+  if decision == UNCERTAIN:
+    if disclosure_status in ("DISCLOSED", "EXEMPT"):
+      return "SUGGESTION"
+    return "IMPORTANT"
   if not transmits:
     return "SUGGESTION"
   if disclosure_status in ("DISCLOSED", "EXEMPT"):
     return "SUGGESTION"
   return "CRITICAL" if data_type in constants.SENSITIVE_DATA_TYPES else "IMPORTANT"
+
+
+def _decision_trace(
+    state: Dict[str, Any],
+    answers: Dict[str, JevAnswer],
+    decision: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+  """Auditable record of *why* a finding was composed the way it was.
+
+  Every score the decision used, the thresholds it was compared against (with
+  provenance), the capability-labelled sinks in scope, the anchor the snippet
+  was built from, and the evaluator version. Downstream ignores unknown keys, so
+  this rides along in ``worker_<goal>.json`` and into the critic input.
+  """
+  anchor = state.get("anchor") or {}
+  sinks = state.get("sinks") or []
+  scores = {qid: a.noul for qid, a in answers.items() if a.type == "noul"}
+  trace: Dict[str, Any] = {
+      "evaluator_version": constants.EVALUATOR_VERSION,
+      "scores": {k: (round(v, 4) if v is not None else None) for k, v in scores.items()},
+      "thresholds": {
+          "T_TRANSMIT_LOW": constants.T_TRANSMIT_LOW,
+          "T_TRANSMIT_HIGH": constants.T_TRANSMIT_HIGH,
+          "T_RELEVANCE": constants.T_RELEVANCE,
+          "T_RELEVANCE_FLOOR": constants.T_RELEVANCE_FLOOR,
+          "RELEVANCE_SOFT_GATE_FILE_EGRESS": constants.RELEVANCE_SOFT_GATE_FILE_EGRESS,
+          "T_DISCLOSURE": constants.T_DISCLOSURE,
+          "T_THIRD_PARTY": constants.T_THIRD_PARTY,
+          "T_SHARING_MASS": constants.T_SHARING_MASS,
+          "T_CONSENT_DEFAULT_ON": constants.T_CONSENT_DEFAULT_ON,
+          "CONF_CONSENT_ACT": constants.CONF_CONSENT_ACT,
+          "CONF_DESTINATION_ACT": constants.CONF_DESTINATION_ACT,
+          "DESTINATION_CLASS_ENABLED": constants.DESTINATION_CLASS_ENABLED,
+          "CONF_TYPE_CONFIRM": constants.CONF_TYPE_CONFIRM,
+          "DATA_TYPE_CONFIRMED_ENABLED": constants.DATA_TYPE_CONFIRMED_ENABLED,
+          "provenance": constants.THRESHOLD_PROVENANCE,
+      },
+      "anchor": {
+          "line": (state.get("signal") or {}).get("line"),
+          "all_lines": (state.get("signal") or {}).get("all_lines"),
+          "scope": anchor.get("scope"),
+          "sink_proximity": anchor.get("proximity"),
+          "sink_in_scope": anchor.get("sink_in_scope"),
+          "scope_capabilities": anchor.get("scope_capabilities"),
+          "rank_tier": anchor.get("tier"),
+          "lexical": anchor.get("lexical"),
+          "callee_in_scope": anchor.get("callee_in_scope"),
+          "callee_capabilities": anchor.get("callee_capabilities"),
+          "destination_hints": anchor.get("destination_hints"),
+          # WP8: declared defaults of the boolean guards around the anchor
+          # (``{flag: True|False|None}``); None when no guard was found.
+          "guard_defaults": anchor.get("guard_defaults"),
+          # WP9: deterministic media-access hint kinds in the scope.
+          "media_hints": anchor.get("media_hints"),
+      },
+      # WP7: the deterministic destination priors read from the anchor scope
+      # (kind, line, why, source line). Empty when none was found.
+      "destination_hints": [
+          {"hint": h.get("hint"), "line": h.get("line"), "detail": h.get("detail"),
+           "evidence": h.get("evidence")}
+          for h in state.get("destination_hints") or []
+      ],
+      "sinks": [
+          {"symbol": s.get("symbol"), "capabilities": s.get("capabilities")} for s in sinks
+      ],
+      # WP6: the one-hop first-party callees the anchor reaches, with the
+      # sinks each contributes. Empty when no hop was followed.
+      "callees": [
+          {"symbol": c.get("symbol"), "file": c.get("file"), "hop": c.get("hop"),
+           "called_at": c.get("called_at"), "members": c.get("members"),
+           "granularity": c.get("granularity"), "capabilities": c.get("capabilities"),
+           "sinks": [{"symbol": s.get("symbol"), "capabilities": s.get("capabilities")}
+                     for s in c.get("sinks") or []]}
+          for c in state.get("callees") or []
+      ],
+  }
+  if decision is not None:
+    trace["transfer_decision"] = decision
+  if extra:
+    trace.update(extra)
+  return trace
+
+
+def _relevant(answers: Dict[str, JevAnswer]) -> Tuple[bool, Optional[float]]:
+  """Semantic match gate. Missing answer (older batteries) counts as relevant."""
+  a = answers.get("signal_relevant")
+  if a is None or a.noul is None:
+    return True, None
+  return a.noul >= constants.T_RELEVANCE, a.noul
+
+
+RELEVANT = "relevant"
+RELEVANCE_LOW_WITH_SINK = "low_with_sink"
+RELEVANCE_LOW_WITH_FILE_EGRESS = "low_with_file_egress"
+RELEVANCE_DROP = "drop"
+
+
+def relevance_verdict(answers: Dict[str, JevAnswer], state: Dict[str, Any]) -> Tuple[str, Optional[float]]:
+  """Soft relevance gate (WP2).
+
+  The lexical pre-gate now removes coincidental substring hits before any model
+  call, so ``signal_relevant`` is left with genuinely semantic questions
+  (``record`` as a database row vs. an audio recording). A model judgement
+  below ``T_RELEVANCE`` is allowed to *suppress* a finding only when the
+  anchor's own scope has no capability-labelled egress or IPC sink (rank tier
+  2 or 3). When such a sink is in scope the code demonstrably hands data to a
+  transfer channel; the finding is kept, capped at IMPORTANT, flagged for
+  manual review and traced as ``relevance="low"``. This follows the charter
+  rule that a finding is never suppressed by judgement alone, and closed two
+  labelled recall losses caused by relevance answers moving with batch
+  composition. Rollback: ``constants.RELEVANCE_SOFT_GATE_ENABLED = False``.
+
+  The soft path applies only to *uncertain* answers: when ``p`` is below
+  ``T_RELEVANCE_FLOOR`` the model is confidently negative and the finding is
+  dropped even with a sink in scope (a database ``record`` next to an HTTP
+  client is not an audio recording). The floor keeps the review queue for
+  genuinely ambiguous matches rather than lexical coincidences.
+
+  Second condition (WP4, ``constants.RELEVANCE_SOFT_GATE_FILE_EGRESS``): an
+  uncertain answer is also kept when the *file* references a strong egress
+  sink (:data:`constants.RANK_STRONG_EGRESS_CAPABILITIES`) anywhere, even
+  though the anchor's own function does not (tier 2–3). The evidence is
+  weaker — the WP3 evidence line marks the sink ``(out of scope)`` — so the
+  verdict is distinct (:data:`RELEVANCE_LOW_WITH_FILE_EGRESS`) and the trace
+  says ``relevance="low_file_egress"``. IPC-only or ``UNKNOWN`` file sinks do
+  not qualify.
+
+  Returns ``(verdict, p_relevant)`` with verdict one of :data:`RELEVANT`,
+  :data:`RELEVANCE_LOW_WITH_SINK`, :data:`RELEVANCE_LOW_WITH_FILE_EGRESS`,
+  :data:`RELEVANCE_DROP`.
+  """
+  relevant, p = _relevant(answers)
+  if relevant:
+    return RELEVANT, p
+  if not constants.RELEVANCE_SOFT_GATE_ENABLED or p is None or p < constants.T_RELEVANCE_FLOOR:
+    return RELEVANCE_DROP, p
+  tier = (state.get("anchor") or {}).get("tier")
+  if tier is not None and tier <= 1:
+    return RELEVANCE_LOW_WITH_SINK, p
+  if constants.RELEVANCE_SOFT_GATE_FILE_EGRESS and file_has_strong_egress(state):
+    return RELEVANCE_LOW_WITH_FILE_EGRESS, p
+  return RELEVANCE_DROP, p
+
+
+def file_has_strong_egress(state: Dict[str, Any]) -> bool:
+  """True when any sink listed in the state carries a strong egress capability.
+
+  ``state["sinks"]`` lists every transfer-capable identifier the file
+  references (lines bounded, symbols not), so this is a file-level fact
+  independent of the anchor's scope. Since WP6 the sinks of the anchor's
+  one-hop first-party callees (``state["callees"][*]["sinks"]``) count too:
+  a helper reached from the anchor's function that owns the network client is
+  at least as strong a reason to keep an uncertain relevance answer for review
+  as a network symbol elsewhere in the same file.
+  """
+  strong = set(constants.RANK_STRONG_EGRESS_CAPABILITIES)
+  if any(set(s.get("capabilities") or []) & strong for s in state.get("sinks") or []):
+    return True
+  return any(set(s.get("capabilities") or []) & strong
+             for c in state.get("callees") or [] for s in c.get("sinks") or [])
+
+
+def sharing_sinks_in_scope(state: Dict[str, Any]) -> List[str]:
+  """Sharing-capable sink symbols reachable from the anchor's own scope.
+
+  Same-file sinks count when one of their reference lines lies inside the
+  anchor scope. Since WP6 the sinks of a first-party callee called from the
+  scope count as well (the call site is in scope by construction; the
+  symbol is reported as ``Callee.Sink`` so the trace shows the hop). Used to
+  OR the model's ``is_third_party`` answer with the static fact that the data
+  reaches a sharing channel (IPC counts as sharing by policy direction).
+  """
+  sharing = set(constants.SHARING_CAPABILITY_NAMES)
+  scope = (state.get("anchor") or {}).get("scope") or [0, 0]
+  out = {
+      s["symbol"] for s in state.get("sinks") or []
+      if set(s.get("capabilities") or []) & sharing
+      and any(scope[0] <= ln <= scope[1] for ln in s.get("lines") or [])
+  }
+  for callee in state.get("callees") or []:
+    for s in callee.get("sinks") or []:
+      if set(s.get("capabilities") or []) & sharing:
+        out.add(f"{callee.get('symbol')}.{s.get('symbol')}")
+  return sorted(out)
+
+
+# ---------------------------------------------------------------------------
+# WP7: destination_class composition
+# ---------------------------------------------------------------------------
+
+DESTINATION_UNKNOWN = "unknown"
+
+
+class Destination:
+  """The composed destination of a transfer and how much the composer trusts it.
+
+  Attributes:
+    cls: One of ``questions.DESTINATION_CLASS_OPTIONS`` (``unknown`` when the
+      battery had no ``destination_class`` answer).
+    confidence: The Choice's calibrated confidence (0.0 when absent).
+    probabilities: The Choice's per-option probabilities (trace only).
+    hints: Deterministic hint kinds found in the anchor scope
+      (``structure.destination_hints``).
+    sharing: True when the transfer counts as sharing with another party --
+      the probability mass on ``constants.SHARING_DESTINATION_CLASSES``
+      reaches ``T_SHARING_MASS`` or a sharing-capable sink is in the anchor
+      scope. Drives the report's ``is_third_party``.
+    sharing_mass: The summed probability of the sharing classes (1.0 / 0.0
+      when the Choice carried no distribution).
+    confirmed: True when the class may change the composed severity: the
+      confidence reaches ``CONF_DESTINATION_ACT`` *and* an independent signal
+      corroborates it (see ``corroboration``). Only meaningful for the
+      non-collection classes; other classes never lower a severity.
+    corroboration: Why ``confirmed`` holds (``hint`` / ``user_initiated`` /
+      ``no_egress_in_scope``) or why not (``low_confidence`` /
+      ``uncorroborated`` / ``n/a``); ``low_sharing_mass`` when a sharing
+      argmax did not reach ``T_SHARING_MASS`` and no IPC sink backs it.
+    applied: True when the class actually changed the finding (a confirmed
+      non-collection class on a transfer at/above ``T_TRANSMIT_LOW``).
+    legacy: True when the class was derived from an ``is_third_party`` Noul
+      (older battery / cached answers) rather than the Choice.
+  """
+
+  def __init__(self, cls: str, confidence: float, probabilities: Dict[str, float],
+               hints: List[str], sharing: bool, confirmed: bool, corroboration: str,
+               legacy: bool = False, sharing_mass: float = 0.0):
+    self.cls = cls
+    self.confidence = confidence
+    self.probabilities = probabilities
+    self.hints = hints
+    self.sharing = sharing
+    self.sharing_mass = sharing_mass
+    self.confirmed = confirmed
+    self.corroboration = corroboration
+    self.applied = False
+    self.legacy = legacy
+
+  @property
+  def non_collection(self) -> bool:
+    """A confirmed class under which the transfer is not collection by the developer."""
+    return self.confirmed and self.cls in constants.NON_COLLECTION_DESTINATION_CLASSES
+
+  @property
+  def sharing_unconfirmed(self) -> bool:
+    """The argmax is a sharing class but the composed ``sharing`` is False (review, not a flip)."""
+    return self.cls in constants.SHARING_DESTINATION_CLASSES and not self.sharing
+
+  def to_trace(self) -> Dict[str, Any]:
+    return {
+        "class": self.cls,
+        "confidence": round(self.confidence, 4),
+        "probabilities": {k: round(v, 4) for k, v in (self.probabilities or {}).items()},
+        "hints": self.hints,
+        "sharing": self.sharing,
+        "sharing_mass": round(self.sharing_mass, 4),
+        "confirmed": self.confirmed,
+        "corroboration": self.corroboration,
+        "applied": self.applied,
+        "legacy": self.legacy,
+        "enabled": constants.DESTINATION_CLASS_ENABLED,
+    }
+
+
+def destination_from_answers(answers: Dict[str, JevAnswer]) -> Tuple[str, float, Dict[str, float], bool]:
+  """``(class, confidence, probabilities, legacy)`` from the battery's answers.
+
+  Prefers the ``destination_class`` Choice. Falls back to the retired
+  ``is_third_party`` Noul (``third_party_sdk`` at/above ``T_THIRD_PARTY``,
+  else ``developer_backend``, confidence = distance from 0.5 doubled) so
+  answers cached by an older battery still compose; the fallback is flagged
+  ``legacy`` in the trace. Missing both -> ``unknown`` at confidence 0.
+  """
+  a = answers.get("destination_class")
+  if a is not None and a.type == "choice" and a.choice:
+    cls = a.choice if a.choice in q.DESTINATION_CLASS_OPTIONS else DESTINATION_UNKNOWN
+    return cls, float(a.confidence or 0.0), dict(a.probabilities or {}), False
+  legacy = answers.get("is_third_party")
+  if legacy is not None and legacy.noul is not None:
+    p = float(legacy.noul)
+    cls = "third_party_sdk" if p >= constants.T_THIRD_PARTY else "developer_backend"
+    # A two-point distribution so ``sharing_mass`` reproduces the Noul.
+    return cls, min(1.0, abs(p - 0.5) * 2.0), {"third_party_sdk": p, "developer_backend": 1.0 - p}, True
+  return DESTINATION_UNKNOWN, 0.0, {}, False
+
+
+def _anchor_hint_kinds(state: Dict[str, Any]) -> List[str]:
+  anchor = state.get("anchor") or {}
+  kinds = anchor.get("destination_hints")
+  if kinds is None:
+    kinds = [h.get("hint") for h in state.get("destination_hints") or []]
+  return sorted({k for k in kinds if k})
+
+
+def _scope_has_strong_egress(state: Dict[str, Any]) -> bool:
+  anchor = state.get("anchor") or {}
+  reach = set(anchor.get("scope_capabilities") or []) | set(anchor.get("callee_capabilities") or [])
+  return bool(reach & set(constants.RANK_STRONG_EGRESS_CAPABILITIES))
+
+
+def compose_destination(
+    state: Dict[str, Any], answers: Dict[str, JevAnswer], transmits: bool,
+    user_initiated: bool, sharing_in_scope: Sequence[str],
+) -> Destination:
+  """Composes the destination of a transfer from the Choice plus static facts (WP7).
+
+  Plan §2 L2 table, in code:
+
+  ======================== ================== =====================================
+  class                    transfer is        consequence (when ``transmits``)
+  ======================== ================== =====================================
+  developer_backend        collection         declare; disclosure if sensitive
+  third_party_sdk          collection+sharing ``is_third_party``; disclosure required
+  other_app_ipc            sharing            ``is_third_party`` (IPC = sharing)
+  user_chosen_destination  not collection     inventory SUGGESTION, EXEMPT (*)
+  platform_component       local              inventory SUGGESTION, EXEMPT (*)
+  unknown                  uncertain          MANUAL_REVIEW, never pruned
+  ======================== ================== =====================================
+
+  (*) only when *confirmed*: confidence >= ``CONF_DESTINATION_ACT`` and an
+  independent signal agrees -- the deterministic ``USER_CHOSEN_DESTINATION``
+  hint or the battery's own ``user_initiated`` for the user-chosen class; no
+  strong-egress capability reachable from the anchor scope (same file or
+  callee) for the platform class. Otherwise the class is traced, the finding
+  keeps its transfer-based severity and goes to manual review. This is the
+  charter's "never suppressed by judgement alone" applied to the one place a
+  judgement lowers a severity.
+
+  ``sharing`` is recall-leaning but not argmax-driven: the probability mass
+  on the sharing classes must reach ``T_SHARING_MASS`` ("more likely shared
+  than not"; the legacy Noul is a two-point distribution so it reproduces the
+  old ``is_third_party``), and a sharing-capable sink inside the anchor scope
+  counts regardless of the class (the pre-WP7 OR). A sharing argmax below
+  the mass with no IPC sink is traced as ``corroboration: low_sharing_mass``
+  and review-flagged by the caller. With ``DESTINATION_CLASS_ENABLED`` off
+  the class is still traced but ``confirmed`` is always False and ``sharing``
+  reduces to the static in-scope fact.
+  """
+  cls, confidence, probabilities, legacy = destination_from_answers(answers)
+  hints = _anchor_hint_kinds(state)
+  enabled = constants.DESTINATION_CLASS_ENABLED
+  if probabilities:
+    sharing_mass = sum(float(probabilities.get(c, 0.0)) for c in constants.SHARING_DESTINATION_CLASSES)
+  else:
+    sharing_mass = 1.0 if cls in constants.SHARING_DESTINATION_CLASSES else 0.0
+  if legacy:
+    # The Noul already applied ``T_THIRD_PARTY``; keep the old semantics exactly.
+    sharing_by_class = enabled and cls in constants.SHARING_DESTINATION_CLASSES
+  else:
+    sharing_by_class = enabled and sharing_mass >= constants.T_SHARING_MASS
+  sharing = bool(transmits and (sharing_by_class or sharing_in_scope))
+
+  confirmed = False
+  corroboration = "n/a"
+  if enabled and transmits and cls in constants.SHARING_DESTINATION_CLASSES and not sharing:
+    corroboration = "low_sharing_mass"
+  elif enabled and cls in constants.NON_COLLECTION_DESTINATION_CLASSES:
+    if confidence < constants.CONF_DESTINATION_ACT:
+      corroboration = "low_confidence"
+    elif cls == "user_chosen_destination":
+      if structure.USER_CHOSEN_DESTINATION in hints:
+        confirmed, corroboration = True, "hint"
+      elif user_initiated:
+        confirmed, corroboration = True, "user_initiated"
+      else:
+        corroboration = "uncorroborated"
+    elif cls == "platform_component":
+      if not _scope_has_strong_egress(state):
+        confirmed, corroboration = True, "no_egress_in_scope"
+      else:
+        corroboration = "uncorroborated"
+  log.debug("destination for %s in %s: class=%s conf=%.2f mass=%.2f hints=%s sharing=%s confirmed=%s (%s)",
+            (state.get("signal") or {}).get("data_type"), (state.get("signal") or {}).get("file"),
+            cls, confidence, sharing_mass, hints, sharing, confirmed, corroboration)
+  return Destination(cls, confidence, probabilities, hints, sharing, confirmed, corroboration,
+                     legacy, sharing_mass=sharing_mass)
+
+
+class Consent:
+  """How a transfer is enabled: by default or by the user opting in (WP8).
+
+  Attributes:
+    p_default_on: The ``consent_default_on`` Noul (None when not asked).
+    guards: The anchor scope's guard states (``state["guards"]``), trace only.
+    guard_defaults: ``runs_by_default`` of every guard with a located
+      declaration -- whether the transfer runs when the flag keeps its
+      declared default (the flag's sense, early-exit included, already
+      folded in by ``context.GuardState``).
+    default_on: The composed answer -- True (raise applied or eligible), False
+      (opt-in confirmed), None (not decided).
+    action: ``raise`` / ``lower`` / ``none`` -- what the composition did.
+    corroboration: Why (``guard_default_on`` / ``unconditional`` /
+      ``model_only`` / ``guard_default_off`` / ``vetoed_by_guard`` /
+      ``uncorroborated`` / ``low_confidence`` / ``not_applicable``).
+    capped_by: Why a default-on answer did *not* raise the severity:
+      ``uncertain_band`` (an UNCERTAIN transfer is capped at IMPORTANT by
+      ``derive_data_safety_severity``) or ``unresolved_destination`` (the
+      destination class is ``unknown`` or an unconfirmed non-collection /
+      sharing class -- a Critical for "collection enabled by default" is not
+      supportable when the collection itself is unresolved). None otherwise.
+  """
+
+  def __init__(self, p_default_on: Optional[float], guards: List[Dict[str, Any]]):
+    self.p_default_on = p_default_on
+    self.guards = guards
+    # Locals (``resolution == "local"``) carry ``runs_by_default: None`` and so
+    # never corroborate or veto; they are still listed for the model / trace.
+    self.guard_defaults: List[Optional[bool]] = [
+        g.get("runs_by_default") for g in guards
+        if g.get("declaration") and (g.get("declaration") or {}).get("resolution") != "local"]
+    self.default_on: Optional[bool] = None
+    self.action = "none"
+    self.corroboration = "not_applicable"
+    self.capped_by: Optional[str] = None
+
+  @property
+  def first_declared(self) -> Optional[Dict[str, Any]]:
+    """The first guard with a located non-local declaration, else the first local one."""
+    for g in self.guards:
+      if g.get("declaration") and g["declaration"].get("resolution") != "local":
+        return g
+    for g in self.guards:
+      if g.get("declaration"):
+        return g
+    return None
+
+  @property
+  def first_off_guard(self) -> Optional[Dict[str, Any]]:
+    """The first guard that keeps the transfer off by default (the opt-in toggle)."""
+    for g in self.guards:
+      if g.get("declaration") and g.get("runs_by_default") is False:
+        return g
+    return None
+
+  def to_trace(self) -> Dict[str, Any]:
+    return {
+        "p_default_on": None if self.p_default_on is None else round(self.p_default_on, 4),
+        "guards": [{"flag": g.get("flag"), "line": g.get("line"), "runs_when": g.get("runs_when"),
+                    "default_on": g.get("default_on"), "runs_by_default": g.get("runs_by_default"),
+                    "declaration": (g.get("declaration") or {}).get("file") and
+                    f"{g['declaration']['file']}:L{g['declaration']['line']}"} for g in self.guards],
+        "guard_defaults": self.guard_defaults,
+        "default_on": self.default_on,
+        "action": self.action,
+        "corroboration": self.corroboration,
+        "capped_by": self.capped_by,
+        "enabled": constants.CONSENT_DEFAULT_ENABLED,
+    }
+
+
+def _state_guards(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+  return list(state.get("guards") or [])
+
+
+def compose_consent(
+    state: Dict[str, Any], answers: Dict[str, JevAnswer], transmits: bool,
+    disclosure_status: str, severity: str, decision: str = TRANSMITS,
+    destination_resolved: bool = True, type_disputed: bool = False,
+) -> Tuple[Consent, str]:
+  """Composes the consent default and returns ``(consent, severity)`` (WP8).
+
+  ``type_disputed`` (WP10): the ``data_type_confirmed`` answer says the value
+  is not personal or the relabel lowered the severity, so a Critical is not
+  supportable until a reviewer settles the type (``capped_by: disputed_type``).
+
+  Only an undisclosed transfer (``transmits`` and ``disclosure_status ==
+  "MISSING"``) is affected; everything else is traced with ``action: none``.
+
+  Raise (IMPORTANT -> CRITICAL), TRANSMITS decisions with a resolved
+  destination only: the Noul is at/above ``T_CONSENT_DEFAULT_ON`` and no
+  guard keeps the transfer off by default. A deterministic default-off guard
+  vetoes the model's default-on claim (``vetoed_by_guard``). The
+  corroboration names the deterministic fact that agrees: a guard under
+  which the transfer runs by default (``guard_default_on``), or no guard at
+  all (``unconditional``); with only unresolved guards the raise still
+  applies on the model's answer (``model_only``) -- severity already derives
+  from the model's booleans and the finding is undisclosed. Two caps keep a
+  Critical supportable: an UNCERTAIN decision stays at IMPORTANT
+  (``derive_data_safety_severity``; ``capped_by: uncertain_band``) and an
+  unresolved destination -- ``unknown``, or an unconfirmed non-collection /
+  sharing class already routed to review -- is not raised either
+  (``capped_by: unresolved_destination``): "collection enabled by default"
+  needs the collection to be resolved first. In both cases the default-on
+  answer is recorded (``default_on: True``) and the severity stands.
+
+  Lower (-> SUGGESTION + review), either band: the Noul is confidently
+  negative (<= 1 - ``CONF_CONSENT_ACT``) *and* a guard keeps the transfer
+  off by default (``runs_by_default == False``). Both halves are required:
+  this is a judgement lowering a severity. The disclosure status is left
+  MISSING because an opt-in toggle is not a prominent disclosure; the
+  finding says to verify the toggle text.
+
+  With ``CONSENT_DEFAULT_ENABLED`` off the Noul and guards are traced and
+  nothing changes.
+  """
+  a = answers.get("consent_default_on")
+  p = None if a is None or a.noul is None else float(a.noul)
+  consent = Consent(p, _state_guards(state))
+  if not constants.CONSENT_DEFAULT_ENABLED or not transmits or disclosure_status != "MISSING" or p is None:
+    return consent, severity
+  any_off = any(d is False for d in consent.guard_defaults)
+  any_on = any(d is True for d in consent.guard_defaults)
+  if p >= constants.T_CONSENT_DEFAULT_ON:
+    if any_off:
+      consent.corroboration = "vetoed_by_guard"
+    else:
+      consent.default_on = True
+      consent.corroboration = ("guard_default_on" if any_on
+                               else "unconditional" if not consent.guards else "model_only")
+      if decision != TRANSMITS:
+        consent.capped_by = "uncertain_band"
+      elif not destination_resolved:
+        consent.capped_by = "unresolved_destination"
+      elif type_disputed:
+        consent.capped_by = "disputed_type"
+      elif severity == "IMPORTANT":
+        severity = "CRITICAL"
+        consent.action = "raise"
+  elif p <= 1.0 - constants.CONF_CONSENT_ACT:
+    if any_off:
+      consent.default_on = False
+      consent.corroboration = "guard_default_off"
+      if severity in ("CRITICAL", "IMPORTANT"):
+        severity = "SUGGESTION"
+        consent.action = "lower"
+    else:
+      consent.corroboration = "uncorroborated"
+  else:
+    consent.corroboration = "low_confidence"
+  log.debug("consent for %s in %s: p=%.2f guards=%s decision=%s -> default_on=%s action=%s (%s%s)",
+            (state.get("signal") or {}).get("data_type"), (state.get("signal") or {}).get("file"),
+            p, consent.guard_defaults, decision, consent.default_on, consent.action, consent.corroboration,
+            f", capped_by={consent.capped_by}" if consent.capped_by else "")
+  return consent, severity
+
+
+# WP10: outcomes of ``compose_type_confirmation``.
+TYPE_AS_LABELLED = "as_labelled"     # the scanner's label stands (or the answer was too weak to act)
+TYPE_RELABELLED = "relabelled"       # composed on a sibling type
+TYPE_NOT_PERSONAL = "not_personal"   # kept, capped at IMPORTANT, review
+TYPE_UNKNOWN = "unknown"             # kept, review
+
+_SEVERITY_RANK = {"SUGGESTION": 0, "IMPORTANT": 1, "CRITICAL": 2}
+
+
+class TypeConfirmation:
+  """What the ``data_type_confirmed`` Choice said and what the composer did with it (WP10).
+
+  Attributes:
+    labelled: The scanner's taxonomy type.
+    answer: The Choice's argmax option (``as_labelled`` when the battery had no
+      answer); one of the option ids in
+      ``questions.data_type_confirmed_question``.
+    confidence: The Choice's calibrated confidence (0.0 when absent).
+    probabilities: The per-option distribution (trace only).
+    effective_type: The type the finding is composed on -- a sibling type after
+      a confident relabel, otherwise ``labelled``.
+    action: ``as_labelled`` / ``relabelled`` / ``not_personal`` / ``unknown``.
+    read: False when the answer was not consulted (below ``T_TRANSMIT_LOW`` the
+      type is moot; the feature flag off).
+    lowered: True when a relabel lowered the derived severity (one step at most,
+      review-flagged).
+    disputed: True when the type is in question -- ``not_personal`` or a
+      lowering relabel -- so no Critical is asserted on it.
+  """
+
+  def __init__(self, labelled: str, answer: str, confidence: float,
+               probabilities: Dict[str, float]):
+    self.labelled = labelled
+    self.answer = answer
+    self.confidence = confidence
+    self.probabilities = probabilities
+    self.effective_type = labelled
+    self.action = TYPE_AS_LABELLED
+    self.read = False
+    self.lowered = False
+
+  @property
+  def disputed(self) -> bool:
+    return self.action == TYPE_NOT_PERSONAL or (self.action == TYPE_RELABELLED and self.lowered)
+
+  @property
+  def review(self) -> bool:
+    """A judgement changed or questioned the type: a reviewer confirms it."""
+    return self.disputed or self.action == TYPE_UNKNOWN
+
+  def to_trace(self) -> Dict[str, Any]:
+    return {
+        "labelled": self.labelled,
+        "answer": self.answer,
+        "confidence": round(self.confidence, 4),
+        "probabilities": {k: round(v, 4) for k, v in (self.probabilities or {}).items()},
+        "effective_type": self.effective_type,
+        "action": self.action,
+        "read": self.read,
+        "lowered": self.lowered,
+        "CONF_TYPE_CONFIRM": constants.CONF_TYPE_CONFIRM,
+        "enabled": constants.DATA_TYPE_CONFIRMED_ENABLED,
+    }
+
+
+def type_confirmation_from_answers(data_type: str, answers: Dict[str, JevAnswer]) -> TypeConfirmation:
+  """Reads the ``data_type_confirmed`` Choice (or ``as_labelled`` at confidence 0 when absent)."""
+  a = answers.get("data_type_confirmed")
+  if a is None or a.type != "choice" or not a.choice:
+    return TypeConfirmation(data_type, TYPE_AS_LABELLED, 0.0, {})
+  return TypeConfirmation(data_type, str(a.choice), float(a.confidence or 0.0), dict(a.probabilities or {}))
+
+
+def compose_type_confirmation(
+    data_type: str, answers: Dict[str, JevAnswer], transmits: bool,
+    disclosure_status: str, decision: str,
+) -> Tuple[TypeConfirmation, str]:
+  """Composes the confirmed data type and returns ``(confirmation, severity)`` (WP10, L7).
+
+  The severity is derived here (``derive_data_safety_severity``) on the
+  *effective* type so the caller composes on one type throughout. Read only
+  for a transfer at/above ``T_TRANSMIT_LOW`` (``transmits``): below the band
+  the finding is local inventory and the label is moot.
+
+  - A sibling type at/above ``CONF_TYPE_CONFIRM`` **relabels**: the finding is
+    composed on that type (``psl_constant``, summary, sensitivity). A relabel
+    that raises the severity applies in full (a more sensitive type is more,
+    not less, of a finding). A relabel that would lower it is a judgement
+    lowering a severity, so it is allowed one step at most (CRITICAL ->
+    IMPORTANT), flagged for review and reported as disputed; the report keeps
+    the finding.
+  - ``NOT_PERSONAL`` at/above the bar keeps the finding and the labelled type
+    (a model judgement never removes a finding; the inventory stays as the
+    scanner saw it), caps the severity at IMPORTANT and flags review: the
+    reviewer, not the model, decides an app UID is not a user account.
+  - ``unknown`` at/above the bar flags review; ``as_labelled``, an option that
+    is not in the taxonomy, or any answer below the bar composes as labelled
+    and is traced only.
+  """
+  tc = type_confirmation_from_answers(data_type, answers)
+  severity = derive_data_safety_severity(data_type, transmits, disclosure_status, decision)
+  if not constants.DATA_TYPE_CONFIRMED_ENABLED or not transmits:
+    return tc, severity
+  tc.read = True
+  if tc.confidence < constants.CONF_TYPE_CONFIRM or tc.answer == TYPE_AS_LABELLED:
+    return tc, severity
+  if tc.answer == constants.NOT_PERSONAL:
+    tc.action = TYPE_NOT_PERSONAL
+    if _SEVERITY_RANK[severity] > _SEVERITY_RANK["IMPORTANT"]:
+      severity = "IMPORTANT"
+    return tc, severity
+  if tc.answer == q.TYPE_CONFIRMED_UNKNOWN:
+    tc.action = TYPE_UNKNOWN
+    return tc, severity
+  if tc.answer in taxonomy.load() and tc.answer != data_type:
+    tc.action = TYPE_RELABELLED
+    tc.effective_type = tc.answer
+    relabelled = derive_data_safety_severity(tc.answer, transmits, disclosure_status, decision)
+    if _SEVERITY_RANK[relabelled] < _SEVERITY_RANK[severity]:
+      tc.lowered = True
+      # One step at most: a relabel never takes a finding out of the report.
+      severity = "IMPORTANT" if severity == "CRITICAL" else severity
+    else:
+      severity = relabelled
+    return tc, severity
+  # An option the taxonomy does not know (stale cache, edited question): as labelled.
+  log.warning("data_type_confirmed answered %r for %s, not a taxonomy type; composing as labelled",
+              tc.answer, data_type)
+  return tc, severity
+
+
+def relevance_is_low(verdict: str) -> bool:
+  """True for either soft-kept verdict (in-scope sink or file-level egress)."""
+  return verdict in (RELEVANCE_LOW_WITH_SINK, RELEVANCE_LOW_WITH_FILE_EGRESS)
+
+
+def relevance_trace(verdict: str) -> str:
+  """The ``decision_trace.relevance`` value for a verdict (``ok`` / ``low`` / ``low_file_egress``)."""
+  if verdict == RELEVANCE_LOW_WITH_SINK:
+    return "low"
+  if verdict == RELEVANCE_LOW_WITH_FILE_EGRESS:
+    return "low_file_egress"
+  return "ok"
+
+
+def reconcile_disclosure_status(
+    status: str, answers: Dict[str, JevAnswer], transmits: bool, user_initiated: bool
+) -> Tuple[str, Optional[str]]:
+  """Cross-checks the ``disclosure_status`` Choice against the battery's own Nouls.
+
+  The battery asks the disclosure question twice in different forms: a Noul
+  ``has_prominent_disclosure`` (P(a gate is shown before the data is used))
+  and a three-way Choice ``disclosure_status``. When the two disagree the
+  Choice is the less reliable of the pair (it moves with snippet composition;
+  a wider anchor scope flipped a labelled media-sharing transfer from
+  ``MISSING`` to ``DISCLOSED`` while ``has_prominent_disclosure`` stayed at
+  0.18), so the composer falls back to the recall-safe reading:
+
+  * ``DISCLOSED`` with ``has_prominent_disclosure < T_DISCLOSURE`` -> ``MISSING``.
+    A disclosure the model itself does not believe exists cannot excuse the
+    transfer; the finding is routed to review instead of being downgraded.
+  * ``EXEMPT`` on an off-device transfer that is *not* user-initiated ->
+    ``MISSING``. The Choice's own criterion for EXEMPT is "stays on-device or
+    obvious core functionality the user initiated"; neither holds.
+
+  Returns ``(status, note)`` where ``note`` is None when nothing changed and
+  otherwise a short trace string (``"DISCLOSED->MISSING (p_disclosure=0.18)"``).
+  ``LOCAL`` decisions never reach this function (they are EXEMPT in code).
+  """
+  a = answers.get("has_prominent_disclosure")
+  p = a.noul if a is not None else None
+  if status == "DISCLOSED" and p is not None and p < constants.T_DISCLOSURE:
+    return "MISSING", f"DISCLOSED->MISSING (p_disclosure={p:.2f} < T_DISCLOSURE={constants.T_DISCLOSURE})"
+  if status == "EXEMPT" and transmits and not user_initiated:
+    return "MISSING", "EXEMPT->MISSING (transfer is not user-initiated)"
+  return status, None
 
 
 def derive_permission_severity(
@@ -135,14 +878,165 @@ def _app_facts(base_context: dict, temp_dir: str) -> Dict[str, Any]:
   }
 
 
+def purpose_in(app_purpose: Optional[Dict[str, Any]], allowed: Iterable[str]) -> bool:
+  """True when the app's established primary purpose is one of ``allowed`` (WP4).
+
+  ``app_purpose`` is the dict produced by ``engine._ask_app_purpose``
+  (``{"purpose", "confidence", "source"}``). The purpose counts as established
+  only at confidence >= ``constants.CONF_APP_PURPOSE``; ``unknown``, a missing
+  answer or a low-confidence answer all return False. Policies use the result
+  to *moderate* severity (a file manager holding all-files access is a
+  Suggestion, anything else is Critical) — False therefore means "not
+  justified", never "suppress". A human-pinned answer (``source == "human"``)
+  is trusted regardless of confidence.
+  """
+  if not app_purpose:
+    return False
+  purpose = app_purpose.get("purpose")
+  if not purpose or purpose == "unknown":
+    return False
+  if app_purpose.get("source") != "human" and float(app_purpose.get("confidence") or 0.0) < constants.CONF_APP_PURPOSE:
+    return False
+  return purpose in set(allowed)
+
+
+_EVIDENCE_MATCHED_MAX = 96  # characters of the matched source line shown in evidence
+
+
+def nearest_sink(state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+  """The capability-labelled sink reference closest to the anchor, or None.
+
+  Preference order: a sink line inside the anchor's own scope (the transfer
+  happens in the same function), then (WP6) a sink inside a first-party
+  callee called from that scope, then the smallest line distance to the
+  anchor line elsewhere in the file. Only sinks with a *transfer* capability
+  count — a ``LOCAL_PERSISTENCE`` or ``USER_DISCLOSURE_UI`` symbol is not a
+  sink for evidence purposes even though it is listed in ``state["sinks"]``
+  for the model. Returns ``{"symbol", "line", "capabilities", "in_scope",
+  "distance"}`` with a 1-based line; for a callee sink the dict also carries
+  ``"file"`` (the callee), ``"via"`` (the class name as called) and
+  ``"called_at"`` (the 1-based caller line of the call site nearest the
+  anchor), and ``distance`` is measured from the anchor to that call site.
+  """
+  signal = state.get("signal") or {}
+  anchor_line = signal.get("line")
+  scope = (state.get("anchor") or {}).get("scope") or [0, 0]
+  transfer_caps = set(constants.SHARING_CAPABILITY_NAMES) | set(constants.RANK_STRONG_EGRESS_CAPABILITIES) | {"UNKNOWN"}
+  best: Optional[Dict[str, Any]] = None
+  best_key: Optional[Tuple[int, int, str]] = None
+  for s in state.get("sinks") or []:
+    caps_ = [c for c in (s.get("capabilities") or []) if c in transfer_caps]
+    if not caps_:
+      continue
+    for ln in s.get("lines") or []:
+      in_scope = bool(scope) and scope[0] <= ln <= scope[1]
+      distance = abs(ln - anchor_line) if anchor_line is not None else 1 << 30
+      key = (0 if in_scope else 2, distance, s.get("symbol") or "")
+      if best_key is None or key < best_key:
+        best_key = key
+        best = {"symbol": s.get("symbol"), "line": ln, "capabilities": caps_,
+                "in_scope": in_scope, "distance": distance}
+  for callee in state.get("callees") or []:
+    called_at = callee.get("called_at") or []
+    if not called_at:
+      continue
+    call_line = min(called_at, key=lambda ln: abs(ln - anchor_line) if anchor_line is not None else ln)
+    distance = abs(call_line - anchor_line) if anchor_line is not None else 1 << 30
+    for s in callee.get("sinks") or []:
+      caps_ = [c for c in (s.get("capabilities") or []) if c in transfer_caps]
+      if not caps_:
+        continue
+      # A file-level callee sink (wildcard import, no located line) still
+      # names the reachable channel; line 0 marks "not located".
+      ln = (s.get("lines") or [0])[0]
+      key = (1, distance, s.get("symbol") or "")
+      if best_key is None or key < best_key:
+        best_key = key
+        best = {"symbol": s.get("symbol"), "line": ln, "capabilities": caps_,
+                "in_scope": True, "distance": distance, "file": callee.get("file"),
+                "via": callee.get("symbol"), "called_at": call_line}
+  return best
+
+
+def evidence_flow(state: Dict[str, Any]) -> Dict[str, Any]:
+  """Machine-readable source -> sink evidence for one finding (WP3).
+
+  ``source`` is the anchor: file, the matched line number, the enclosing
+  scope (1-based inclusive) and the matched source text. ``sink`` is
+  :func:`nearest_sink` or None. Downstream ignores unknown keys; WP7 appends
+  the destination class here.
+  """
+  signal = state.get("signal") or {}
+  scope = (state.get("anchor") or {}).get("scope") or None
+  return {
+      "source": {
+          "file": signal.get("file"),
+          "line": signal.get("line"),
+          "scope": list(scope) if scope else None,
+          "matched": (signal.get("matched_line") or "").strip()[:_EVIDENCE_MATCHED_MAX],
+      },
+      "sink": nearest_sink(state),
+  }
+
+
+def files_involved(state: Dict[str, Any]) -> List[str]:
+  """The anchor file plus, when the evidence sink lives in a first-party
+  callee (WP6), that callee's file, so the report points the reviewer at both
+  halves of the flow. Order: anchor file first."""
+  files = [state["signal"]["file"]]
+  sink = nearest_sink(state)
+  if sink and sink.get("file") and sink["file"] not in files:
+    files.append(sink["file"])
+  return files
+
+
 def _evidence_line(state: Dict[str, Any]) -> str:
-  """One-line evidence: ``file:Lnn — <the matched source line>``."""
+  """One-line, human-readable evidence (WP3 structured form).
+
+  With a transfer sink in the file::
+
+    source@<file>:L<start>-L<end> (L<line>: <matched>) -> sink@L<n> <Symbol> [<CAPS>]
+
+  ``L<start>-L<end>`` is the anchor's enclosing scope, so a reviewer sees the
+  function that performs the operation, not a single line; the sink is the
+  nearest capability-labelled transfer reference (:func:`nearest_sink`),
+  suffixed ``(out of scope)`` when it lies outside that function. When the
+  sink lives in a first-party callee (WP6) the destination names the callee
+  file and the call site::
+
+    ... -> sink@<callee file>:L<n> <Symbol> [<CAPS>] (via <Class> called at L<k>)
+
+  Without a transfer sink the previous form is kept unchanged::
+
+    <file>:L<line> — <matched>
+
+  ``|`` and newlines never appear (the report renders this inside a Markdown
+  table cell). The same data is available structurally as
+  ``finding["evidence_flow"]``.
+  """
   signal = state.get("signal", {})
   file = signal.get("file")
   line = signal.get("line")
-  matched = (signal.get("matched_line") or "").strip()
-  where = f"{file}:L{line}" if line else str(file)
-  return f"{where} — {matched}" if matched else str(where)
+  matched = (signal.get("matched_line") or "").strip().replace("|", "¦")
+  if len(matched) > _EVIDENCE_MATCHED_MAX:
+    matched = matched[:_EVIDENCE_MATCHED_MAX - 1] + "…"
+  sink = nearest_sink(state)
+  scope = (state.get("anchor") or {}).get("scope")
+  if sink is None or not scope or line is None:
+    where = f"{file}:L{line}" if line else str(file)
+    return f"{where} — {matched}" if matched else str(where)
+  caps_ = ", ".join(sink["capabilities"])
+  span = f"L{scope[0]}-L{scope[1]}" if scope[0] != scope[1] else f"L{scope[0]}"
+  src = f"source@{file}:{span} (L{line}: {matched})" if matched else f"source@{file}:{span} (L{line})"
+  if sink.get("file"):
+    where = f"{sink['file']}:L{sink['line']}" if sink["line"] else str(sink["file"])
+    dst = (f"sink@{where} {sink['symbol']} [{caps_}] "
+           f"(via {sink.get('via')} called at L{sink.get('called_at')})")
+  else:
+    dst = f"sink@L{sink['line']} {sink['symbol']} [{caps_}]"
+    if not sink["in_scope"]:
+      dst += " (out of scope)"
+  return f"{src} -> {dst}"
 
 
 def _answers_log(answers: Dict[str, JevAnswer]) -> Dict[str, Any]:
@@ -157,46 +1051,255 @@ def _compose_data_safety_finding(
     answers: Dict[str, JevAnswer],
     client_name: str,
 ) -> Dict[str, Any]:
-  """Builds one ``goal_data_safety`` finding from the typed answers."""
+  """Builds one ``goal_data_safety`` finding from the typed answers, or None.
+
+  Returns None when the semantic match gate says the matched token does not
+  actually concern this data type (a coincidental lexical hit).
+
+  Decision logic (all in code; the model only supplies calibrated answers):
+
+  1. ``signal_relevant`` < ``T_RELEVANCE`` -> drop (logged as a gate drop)
+     unless an egress/IPC sink is in the anchor's scope, in which case the
+     finding is kept for manual review (:func:`relevance_verdict`, WP2).
+  2. ``transmits_offdevice`` -> three-way :func:`transfer_decision`.
+  3. LOCAL: disclosure is EXEMPT by construction (nothing leaves the device).
+     TRANSMITS: disclosure status as answered, cross-checked against the
+     battery's own ``has_prominent_disclosure`` Noul and the user-initiated
+     answer (:func:`reconcile_disclosure_status`, WP2); severity
+     CRITICAL/IMPORTANT.
+     UNCERTAIN: recall-safe — ``is_transferred`` is set True so the shared
+     report routes it to review (a False value is treated as "compliant" and
+     dropped from review), severity capped at IMPORTANT, ``needs_manual_review``
+     set, and the critic never prunes it.
+  4. Destination (WP7, :func:`compose_destination`): the ``destination_class``
+     Choice decides ``is_third_party`` (sharing classes, OR-ed with a
+     sharing-capable sink inside the anchor's own scope -- IPC counts as
+     sharing by policy direction). A *confirmed* ``user_chosen_destination``
+     or ``platform_component`` turns the finding into a data-safety inventory
+     SUGGESTION with disclosure EXEMPT (the transfer is not collection by the
+     developer); an unconfirmed one or ``unknown`` keeps the transfer-based
+     severity and routes to manual review. Below ``T_TRANSMIT_LOW`` the class
+     is traced only.
+  """
   tax = _taxonomy().get(data_type, {})
   category = tax.get("category", "Other")
+  name = tax.get("data_type", data_type)
 
-  transmits = (answers["transmits_offdevice"].noul or 0.0) >= constants.T_TRANSMIT
+  verdict, p_relevant = relevance_verdict(answers, state)
+  if verdict == RELEVANCE_DROP:
+    log.info("relevance gate dropped %s in %s (p=%.2f, token=%r, tier=%s)", data_type,
+             state["signal"]["file"], p_relevant or 0.0, state["signal"].get("matched_pattern"),
+             (state.get("anchor") or {}).get("tier"))
+    return None
+  relevance_low = relevance_is_low(verdict)
+  if relevance_low:
+    log.info("relevance low but %s; keeping %s in %s for review (p=%.2f, token=%r)",
+             "sink in scope" if verdict == RELEVANCE_LOW_WITH_SINK else "file has strong egress sink",
+             data_type, state["signal"]["file"], p_relevant or 0.0,
+             state["signal"].get("matched_pattern"))
+
+  p_transmit = answers["transmits_offdevice"].noul or 0.0
+  decision = transfer_decision(p_transmit)
+  transmits = decision in (TRANSMITS, UNCERTAIN)
   user_initiated = (answers["user_initiated"].noul or 0.0) >= constants.T_USER_INITIATED
-  is_third_party = (answers["is_third_party"].noul or 0.0) >= constants.T_THIRD_PARTY
+
+  sharing_in_scope = sharing_sinks_in_scope(state)
+  destination = compose_destination(state, answers, transmits, user_initiated, sharing_in_scope)
+  is_third_party = destination.sharing
+
   disclosure_status = answers["disclosure_status"].choice or "MISSING"
+  disclosure_note: Optional[str] = None
+  destination_note: Optional[str] = None
   # Local-only data needs no disclosure by definition, so compose EXEMPT in code
   # rather than relying on the model to infer it (it reads the question literally
   # and reports MISSING when no gate is present, even for on-device data).
-  if not transmits:
+  if decision == LOCAL:
     disclosure_status = "EXEMPT"
+  elif destination.non_collection:
+    # WP7: the user chose where the data goes (or it went to a platform
+    # component on the device) -- confirmed by an independent signal. Not
+    # collection by the developer, so no prominent-disclosure gate is owed;
+    # the transfer is still inventoried. ``reconcile_disclosure_status`` is
+    # skipped on purpose: its EXEMPT->MISSING rule ("transfer not
+    # user-initiated") is exactly what the confirmed class overrides.
+    disclosure_status = "EXEMPT"
+    destination.applied = True
+    # A user-directed hand-off to a destination the user picked (or to a
+    # platform component on the device) is not "sharing" by the developer in
+    # the Data Safety sense, even though the chooser Intent in scope is a
+    # sharing-capable sink. The static OR is overridden only here, behind the
+    # double gate; the trace keeps ``sharing_mass`` and the in-scope sinks.
+    if destination.sharing:
+      destination.sharing = False
+      is_third_party = False
+    destination_note = (f"{destination.cls} confirmed by {destination.corroboration} "
+                        f"(conf={destination.confidence:.2f}); composed as inventory, "
+                        f"not sharing")
+    log.info("destination %s for %s in %s: %s", destination.cls, data_type,
+             state["signal"]["file"], destination_note)
+  else:
+    disclosure_status, disclosure_note = reconcile_disclosure_status(
+        disclosure_status, answers, transmits, user_initiated)
+    if disclosure_note:
+      log.info("disclosure status reconciled for %s in %s: %s", data_type,
+               state["signal"]["file"], disclosure_note)
   # Severity is derived in code from the atomic booleans, not read off Jev's
-  # advisory Score (which is logged for comparison only).
-  severity = derive_data_safety_severity(data_type, transmits, disclosure_status)
+  # advisory Score (which is logged for comparison only). WP10: derived on the
+  # *confirmed* type -- a confident sibling relabel changes the type the finding
+  # is composed on; "not personal" caps at IMPORTANT and asks for review.
+  type_conf, severity = compose_type_confirmation(data_type, answers, transmits, disclosure_status, decision)
+  type_note: Optional[str] = None
+  if type_conf.action == TYPE_RELABELLED:
+    tax = _taxonomy().get(type_conf.effective_type, tax)
+    category = tax.get("category", category)
+    name = tax.get("data_type", type_conf.effective_type)
+    type_note = (f"relabelled {data_type} -> {type_conf.effective_type} (conf={type_conf.confidence:.2f})"
+                 + ("; severity lowered one step, kept for review" if type_conf.lowered else ""))
+  elif type_conf.action == TYPE_NOT_PERSONAL:
+    type_note = (f"model says the value is not personal data (conf={type_conf.confidence:.2f}); "
+                 "finding kept as labelled, severity capped at IMPORTANT, review")
+  elif type_conf.action == TYPE_UNKNOWN:
+    type_note = f"model cannot tell what the value is (conf={type_conf.confidence:.2f}); review"
+  if type_note:
+    log.info("data type for %s in %s: %s", data_type, state["signal"]["file"], type_note)
+  if destination.applied:
+    # A confirmed non-collection destination is inventory even when the
+    # transfer probability sits in the UNCERTAIN band (the band would
+    # otherwise hold it at IMPORTANT); the review flag below still applies.
+    severity = "SUGGESTION"
 
-  # A transmitted, undisclosed sensitive type is a prominent-disclosure risk;
-  # otherwise it is inventory for the Data Safety section reconciliation.
+  # A transmitted, undisclosed type is a prominent-disclosure risk; otherwise it
+  # is inventory for the Data Safety section reconciliation.
   if transmits and disclosure_status == "MISSING":
     policy_id = "prominent_disclosure_policy"
   else:
     policy_id = "data_safety_section"
 
-  if is_third_party:
+  # Unresolved destinations on a transfer: the class is a judgement, so an
+  # unconfirmed non-collection answer or ``unknown`` never lowers anything --
+  # it adds a review flag and a note (charter: review, do not suppress).
+  destination_review = bool(
+      constants.DESTINATION_CLASS_ENABLED and transmits and not destination.applied
+      and (destination.cls == DESTINATION_UNKNOWN
+           or destination.cls in constants.NON_COLLECTION_DESTINATION_CLASSES
+           or destination.sharing_unconfirmed))
+
+  # WP8: default-on raises an undisclosed transfer to CRITICAL; a confirmed
+  # opt-in (double gate) lowers it to a review SUGGESTION. Never for a
+  # destination that was already composed as inventory, and no raise while
+  # the destination itself is still under review.
+  consent, severity = compose_consent(
+      state, answers, transmits and not destination.applied, disclosure_status, severity, decision,
+      destination_resolved=not destination_review, type_disputed=type_conf.disputed)
+  consent_note: Optional[str] = None
+  if consent.action == "raise":
+    consent_note = (f"enabled by default (p={consent.p_default_on:.2f}, {consent.corroboration}); "
+                    "undisclosed transfer raised to CRITICAL")
+  elif consent.action == "lower":
+    consent_note = (f"opt-in (p={consent.p_default_on:.2f}, guard keeps the transfer off by default); "
+                    "lowered to SUGGESTION, verify the toggle text meets the disclosure requirement")
+  elif consent.corroboration == "vetoed_by_guard":
+    consent_note = (f"model says default-on (p={consent.p_default_on:.2f}) but a guard keeps the "
+                    "transfer off by default; severity unchanged, kept for review")
+  elif consent.capped_by == "uncertain_band":
+    consent_note = (f"enabled by default (p={consent.p_default_on:.2f}, {consent.corroboration}) but the "
+                    "transfer is UNCERTAIN; severity stays capped at IMPORTANT")
+  elif consent.capped_by == "unresolved_destination":
+    consent_note = (f"enabled by default (p={consent.p_default_on:.2f}, {consent.corroboration}) but the "
+                    f"destination ({destination.cls}) is unresolved; severity unchanged")
+  elif consent.capped_by == "disputed_type":
+    consent_note = (f"enabled by default (p={consent.p_default_on:.2f}, {consent.corroboration}) but the "
+                    "data type is disputed; severity unchanged")
+  if consent_note:
+    log.info("consent for %s in %s: %s", data_type, state["signal"]["file"], consent_note)
+
+  if destination_review and destination.sharing_unconfirmed:
+    destination_note = (f"{destination.cls} argmax but sharing mass "
+                        f"{destination.sharing_mass:.2f} < T_SHARING_MASS and no sharing sink in "
+                        f"scope; is_third_party not set, kept for review")
+  elif destination_review:
+    destination_note = (f"{destination.cls} not applied ({destination.corroboration}, "
+                        f"conf={destination.confidence:.2f}); kept for review")
+    log.info("destination %s for %s in %s: %s", destination.cls, data_type,
+             state["signal"]["file"], destination_note)
+
+  if destination.applied and destination.cls == "user_chosen_destination":
+    purpose = "User-chosen destination (user-directed transfer; not collection by the developer)"
+  elif destination.applied and destination.cls == "platform_component":
+    purpose = "Platform component on the same device"
+  elif decision == UNCERTAIN:
+    purpose = "Possible transfer (uncertain; manual review)"
+  elif destination.cls == "other_app_ipc" and is_third_party and constants.DESTINATION_CLASS_ENABLED:
+    purpose = "Shared with another app (IPC)"
+  elif is_third_party:
     purpose = "Analytics or third-party sharing"
+  elif transmits and destination.cls == DESTINATION_UNKNOWN and constants.DESTINATION_CLASS_ENABLED:
+    purpose = "Transfer to an unresolved destination (manual review)"
   elif transmits:
     purpose = "App functionality"
   else:
     purpose = "Local functionality only"
 
-  return {
-      "psl_constant": data_type,
+  summary = templates.issue_summary(policy_id, name, disclosure_status, transmits)
+  if decision == UNCERTAIN:
+    summary = f"{summary} [transfer uncertain: p={p_transmit:.2f}; verify]"
+  if destination.applied:
+    summary = f"{summary} [destination: {destination.cls.replace('_', ' ')}]"
+  elif destination_review and destination.sharing_unconfirmed:
+    summary = (f"{summary} [sharing unconfirmed: {destination.cls.replace('_', ' ')} "
+               f"mass={destination.sharing_mass:.2f}; verify]")
+  elif destination_review:
+    summary = (f"{summary} [destination {destination.cls.replace('_', ' ')} unconfirmed: "
+               f"conf={destination.confidence:.2f}; verify]")
+  if consent.action == "raise":
+    summary = f"{summary} [enabled by default]"
+  elif consent.action == "lower":
+    first = consent.first_off_guard or {}
+    summary = f"{summary} [opt-in: {first.get('flag', 'guard')} off by default; verify toggle text]"
+  elif consent.corroboration == "vetoed_by_guard":
+    summary = f"{summary} [consent default unclear: model default-on vs guard default-off; verify]"
+  if relevance_low:
+    summary = f"{summary} [data-type match uncertain: p={p_relevant or 0.0:.2f}; verify]"
+    if severity == "CRITICAL":
+      severity = "IMPORTANT"
+  if type_conf.action == TYPE_RELABELLED:
+    summary = (f"{summary} [type: {data_type} -> {type_conf.effective_type} "
+               f"conf={type_conf.confidence:.2f}{'; verify' if type_conf.lowered else ''}]")
+  elif type_conf.action == TYPE_NOT_PERSONAL:
+    summary = f"{summary} [type disputed: not personal data per model conf={type_conf.confidence:.2f}; verify]"
+  elif type_conf.action == TYPE_UNKNOWN:
+    summary = f"{summary} [type unclear conf={type_conf.confidence:.2f}; verify]"
+
+  sinks = state.get("sinks") or []
+  # The critic's claim names the callee-reached sinks too (``Callee.Sink``),
+  # so it can check the hop rather than rediscover it (WP6).
+  callee_sink_names = [f"{c.get('symbol')}.{s.get('symbol')}"
+                       for c in state.get("callees") or [] for s in c.get("sinks") or []]
+  sink_names = ", ".join([s["symbol"] for s in sinks[:5]] + callee_sink_names[:3]) or "no labelled sink in file"
+  effective_type = type_conf.effective_type
+  claim = (
+      f"{name} ({effective_type}) is sent off-device or shared with another app "
+      f"in {state['signal']['file']} (sinks: {sink_names})."
+  )
+
+  log.debug("compose %s in %s: p_transmit=%.2f decision=%s severity=%s third_party=%s destination=%s type=%s",
+            data_type, state["signal"]["file"], p_transmit, decision, severity, is_third_party,
+            destination.cls, type_conf.action)
+
+  finding = {
+      "psl_constant": effective_type,
+      # WP10: the scanner's label and the model's answer, for the calibration
+      # confusion table and for a reviewer of a relabelled finding.
+      "scanner_data_type": data_type,
+      "data_type_confirmed": type_conf.answer if type_conf.read else None,
+      "confirmed_type": (constants.NOT_PERSONAL if type_conf.action == TYPE_NOT_PERSONAL
+                         else effective_type),
       "policy_id": policy_id,
-      "issue_summary": templates.issue_summary(
-          policy_id, tax.get("data_type", data_type), disclosure_status, transmits
-      ),
+      "issue_summary": summary,
       "severity": severity,
-      "files_involved": [state["signal"]["file"]],
+      "files_involved": files_involved(state),
       "evidence": _evidence_line(state),
+      "evidence_flow": evidence_flow(state),
       "evidence_snippet": state.get("code_snippet", ""),
       "recommendation": templates.recommendation(policy_id, severity),
       "is_transferred": transmits,
@@ -205,10 +1308,65 @@ def _compose_data_safety_finding(
       "prominent_disclosure_status": disclosure_status,
       "purpose": purpose,
       "linked_to_user": category in _LINKED_CATEGORIES,
-      # Provenance for reproducibility; downstream ignores unknown keys.
+      # Fields the critic and the trace consume; downstream ignores unknown keys.
+      "transfer_decision": decision,
+      "destination_class": destination.cls,
+      "consent_default_on": consent.default_on,
+      "claim": claim,
+      "claim_kind": "transfer",
+      "sinks": [{"symbol": s["symbol"], "capabilities": s["capabilities"]} for s in sinks],
       "client": client_name,
       "typesafe_answers": _answers_log(answers),
+      "decision_trace": _decision_trace(
+          state, answers, decision,
+          {"sharing_sinks_in_scope": sharing_in_scope, "p_relevant": p_relevant,
+           "relevance": relevance_trace(verdict),
+           "disclosure_reconciled": disclosure_note,
+           "destination": destination.to_trace(),
+           "destination_note": destination_note,
+           "consent": consent.to_trace(),
+           "consent_note": consent_note,
+           "type_confirmation": type_conf.to_trace(),
+           "type_note": type_note},
+      ),
   }
+  if consent.guards:
+    finding["evidence"] = _with_guard_evidence(finding["evidence"], consent)
+    finding["evidence_flow"]["guards"] = [
+        {"flag": g.get("flag"), "line": g.get("line"), "runs_when": g.get("runs_when"),
+         "default_on": g.get("default_on"), "runs_by_default": g.get("runs_by_default"),
+         "declaration": g.get("declaration")} for g in consent.guards]
+  if (decision == UNCERTAIN or relevance_low or disclosure_note or destination_review
+      or consent.action == "lower" or consent.corroboration == "vetoed_by_guard"
+      or type_conf.review):
+    finding["needs_manual_review"] = True
+  return finding
+
+
+def _with_guard_evidence(evidence: str, consent: Consent) -> str:
+  """Appends the guarding flag and its declared default to the evidence line (WP8).
+
+  ``... [guard <flag> default=<true|false|unknown> @<file>:L<n>]`` for the
+  guard that decides the composition -- the first one that keeps the transfer
+  off by default, else the first with a located declaration -- or ``[guard
+  <flag> default=unknown]`` when none was located. When the declared default
+  is not a literal the initialiser is quoted (``default=unknown
+  init="withDefault(isPlayStoreFlavour())"``) so a reviewer sees what the
+  default depends on; when the flag's sense is inverted the suffix says so
+  (``runs when false``).
+  """
+  g = consent.first_off_guard or consent.first_declared or (consent.guards[0] if consent.guards else None)
+  if not g:
+    return evidence
+  default = g.get("default_on")
+  default_txt = "unknown" if default is None else str(default).lower()
+  decl = g.get("declaration") or {}
+  if default is None and decl.get("initialiser"):
+    init = str(decl["initialiser"]).replace('"', "'")
+    default_txt += f' init="{init[:60]}{"…" if len(init) > 60 else ""}"'
+  sense = " runs when false" if g.get("runs_when") == "false" else ""
+  where = f" @{decl['file']}:L{decl['line']}" if decl.get("file") else ""
+  return f"{evidence} [guard {g.get('flag')} default={default_txt}{sense}{where}]".replace("|", "¦")
 
 
 def _compose_permission_finding(
@@ -218,12 +1376,32 @@ def _compose_permission_finding(
     answers: Dict[str, JevAnswer],
     client_name: str,
 ) -> Optional[Dict[str, Any]]:
-  """Builds one ``goal_permissions_and_apis`` finding, or None if compliant/core."""
+  """Builds one ``goal_permissions_and_apis`` finding, or None if compliant/core.
+
+  The relevance gate runs first: a permission-hygiene finding on a snippet that
+  does not actually touch the restricted data (``record`` matching a DNS record
+  type, an ``audio/*`` MIME filter) is dropped before severity is composed.
+  A transfer in the UNCERTAIN band is treated as "may transmit" for the
+  high-risk escalation, but the finding is marked for manual review.
+  """
+  verdict, p_relevant = relevance_verdict(answers, state)
+  if verdict == RELEVANCE_DROP:
+    log.info("relevance gate dropped %s (%s) in %s (p=%.2f, tier=%s)", data_type, policy_id,
+             state["signal"]["file"], p_relevant or 0.0, (state.get("anchor") or {}).get("tier"))
+    return None
+  relevance_low = relevance_is_low(verdict)
+  if relevance_low:
+    log.info("relevance low but %s; keeping %s (%s) in %s for review (p=%.2f)",
+             "sink in scope" if verdict == RELEVANCE_LOW_WITH_SINK else "file has strong egress sink",
+             data_type, policy_id, state["signal"]["file"], p_relevant or 0.0)
+
   is_core = (answers["is_core_functionality"].noul or 0.0) >= constants.T_CORE_FUNCTION
   has_disclosure = (
       answers["has_prominent_disclosure"].noul or 0.0
   ) >= constants.T_DISCLOSURE
-  transmits = (answers["transmits_offdevice"].noul or 0.0) >= constants.T_TRANSMIT
+  p_transmit = answers["transmits_offdevice"].noul or 0.0
+  decision = transfer_decision(p_transmit)
+  transmits = decision == TRANSMITS
 
   # Severity derived in code; None means compliant (emit nothing).
   severity = derive_permission_severity(
@@ -231,18 +1409,283 @@ def _compose_permission_finding(
   )
   if severity is None:
     return None
+  summary = templates.issue_summary(policy_id, data_type)
+  if relevance_low:
+    summary = f"{summary} [data-type match uncertain: p={p_relevant or 0.0:.2f}; verify]"
+    if severity == "CRITICAL":
+      severity = "IMPORTANT"
 
-  return {
+  finding = {
       "policy_id": policy_id,
-      "issue_summary": templates.issue_summary(policy_id, data_type),
+      "issue_summary": summary,
       "severity": severity,
-      "files_involved": [state["signal"]["file"]],
+      "files_involved": files_involved(state),
       "evidence": _evidence_line(state),
+      "evidence_flow": evidence_flow(state),
       "evidence_snippet": state.get("code_snippet", ""),
       "recommendation": templates.recommendation(policy_id, severity),
+      "claim_kind": "generic",
+      "sinks": [
+          {"symbol": s["symbol"], "capabilities": s["capabilities"]}
+          for s in (state.get("sinks") or [])
+      ],
       "client": client_name,
       "typesafe_answers": _answers_log(answers),
+      "decision_trace": _decision_trace(
+          state, answers, decision,
+          {"is_core": is_core, "has_disclosure": has_disclosure, "p_relevant": p_relevant,
+           "relevance": relevance_trace(verdict)},
+      ),
   }
+  if (decision == UNCERTAIN and severity != "SUGGESTION") or relevance_low:
+    finding["needs_manual_review"] = True
+  return finding
+
+
+# ---------------------------------------------------------------------------
+# WP9: wave-2 storage code findings
+# ---------------------------------------------------------------------------
+
+MEDIA_FULL_LIBRARY = "full_library"
+MEDIA_USER_SELECTED = "user_selected"
+MEDIA_UNCERTAIN = "uncertain"
+
+
+def media_access_mode(p_full: Optional[float]) -> str:
+  """Three-way reading of the ``accesses_full_media_library`` Noul (WP9).
+
+  ``p >= T_FULL_MEDIA_LIBRARY`` -> :data:`MEDIA_FULL_LIBRARY`;
+  ``p <= 1 - T_FULL_MEDIA_LIBRARY`` -> :data:`MEDIA_USER_SELECTED`; the band
+  between (and a missing answer) -> :data:`MEDIA_UNCERTAIN`, which is always
+  review-marked. The band is symmetric so neither direction is favoured.
+  """
+  if p_full is None:
+    return MEDIA_UNCERTAIN
+  if p_full >= constants.T_FULL_MEDIA_LIBRARY:
+    return MEDIA_FULL_LIBRARY
+  if p_full <= 1.0 - constants.T_FULL_MEDIA_LIBRARY:
+    return MEDIA_USER_SELECTED
+  return MEDIA_UNCERTAIN
+
+
+def _media_hint_kinds(state: Dict[str, Any]) -> List[str]:
+  anchor_kinds = (state.get("anchor") or {}).get("media_hints") or []
+  if anchor_kinds:
+    return sorted(set(anchor_kinds))
+  return sorted({h.get("hint") for h in state.get("media_access_hints") or [] if h.get("hint")})
+
+
+def _purpose_status(app_purpose: Optional[Dict[str, Any]], allowed: Iterable[str]) -> Tuple[bool, bool, str]:
+  """``(justified, established, label)`` for a purpose-conditioned code finding.
+
+  ``justified`` is :func:`purpose_in`; ``established`` is whether the purpose
+  is known at all at acting confidence (an unknown purpose can only raise a
+  severity and always sends the finding to review); ``label`` is the trace /
+  evidence text (``file_manager (p=0.92, model)`` / ``not established``).
+  """
+  ap = app_purpose or {}
+  purpose = ap.get("purpose") or "unknown"
+  established = purpose != "unknown" and purpose_in(ap, {purpose})
+  conf = float(ap.get("confidence") or 0.0)
+  src = ap.get("source") or "unavailable"
+  label = "not established" if not ap or purpose == "unknown" else (
+      f"{purpose} (p={conf:.2f}, {src}{'' if established else ', below CONF_APP_PURPOSE'})")
+  return purpose_in(ap, allowed), established, label
+
+
+def compose_photo_video_finding(
+    data_type: str,
+    state: Dict[str, Any],
+    answers: Dict[str, JevAnswer],
+    client_name: str,
+    app_purpose: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+  """One ``photo_video_access_policy`` code finding, or None (WP9).
+
+  The manifest rule already decides the app-level verdict; this per-site
+  finding says *how* the code reaches media so the reviewer can tell a
+  library scan from a one-item pick:
+
+  * Relevance gate first (shared with every code-signal policy).
+  * ``mode`` from :func:`media_access_mode`; ``media_access_hints`` in the
+    state corroborate (``LIBRARY_QUERY`` with full_library, ``USER_PICK`` with
+    user_selected) or contradict it. A contradiction never flips the mode; it
+    review-marks the finding and is traced.
+  * Purpose in ``PHOTO_VIDEO_PURPOSES`` (gallery / editor, backup, file
+    manager): a user-selected site is compliant (None; a gallery may also
+    pick one item); a full-library site is the SUGGESTION declaration
+    reminder; uncertain -> SUGGESTION + review.
+  * Any other purpose: IMPORTANT for every mode — a full-library scan in a
+    non-media app is the matrix's "not a dedicated media manager" row and a
+    user-selected site is exactly its Photo Picker heuristic. Review-marked
+    when the purpose is not established or the mode is uncertain.
+  The severity is never raised above IMPORTANT (the matrix has no Critical row).
+  """
+  verdict, p_relevant = relevance_verdict(answers, state)
+  file = state["signal"]["file"]
+  if verdict == RELEVANCE_DROP:
+    log.info("photo_video: relevance gate dropped %s in %s (p=%.2f)", data_type, file, p_relevant or 0.0)
+    return None
+  relevance_low = relevance_is_low(verdict)
+  answer = answers.get("accesses_full_media_library")
+  p_full = answer.noul if answer is not None else None
+  mode = media_access_mode(p_full)
+  hints = _media_hint_kinds(state)
+  corroborated = ((mode == MEDIA_FULL_LIBRARY and "LIBRARY_QUERY" in hints)
+                  or (mode == MEDIA_USER_SELECTED and "USER_PICK" in hints))
+  contradicted = ((mode == MEDIA_FULL_LIBRARY and hints == ["USER_PICK"])
+                  or (mode == MEDIA_USER_SELECTED and hints == ["LIBRARY_QUERY"]))
+  justified, established, purpose_label = _purpose_status(app_purpose, constants.PHOTO_VIDEO_PURPOSES)
+  trace_extra = {
+      "media_access": {"p_full_library": round(p_full, 4) if p_full is not None else None,
+                       "mode": mode, "hints": hints, "corroborated": corroborated,
+                       "contradicted": contradicted, "T_FULL_MEDIA_LIBRARY": constants.T_FULL_MEDIA_LIBRARY},
+      "app_purpose": purpose_label, "justified_by_purpose": justified,
+      "allowed_purposes": sorted(constants.PHOTO_VIDEO_PURPOSES),
+      "p_relevant": p_relevant, "relevance": relevance_trace(verdict),
+  }
+  if justified and mode == MEDIA_USER_SELECTED and not contradicted:
+    log.info("photo_video: %s in %s handles user-selected media and the purpose (%s) qualifies; "
+             "no finding", data_type, file, purpose_label)
+    return None
+  severity = "SUGGESTION" if justified else "IMPORTANT"
+  needs_review = (mode == MEDIA_UNCERTAIN or contradicted or relevance_low
+                  or (not justified and not established))
+  summary = templates.media_access_summary(data_type, mode, justified)
+  if contradicted:
+    summary += f" [deterministic hint {hints[0]} disagrees; verify]"
+  if relevance_low:
+    summary += f" [data-type match uncertain: p={p_relevant or 0.0:.2f}; verify]"
+  evidence = _evidence_line(state)
+  if hints:
+    evidence += f" [media hints: {', '.join(hints)}]"
+  log.info("photo_video: %s in %s mode=%s (p=%.2f, hints=%s, corroborated=%s, contradicted=%s) purpose=%s "
+           "-> %s%s", data_type, file, mode, p_full or 0.0, hints, corroborated, contradicted, purpose_label,
+           severity, " [review]" if needs_review else "")
+  finding = {
+      "policy_id": "photo_video_access_policy",
+      "issue_summary": summary,
+      "severity": severity,
+      "files_involved": files_involved(state),
+      "evidence": evidence,
+      "evidence_flow": {**evidence_flow(state), "media_access_mode": mode, "media_hints": hints},
+      "evidence_snippet": state.get("code_snippet", ""),
+      "recommendation": templates.recommendation("photo_video_access_policy", severity),
+      "claim_kind": "generic",
+      "psl_constant": data_type,
+      "media_access_mode": mode,
+      "sinks": [{"symbol": s["symbol"], "capabilities": s["capabilities"]} for s in (state.get("sinks") or [])],
+      "client": client_name,
+      "typesafe_answers": _answers_log(answers),
+      "decision_trace": _decision_trace(state, answers, None, trace_extra),
+  }
+  if needs_review:
+    finding["needs_manual_review"] = True
+  return finding
+
+
+ROOT_FOLDER_CONFIRMED = "confirmed"
+ROOT_FOLDER_UNCERTAIN = "uncertain"
+ROOT_FOLDER_DENIED = "denied"
+
+
+def root_folder_mode(p_root: Optional[float]) -> str:
+  """Three-way reading of the ``creates_root_level_external_folder`` Noul (WP9)."""
+  if p_root is None:
+    return ROOT_FOLDER_UNCERTAIN
+  if p_root >= constants.T_ROOT_LEVEL_FOLDER:
+    return ROOT_FOLDER_CONFIRMED
+  if p_root <= 1.0 - constants.T_ROOT_LEVEL_FOLDER:
+    return ROOT_FOLDER_DENIED
+  return ROOT_FOLDER_UNCERTAIN
+
+
+def compose_files_and_docs_finding(
+    data_type: str,
+    state: Dict[str, Any],
+    answers: Dict[str, JevAnswer],
+    client_name: str,
+    app_purpose: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+  """One ``files_and_docs_policy`` code finding, or None (WP9).
+
+  Activation is deterministic: ``state["external_storage_paths"]`` (the
+  file's paths composed from the shared-storage root, strongest first) must
+  be non-empty, otherwise nothing was asked and nothing composes. Then:
+
+  * ``mode`` from :func:`root_folder_mode`.
+  * ``confirmed`` -> IMPORTANT (the matrix's manual-file-sync heuristic),
+    or SUGGESTION when the established purpose is in
+    ``ALL_FILES_ACCESS_PURPOSES`` (a file manager or backup tool operates on
+    the shared tree by design; the scoped alternative is still suggested).
+    Review-marked when the purpose is not established.
+  * ``uncertain`` -> SUGGESTION + review.
+  * ``denied`` -> None only when no hint has ``strength == "writes"``
+    (double gate: the model says no *and* the structure layer saw no write
+    on a root-composed path); with such a write the finding stays as a
+    review-marked SUGGESTION that says the model disagrees.
+  The evidence points at the strongest hint line (``<file>:L<n> — <root
+  line> … <write line>``) rather than the scanner anchor, because the anchor
+  (a MIME literal, a permission string) is rarely where the folder is made.
+  """
+  file = state["signal"]["file"]
+  hints = state.get("external_storage_paths") or []
+  if not hints:
+    log.info("files_and_docs: no external storage path hint in %s; nothing to compose", file)
+    return None
+  answer = answers.get("creates_root_level_external_folder")
+  p_root = answer.noul if answer is not None else None
+  mode = root_folder_mode(p_root)
+  strongest = hints[0]
+  has_write = any(h.get("writes") for h in hints)
+  justified, established, purpose_label = _purpose_status(app_purpose, constants.ALL_FILES_ACCESS_PURPOSES)
+  trace_extra = {
+      "root_folder": {"p_root_level": round(p_root, 4) if p_root is not None else None, "mode": mode,
+                      "hints": [{"hint": h.get("hint"), "line": h.get("line"), "strength": h.get("strength")}
+                                for h in hints],
+                      "deterministic_write": has_write, "T_ROOT_LEVEL_FOLDER": constants.T_ROOT_LEVEL_FOLDER},
+      "app_purpose": purpose_label, "justified_by_purpose": justified,
+      "allowed_purposes": sorted(constants.ALL_FILES_ACCESS_PURPOSES),
+  }
+  if mode == ROOT_FOLDER_DENIED and not has_write:
+    log.info("files_and_docs: model denies a root-level folder in %s (p=%.2f) and no deterministic write "
+             "exists; no finding", file, p_root or 0.0)
+    return None
+  if mode == ROOT_FOLDER_CONFIRMED:
+    severity = "SUGGESTION" if justified else "IMPORTANT"
+    needs_review = not justified and not established
+  else:
+    severity = "SUGGESTION"
+    needs_review = True
+  summary = templates.root_folder_summary(mode, justified)
+  root_line = strongest.get("line")
+  evidence = f"{file}:L{root_line} — {str(strongest.get('evidence') or '').replace('|', '¦')}"
+  evidence += f" [{strongest.get('hint')}, {strongest.get('strength')}]"
+  log.info("files_and_docs: %s mode=%s (p=%.2f, strongest=%s@L%s, write=%s) purpose=%s -> %s%s",
+           file, mode, p_root or 0.0, strongest.get("hint"), root_line, has_write, purpose_label, severity,
+           " [review]" if needs_review else "")
+  finding = {
+      "policy_id": "files_and_docs_policy",
+      "issue_summary": summary,
+      "severity": severity,
+      "files_involved": [file],
+      "evidence": evidence,
+      "evidence_flow": {**evidence_flow(state), "storage_hint": dict(strongest), "root_folder_mode": mode},
+      "evidence_snippet": state.get("code_snippet", ""),
+      "recommendation": templates.recommendation("files_and_docs_policy", severity),
+      "claim_kind": "generic",
+      "root_folder_mode": mode,
+      "sinks": [{"symbol": s["symbol"], "capabilities": s["capabilities"]} for s in (state.get("sinks") or [])],
+      "client": client_name,
+      "typesafe_answers": _answers_log(answers),
+      "decision_trace": _decision_trace(state, answers, None, trace_extra),
+      # The scanner data type that brought the file in; the hint, not the
+      # anchor, is what the finding rests on.
+      "psl_constant": data_type,
+  }
+  if needs_review:
+    finding["needs_manual_review"] = True
+  return finding
 
 
 def _iter_findings(base_context: dict):
@@ -353,12 +1796,19 @@ def run(
   return engine.run(temp_dir, client, model=model, batched=False)
 
 
-def _critic_decision(supports: float) -> Dict[str, str]:
-  """Turns the evidence-supports-claim probability into a routed verdict.
+def _critic_decision(supports: float, uncertain: bool = False) -> Dict[str, str]:
+  """Turns the evidence probability into a routed verdict.
 
   Recall-weighted: only strong evidence of a false positive prunes; a middling
-  probability goes to a human rather than being dropped.
+  probability goes to a human rather than being dropped. A finding whose
+  transfer decision was UNCERTAIN is *never* pruned: strong evidence upgrades it
+  to VERIFIED (the critic saw the flow the battery was unsure about), anything
+  else stays MANUAL_REVIEW.
   """
+  if uncertain:
+    if supports >= constants.CONF_ACT:
+      return {"action": "VERIFIED", "confidence": "Medium"}
+    return {"action": "MANUAL_REVIEW", "confidence": "Low"}
   if supports >= constants.CONF_ACT:
     return {"action": "VERIFIED", "confidence": "High"}
   if supports >= constants.T_EVIDENCE_SUPPORTS:
@@ -373,22 +1823,46 @@ def evaluate_critic_chunk(
     client: JevClient,
     model: Optional[str] = None,
 ) -> Dict[str, dict]:
-  """One cheap Noul per high-severity finding; routes it in code. Robust per finding."""
+  """One cheap Noul per high-severity finding; routes it in code. Robust per finding.
+
+  The critic sees the same enriched evidence the battery saw (enclosing scope
+  plus capability-labelled sink lines), the atomic ``claim`` the finding rests
+  on, and the sink list. For transfer claims it verifies only the transfer, not
+  the disclosure. Findings that bypassed the model (``client`` == error) or that
+  already carry ``needs_manual_review`` are routed without a call.
+  """
   decisions: Dict[str, dict] = {}
   for fid, finding in chunk.items():
+    uncertain = finding.get("transfer_decision") == UNCERTAIN
+    if finding.get("client") == "error":
+      decisions[fid] = {
+          "action": "MANUAL_REVIEW", "confidence": "Low",
+          "critic_justification": "evaluation error upstream; routed to review",
+      }
+      continue
+
+    claim_kind = finding.get("claim_kind") or "generic"
     state = {
         "finding": {
             "issue_summary": finding.get("issue_summary", ""),
+            "claim": finding.get("claim") or finding.get("issue_summary", ""),
             "evidence_snippet": finding.get("evidence_snippet")
             or finding.get("evidence", ""),
+            "sinks": finding.get("sinks") or [],
             "policy_id": finding.get("policy_id", ""),
+            "transfer_decision": finding.get("transfer_decision"),
         }
     }
+    battery = q.critic_battery(claim_kind)
+    qid = next(iter(battery))
     try:
-      answers = client.system_one(state, q.critic_battery(), model=model)
-      supports = answers["evidence_supports_claim"].noul or 0.0
-      decision = _critic_decision(supports)
-      decision["critic_justification"] = f"evidence_supports_claim={supports:.2f}"
+      answers = client.system_one(state, battery, model=model)
+      supports = answers[qid].noul or 0.0
+      decision = _critic_decision(supports, uncertain=uncertain)
+      decision["critic_justification"] = (
+          f"{qid}={supports:.2f}" + ("; transfer band UNCERTAIN" if uncertain else "")
+      )
+      log.debug("critic %s: %s=%.2f -> %s", fid, qid, supports, decision["action"])
     except Exception as exc:  # pylint: disable=broad-exception-caught
       # Never drop a high-severity finding because the critic call failed.
       decision = {

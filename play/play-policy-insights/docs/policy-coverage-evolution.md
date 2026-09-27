@@ -1,7 +1,7 @@
 # Policy Coverage Evolution & Model Selection
 
 Status: Draft / plan
-Last updated: 2026-09-26
+Last updated: 2026-09-27
 
 How we grow the Jev hybrid evaluator from the current prototype to **parity with
 the existing skill's coverage** — every policy domain the `goal_*.md` matrices
@@ -11,6 +11,15 @@ regressing the quality dimensions in the [evaluation charter](evaluation-charter
 Read the [architecture doc](typesafe-hybrid-architecture.md) first for how the
 hybrid pipeline works; this doc is about scaling it across all policies and
 choosing the right model.
+
+> **2026-09-27 update.** The detailed, evidence-backed plan for the remaining
+> policies — including per-policy deterministic rules, atomic questions,
+> severity composition, rollout waves and the shared manifest/`AppProfile`
+> infrastructure they need — now lives in
+> [legacy-skill-lessons-and-coverage-plan.md](legacy-skill-lessons-and-coverage-plan.md).
+> It was derived from mining the full legacy-skill runs on the two development
+> apps. This document keeps the porting recipe (§3), model selection (§4) and
+> parity methodology (§5); §2 and §6 below are summarised there in more detail.
 
 ## 1. What "parity" means
 
@@ -37,17 +46,17 @@ Source of truth: `policies.json` + `goal_permissions_and_apis.md` /
 | Permissions | `location_access_policy` | permissions | **Prototyped** | core + disclosure + transmit |
 | Permissions | `contacts_access_policy` | permissions | **Prototyped** | core + picker-alternative |
 | Permissions | `audio_recording_policy` | permissions | **Prototyped** | core + mic-button alternative |
-| User Data | `account_deletion` | user_account | **Prototyped (code)** | deterministic presence check; no model needed |
-| Permissions | `photo_video_access_policy` | permissions | Planned | Photo Picker migration; SDK-version aware (code) |
-| Permissions | `all_files_access_policy` | permissions | Planned | MANAGE_EXTERNAL_STORAGE justification |
-| Permissions | `files_and_docs_policy` | permissions | Planned | Scoped storage / SAF |
-| Permissions | `sms_call_log_policy` | permissions | Planned | default-handler check; OTP retriever alternative |
-| Permissions | `package_visibility_policy` | permissions | Planned | QUERY_ALL_PACKAGES justification |
-| Permissions | `accessibility_api_policy` | permissions | Planned | tool vs misuse; disclosure gate |
-| Permissions | `exact_alarm_policy` | permissions | Planned | alarm/calendar core vs sync misuse |
-| Privacy/Abuse | `foreground_services_policy` | permissions | Planned | FGS type present (mostly manifest → code) |
-| Play Console | `login_credentials` | user_account | Planned | demo-credential presence for review |
-| Privacy/Abuse | `target_api_level` | (Phase 1) | **Code-only** | numeric SDK check stays in code |
+| User Data | `account_deletion` | user_account | **Prototyped (code)** | deterministic presence check + model gate; "server-side identity without delete endpoint" heuristic planned (wave 3) |
+| Permissions | `photo_video_access_policy` | permissions | Planned (wave 2) | Photo Picker migration; SDK-version aware (code) |
+| Permissions | `all_files_access_policy` | permissions | **Shipped (manifest, WP5)** | `MANAGE_EXTERNAL_STORAGE`: Suggestion when the cached `declared_core_purpose` is a file manager / backup-antivirus, otherwise Critical (review-marked when the purpose is not established); redundant media permissions → Important |
+| Permissions | `files_and_docs_policy` | permissions | Planned (wave 2) | Scoped storage / SAF; `maxSdkVersion` caps |
+| Permissions | `sms_call_log_policy` | permissions | Planned (wave 4) | default-handler check; OTP retriever alternative; needs external fixtures |
+| Permissions | `package_visibility_policy` | permissions | **Shipped (manifest, WP5)** | `QUERY_ALL_PACKAGES`: Suggestion for qualifying purposes, Important otherwise or when `<queries>` is also declared |
+| Permissions | `accessibility_api_policy` | permissions | Planned (wave 4) | tool vs misuse; disclosure gate; needs external fixtures |
+| Permissions | `exact_alarm_policy` | permissions | **Shipped (manifest, WP5)** | `USE_EXACT_ALARM` outside alarm/timer/calendar → Important; `SCHEDULE_EXACT_ALARM` → Suggestion |
+| Privacy/Abuse | `foreground_services_policy` | permissions | **Shipped (manifest, WP5)** | over the `AppProfile`: typeless service that calls `startForeground` on API 34+ → Critical; `specialUse` without its `<property>` → Critical; missing per-type permission → Important; type/purpose misalignment → Important; inventory Suggestion; stray `FOREGROUND_SERVICE_SPECIAL_USE` → Suggestion. Notification-integrity Noul still planned |
+| Play Console | `login_credentials` | user_account | Planned (wave 3) | login-gate type Choice; demo-credential reminder |
+| Privacy/Abuse | `target_api_level` | permissions | **Shipped (manifest, WP5)** | lowest shipped `targetSdk` vs `constants.PLAY_REQUIRED_TARGET_SDK` (dated provenance): below the existing-app floor → Critical, one behind → Important, unknown → review |
 
 Numeric/threshold checks (target SDK, counts) stay in code per the charter — Jev
 is not asked to do arithmetic.
@@ -141,6 +150,10 @@ the domain genuinely needs reasoning).
 - **Phase D:** stand up the gold corpus + parity harness; switch defaults per
   domain on non-regression; run the Jev tool as a CI pre-submission gate with the
   legacy skill as fallback.
+
+Phases B and C are now sequenced as five rollout waves (deterministic
+manifest policies first, external-fixture-dependent policies last) in
+[legacy-skill-lessons-and-coverage-plan.md §5.4](legacy-skill-lessons-and-coverage-plan.md).
 
 ## 7. Open questions / risks
 
