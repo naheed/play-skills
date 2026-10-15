@@ -1161,4 +1161,29 @@ touching the rest of the cascade.
 - [x] **M3 gate** (passed; 47/48 join and one unlabelled-destination LOCAL recorded)
 - [x] WP12 wave 4 (review-only; fixture apps still required before clearing review-only)
 - [x] WP13 wave 5 refinements
-- [ ] **M4 gate**
+- [x] **M4 gate** (wave 4 review-only and wave 5 location rows hold; one labelled anchor moved in upstream source, recorded below)
+
+### M4 gate — result (rules hold; one labelled anchor moved upstream)
+
+- Wave 4 fires on the synthetic fixtures and every finding is review-only.
+  Neither dev app ships an SMS permission, a call-log permission, or an
+  accessibility service, so both live runs emit zero wave-4 findings.
+- Wave 5 on the live App A run: background location is Important, the
+  required disclosure phrase is absent so the wording row is a Suggestion,
+  and fine location on target 37 is a location-button Suggestion. The
+  Contact Picker row and the continuous-audio Noul are covered by selftest
+  (the dev apps do not exercise them).
+- The per-policy coverage table in `policy-coverage-evolution.md` is updated.
+- Selftest: 612 checks.
+- **Exception — one labelled positive no longer has an anchor.**
+  `RpnProxyUpdateWorker.kt` / `DEVICE_ID` was a true transfer when the label
+  was written, because that file called `getDeviceId`. The current upstream
+  tree passes `deviceId` into `registerDevice` and no longer calls
+  `getDeviceId`, which is the scanner's pattern, so there is no candidate to
+  ask about. The same transmission is still reported as `DEVICE_ID` on
+  `RpnProxyManager.kt` and `ServerOrderHistoryRepository.kt`. The label was
+  not edited to fit the new tree. `calibrate --rejoin` therefore exits 2 on
+  this one case. Every other positive still joins (46 of 48 labels join; the
+  other miss is the negative `OrbotBottomSheet.kt` case recorded at M3).
+  Precision-at-high on the joined set is 0.923. Type-confirmation accuracy
+  is 0.957.
