@@ -93,7 +93,7 @@ RANK_STRONG_EGRESS_CAPABILITIES = ("NETWORK_EGRESS", "THIRD_PARTY_TELEMETRY", "A
 # ``is_third_party`` Noul), ``T_TRANSMIT_HIGH`` 0.70 -> 0.72 from the rejoined
 # dev set, label schema v2. Cached answers keyed on the old wording are simply
 # re-asked; the version on a finding says which wording produced it.
-EVALUATOR_VERSION = "2.1.0-capability"
+EVALUATOR_VERSION = "2.2.0-capability"
 
 # Path fragments whose files are string catalogs / UI text, not behavior. A
 # generic pattern like "deactivate" or "record" matching a localized
@@ -645,7 +645,7 @@ THRESHOLD_PROVENANCE = {
         "IPC hand-offs count as sharing unless the user chose the recipient."
     ),
     "calibrated_at": "2026-09-27",
-    "calibrated_with": "typesafe_eval calibrate --rejoin at M2 (after WP6 + WP7)",
+    "calibrated_with": "typesafe_eval calibrate --rejoin at M2 (after WP6 + WP7); rechecked at M3",
     "method": (
         "T_TRANSMIT_LOW = highest threshold with recall 1.0 on labelled "
         "transfers (platform_component labels are on-device hand-offs and "
@@ -684,6 +684,24 @@ THRESHOLD_PROVENANCE = {
         "edge here is decided by a single case; revisit once the labelled set "
         "exceeds ~100 cases."
     ),
+    # M3 (WP8-WP11) changed question and state text, so the version moves to
+    # 2.2.0-capability. The shipped band is unchanged: the recheck on the
+    # rebuilt trees (47 of 48 labels join; one negative no longer has a
+    # finding because the source moved) keeps precision-at-high 0.933 and
+    # zero missing positives. The one LOCAL positive is the clipboard
+    # hand-off M2 already treats as recall-exempt; its destination_class
+    # label was not restored after the environment reset, so calibrate counts
+    # it until that label is re-adjudicated. Do not move the band on that case.
+    "m3_recheck": {
+        "evaluator_version": "2.2.0-capability",
+        "n_joined": 47,
+        "missing_positives": 0,
+        "precision_at_high": 0.933,
+        "recall_at_high": 0.609,
+        "abstention_rate": 0.489,
+        "type_confirmation_accuracy": 0.957,
+        "band_changed": False,
+    },
 }
 
 # Minimum severity Score (0-indexed levels) required to treat a finding as an

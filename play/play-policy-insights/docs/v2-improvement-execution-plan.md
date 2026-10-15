@@ -1010,6 +1010,34 @@ applied constants (`EVALUATOR_VERSION = "2.1.0-capability"`):
   28 → 30 (the 0.71 false positive left TRANSMITS). Both reports keep their
   Non-Compliant status. Selftest 396 checks.
 
+### M3 gate — result (passed with two recorded exceptions)
+
+Measured with `calibrate --rejoin` on the WP11 live runs, then recorded under
+`EVALUATOR_VERSION = "2.2.0-capability"`. The shipped transfer band is
+**unchanged** (0.35 / 0.72). WP8–WP11 changed question and state text, which
+is why the version moves; cached answers under the old text are re-asked.
+
+- App A default-on crash-log transfer still carries the consent default
+  (WP8), and the wave 2/3 findings match the legacy adjudication: photo /
+  video and files manifest rules (WP9), the `uid` → not-personal and the
+  recorded `EMAILS` disagreement (WP10), and App A `account_deletion`
+  Important with App B recording `user_remote_server_credentials` and no
+  account-deletion finding (WP11).
+- `missing_positives` empty. Precision-at-high 0.933. Type-confirmation
+  accuracy 0.957 with the two recorded `wrong_relabels` (the developer's
+  support address; labels kept).
+- **Exception — join count 47/48.** The environment was reset after WP10 and
+  the apps were re-checked-out at current revisions. One negative label
+  (`OrbotBottomSheet.kt`, `APP_INTERACTIONS`) no longer meets a finding.
+  Every positive still does.
+- **Exception — one LOCAL positive in the recheck.** `AboutFragment.kt` /
+  `PERFORMANCE_DIAGNOSTICS` composes LOCAL. M2 recorded this case as the
+  recall-exempt `platform_component` clipboard hand-off. The `destination_class`
+  label was not restored, so `calibrate` counts it until that label is
+  re-adjudicated. The finding is still in the report as a Suggestion. The
+  band was not moved to absorb it.
+- `THRESHOLD_PROVENANCE["m3_recheck"]` records the recheck. Selftest 596 checks.
+
 A milestone gate that fails is resolved inside the milestone (fix or revert
 the offending WP by its flag); the next milestone does not start on a red
 gate.
@@ -1108,7 +1136,7 @@ touching the rest of the cascade.
 - [x] WP9 wave 2 policies
 - [x] WP10 `data_type_confirmed`
 - [x] WP11 wave 3 policies
-- [ ] **M3 gate**
+- [x] **M3 gate** (passed; 47/48 join and one unlabelled-destination LOCAL recorded)
 - [ ] WP12 wave 4 (review-only) + fixture apps
 - [ ] WP13 wave 5 refinements
 - [ ] **M4 gate**

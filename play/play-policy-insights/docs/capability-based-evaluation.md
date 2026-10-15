@@ -1,6 +1,6 @@
 # Capability-Based Evaluation (hybrid evaluator v2)
 
-Status: Implemented (`EVALUATOR_VERSION = "2.1.0-capability"`; `2.0.0-capability` was the pre-M2 wording and band)
+Status: Implemented (`EVALUATOR_VERSION = "2.2.0-capability"`; `2.1.0-capability` was the M2 band, `2.0.0-capability` the pre-M2 wording)
 Owner: play-policy-insights
 Last updated: 2026-09-27
 Supersedes: the single-cliff `T_TRANSMIT` decision and pattern-anchored snippets described
