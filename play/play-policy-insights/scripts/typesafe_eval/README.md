@@ -11,6 +11,98 @@ answers in code. Phase 1 (`orchestrator.py init`) and finalization
 Standard library only. The real Jev client uses `urllib`; an offline heuristic
 client lets the whole pipeline run without a key or network.
 
+## Start here
+
+The evaluator answers a fixed list of small questions about an Android app and
+turns the answers into Play-policy findings in code. It does not ask a model
+to write the report. A finding is kept when the code or the answers support it.
+A low-confidence answer sends the finding to review. It does not delete it.
+
+**Run the offline checks** from `play/play-policy-insights/scripts`:
+
+```bash
+python3 -m typesafe_eval.selftest
+```
+
+**Run one app offline** (no API key; the stand-in client is not a policy judgment):
+
+```bash
+python3 orchestrator.py init /path/to/app
+python3 -m typesafe_eval run /workspace/.scratch/play_policy_insights_<id> --client heuristic
+```
+
+**Run one app against Jev.** Set `TYPESAFE_API_KEY` in the environment. Do not
+put the key in a file in the repo. Pin the model with `--model jev-1.13.0`.
+Add `--cache` so a second run of the same tree does not repeat answered questions.
+
+### How a policy becomes a finding
+
+1. `orchestrator.py init` scans the tree and writes the raw artifacts.
+2. The engine loads the merged manifest (`android_manifest.py`) and asks one
+   cached question for the app's core purpose.
+3. Candidate files are filtered, ranked, and (when a policy needs it) sent to
+   Jev as a batch of typed questions.
+4. `evaluate.py` composes each answer into a severity. Manifest-only policies
+   skip the model.
+5. The run writes `worker_<goal>.json` and `typesafe_triage.json`. The triage
+   file is the place to see why a finding exists or why a candidate was dropped.
+
+### Add a policy
+
+1. Add one `PolicySpec` in `registry.py`. Use `kind="manifest"` when the rule
+   is a permission, a component, or a resource flag. Use `kind="code_signal"`
+   when a source file has to be read.
+2. Put every new threshold, purpose set, and regex in `constants.py`, with a
+   comment that says what it decides and how to turn it off.
+3. If the model is asked anything, add an atomic question in `questions.py`.
+   Closed choices always include `unknown`, and `unknown` goes to review.
+4. Compose the answers in `evaluate.py` or in the manifest function. A model
+   answer may confirm a compliant path. It may not hide a finding the
+   deterministic rule already produced.
+5. Add the summary and recommendation in `templates.py`.
+6. Add a selftest fixture for the positive case, the negative case, and the
+   boundary (`targetSdk`, a missing flag, a client failure). Run
+   `python3 -m typesafe_eval.selftest`.
+7. Describe the rule in `docs/capability-based-evaluation.md` and mark the row
+   in `docs/policy-coverage-evolution.md`.
+
+Set `review_only=True` on the spec when the policy has no labelled apps yet.
+Those findings always carry `needs_manual_review`.
+
+### Test and review a change
+
+- `python3 -m typesafe_eval.selftest` must pass before a live run.
+- `python3 -m typesafe_eval triage-diff <before_dir> <after_dir>` shows which
+  findings appeared, disappeared, or changed severity.
+- `python3 -m typesafe_eval calibrate <labels.json> --rejoin --worker-dir <run>`
+  checks that every labelled transfer still has a finding. The label file stays
+  **out of the repository**, because it names files in real apps.
+- Log the branch taken (`log.info`) with the file, the probability, and the
+  severity. A reviewer should be able to reconstruct the decision from
+  `typesafe_triage.json` alone.
+
+### Glossary
+
+| Term | Meaning |
+| --- | --- |
+| Anchor | The line the scanner matched, plus the function around it. |
+| Battery | The set of typed questions asked about one file or one app. |
+| Choice / Noul | A closed option list, or a yes/no probability in `[0, 1]`. |
+| Band | Probabilities between `T_TRANSMIT_LOW` and `T_TRANSMIT_HIGH`. The finding is reported and marked for review. |
+| Review-only | The policy emits findings, and a person decides. Used until labels exist. |
+| Stand-in client | `HeuristicJevClient`. Offline, deterministic, not a judgment. Live runs use `--client http`. |
+
+### Where the design is written
+
+| Doc | What it is for |
+| --- | --- |
+| `docs/evaluation-charter.md` | Quality order: recall, then precision, then calibration, then latency, then cost. |
+| `docs/capability-based-evaluation.md` | How each stage and policy works, including thresholds. |
+| `docs/v2-improvement-execution-plan.md` | Work packages, what shipped, and the milestone results. |
+| `docs/policy-coverage-evolution.md` | One row per policy and the status of that row. |
+| `docs/typesafe-hybrid-architecture.md` | Why the questions are composed in code. |
+| `docs/legacy-skill-lessons-and-coverage-plan.md` | What the previous agent got right, and the rules that came from it. |
+
 ## Where it plugs in
 
 ```
