@@ -43,19 +43,19 @@ Source of truth: `policies.json` + `goal_permissions_and_apis.md` /
 | User Data | `data_safety_section` (35 taxonomy types) | data_safety | **Prototyped** | transmit/disclosure/third-party batteries; per data type |
 | User Data | `prominent_disclosure_policy` | data_safety | **Prototyped** | gate-before-access Noul + disclosure Choice |
 | User Data | `data_safety_section` (declaration coverage) | data_safety | **Prototyped (`play_declaration` kind)** | Jev checks detected off-device transfers vs the developer's declaration; semantic coverage, not string match. Needs a reliable declaration (prefer provided JSON). |
-| Permissions | `location_access_policy` | permissions | **Prototyped** | core + disclosure + transmit |
-| Permissions | `contacts_access_policy` | permissions | **Prototyped** | core + picker-alternative |
-| Permissions | `audio_recording_policy` | permissions | **Prototyped** | core + mic-button alternative |
-| User Data | `account_deletion` | user_account | **Prototyped (code)** | deterministic presence check + model gate; "server-side identity without delete endpoint" heuristic planned (wave 3) |
-| Permissions | `photo_video_access_policy` | permissions | Planned (wave 2) | Photo Picker migration; SDK-version aware (code) |
+| Permissions | `location_access_policy` | permissions | **Shipped (WP13 rows on the WP5 battery)** | core + disclosure + transmit, plus background-location Important, required-phrase Suggestion, and a location-button Suggestion on API 37+ |
+| Permissions | `contacts_access_policy` | permissions | **Shipped (WP13 picker row)** | core + picker-alternative; `READ_CONTACTS` on API 37+ → Contact Picker Suggestion |
+| Permissions | `audio_recording_policy` | permissions | **Shipped (WP13 continuous-capture Noul)** | core + mic-button alternative; continuous/background capture → Critical + review (prior threshold, no labels yet) |
+| User Data | `account_deletion` | user_account | **Shipped (app-level, WP11)** | provisioning-without-deletion is Important; a confirmed remote delete is traced and not a finding |
+| Permissions | `photo_video_access_policy` | permissions | **Shipped (manifest + one Noul, WP9)** | Photo Picker migration; SDK-version aware |
 | Permissions | `all_files_access_policy` | permissions | **Shipped (manifest, WP5)** | `MANAGE_EXTERNAL_STORAGE`: Suggestion when the cached `declared_core_purpose` is a file manager / backup-antivirus, otherwise Critical (review-marked when the purpose is not established); redundant media permissions → Important |
-| Permissions | `files_and_docs_policy` | permissions | Planned (wave 2) | Scoped storage / SAF; `maxSdkVersion` caps |
-| Permissions | `sms_call_log_policy` | permissions | Planned (wave 4) | default-handler check; OTP retriever alternative; needs external fixtures |
+| Permissions | `files_and_docs_policy` | permissions | **Shipped (manifest + one Noul, WP9)** | Scoped storage / SAF; `maxSdkVersion` caps |
+| Permissions | `sms_call_log_policy` | permissions | **Shipped review-only (WP12)** | default-handler check; OTP Noul annotates the finding; stays on manual review until fixture labels exist |
 | Permissions | `package_visibility_policy` | permissions | **Shipped (manifest, WP5)** | `QUERY_ALL_PACKAGES`: Suggestion for qualifying purposes, Important otherwise or when `<queries>` is also declared |
-| Permissions | `accessibility_api_policy` | permissions | Planned (wave 4) | tool vs misuse; disclosure gate; needs external fixtures |
+| Permissions | `accessibility_api_policy` | permissions | **Shipped review-only (WP12)** | missing `isAccessibilityTool` → Important; off-device screen content → Critical; both review-only until fixture labels exist |
 | Permissions | `exact_alarm_policy` | permissions | **Shipped (manifest, WP5)** | `USE_EXACT_ALARM` outside alarm/timer/calendar → Important; `SCHEDULE_EXACT_ALARM` → Suggestion |
 | Privacy/Abuse | `foreground_services_policy` | permissions | **Shipped (manifest, WP5)** | over the `AppProfile`: typeless service that calls `startForeground` on API 34+ → Critical; `specialUse` without its `<property>` → Critical; missing per-type permission → Important; type/purpose misalignment → Important; inventory Suggestion; stray `FOREGROUND_SERVICE_SPECIAL_USE` → Suggestion. Notification-integrity Noul still planned |
-| Play Console | `login_credentials` | user_account | Planned (wave 3) | login-gate type Choice; demo-credential reminder |
+| Play Console | `login_credentials` | user_account | **Shipped (once per app, WP11)** | `login_gate_type` Choice; app account or a sign-in bridge → Important; the user's own server credentials are recorded and are not a finding |
 | Privacy/Abuse | `target_api_level` | permissions | **Shipped (manifest, WP5)** | lowest shipped `targetSdk` vs `constants.PLAY_REQUIRED_TARGET_SDK` (dated provenance): below the existing-app floor → Critical, one behind → Important, unknown → review |
 
 Numeric/threshold checks (target SDK, counts) stay in code per the charter — Jev

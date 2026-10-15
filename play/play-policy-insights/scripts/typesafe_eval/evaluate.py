@@ -1407,9 +1407,23 @@ def _compose_permission_finding(
   severity = derive_permission_severity(
       policy_id, is_core, has_disclosure, transmits
   )
-  if severity is None:
+  # WP13: continuous / background audio capture is Critical even when the
+  # rest of the battery would call the permission compliant. The threshold is
+  # a prior (no labels yet), so the finding is always review-marked.
+  continuous_p: Optional[float] = None
+  cont_ans = answers.get("captures_audio_continuously_in_background")
+  if cont_ans is not None and constants.CONTINUOUS_AUDIO_ENABLED:
+    continuous_p = float(cont_ans.noul or 0.0)
+  continuous = continuous_p is not None and continuous_p >= constants.T_CONTINUOUS_AUDIO
+  if severity is None and not continuous:
     return None
+  if continuous:
+    log.info("audio: continuous/background capture p=%.2f >= %.2f -> CRITICAL + review",
+             continuous_p or 0.0, constants.T_CONTINUOUS_AUDIO)
+    severity = "CRITICAL"
   summary = templates.issue_summary(policy_id, data_type)
+  if continuous:
+    summary = templates.continuous_audio_summary()
   if relevance_low:
     summary = f"{summary} [data-type match uncertain: p={p_relevant or 0.0:.2f}; verify]"
     if severity == "CRITICAL":
@@ -1437,8 +1451,13 @@ def _compose_permission_finding(
            "relevance": relevance_trace(verdict)},
       ),
   }
-  if (decision == UNCERTAIN and severity != "SUGGESTION") or relevance_low:
+  if (decision == UNCERTAIN and severity != "SUGGESTION") or relevance_low or continuous:
     finding["needs_manual_review"] = True
+  if continuous:
+    finding["decision_trace"]["continuous_capture"] = {
+        "p": round(continuous_p or 0.0, 3),
+        "threshold": constants.T_CONTINUOUS_AUDIO,
+    }
   return finding
 
 

@@ -615,6 +615,15 @@ class HeuristicJevClient(JevClient):
       return 0.15 if has_network else 0.85
     if qid == "declaration_covers":
       return 0.5
+    if qid == "captures_audio_continuously_in_background":
+      # WP13 stand-in: the offline client cannot see a recorder's lifetime, so
+      # it answers "not continuous". Tests that need the Critical use a fixed
+      # answer. Labelled as a stand-in, never used in a live run.
+      return 0.15
+    if qid in ("reads_one_time_code", "siphons_screen_content_offdevice"):
+      # WP12 stand-in: lean no, so an offline run does not invent a Critical.
+      # The manifest finding still ships. Tests use a fixed client.
+      return 0.15
     return 0.5
 
   @staticmethod

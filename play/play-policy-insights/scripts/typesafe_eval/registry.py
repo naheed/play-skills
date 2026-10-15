@@ -161,6 +161,10 @@ class PolicySpec:
   applies_file: Optional[Callable[[structure.FileStructure], bool]] = None
   one_per_file: bool = False
   needs_app_purpose: bool = False
+  # WP12: every finding this spec emits is routed to manual review until the
+  # policy has labels. The composer also stamps the finding, so a unit test of
+  # ``compose_manifest`` sees the flag without going through the engine.
+  review_only: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -918,9 +922,179 @@ def _files_and_docs_code_spec() -> PolicySpec:
   )
 
 
-def _manifest_spec(policy_id: str, compose: Callable[[ManifestInputs], List[Dict[str, Any]]]) -> PolicySpec:
+def _manifest_spec(policy_id: str, compose: Callable[[ManifestInputs], List[Dict[str, Any]]],
+                   review_only: bool = False) -> PolicySpec:
   return PolicySpec(policy_id=policy_id, kind=MANIFEST, goal="permissions_and_apis",
-                    compose_manifest=compose)
+                    compose_manifest=compose, review_only=review_only)
+
+
+def _stamp_review_only(finding: Dict[str, Any]) -> Dict[str, Any]:
+  """Route a wave-4 finding to a human until the policy has labels (WP12)."""
+  if constants.WAVE4_REVIEW_ONLY:
+    finding["needs_manual_review"] = True
+    finding["review_only"] = True
+  return finding
+
+
+def _sms_call_log_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """SMS and Call Log permissions without a default-handler role (WP12).
+
+  Play allows these permissions for the default SMS, dialer or assistant
+  handler. The role is read from intent filters (``default_handler_roles``),
+  not from a model. An established ``messaging_default_handler`` purpose
+  lowers the SMS row to a Suggestion; it never lowers the call-log row,
+  because that purpose is not a dialer. An unestablished purpose keeps the
+  Critical and adds review. A receiver for the incoming-SMS broadcast with
+  no SMS role is the same Critical, folded into the SMS finding when the
+  permission is also present.
+  """
+  pid = "sms_call_log_policy"
+  if inputs.profile is None:
+    log.info("sms_call_log: no profile; nothing to check")
+    return []
+  profile = inputs.profile
+  roles = profile.default_handler_roles()
+  sms_perms = [p for p in ( _shipped_permission(inputs, n) for n in ("READ_SMS", "RECEIVE_SMS", "SEND_SMS")) if p]
+  call_perms = [p for p in (
+      _shipped_permission(inputs, n) for n in ("READ_CALL_LOG", "WRITE_CALL_LOG", "PROCESS_OUTGOING_CALLS")) if p]
+  receivers = [c for c in profile.sms_receivers() if profile.ships_in_play_build(c)]
+  if not sms_perms and not call_perms and not receivers:
+    log.debug("sms_call_log: no SMS/call-log permission and no SMS receiver")
+    return []
+  purpose = inputs.purpose_label()
+  justified = inputs.purpose_in(constants.SMS_CALL_LOG_PURPOSES)
+  findings: List[Dict[str, Any]] = []
+  if sms_perms or receivers:
+    has_role = bool(roles.get("sms"))
+    if not has_role:
+      severity = "SUGGESTION" if justified else "CRITICAL"
+      evidence = "; ".join(_perm_evidence(p) for p in sms_perms)
+      if receivers:
+        evidence = (evidence + "; " if evidence else "") + "SMS receiver " + ", ".join(c.name for c in receivers)
+      evidence += f"; sms role absent; declared_core_purpose={purpose}; roles={sorted(roles)}"
+      log.info("sms_call_log: SMS permission/receiver without the sms role -> %s", severity)
+      findings.append(_stamp_review_only(_manifest_finding(
+          pid, severity,
+          "SMS permission or an incoming-SMS receiver is declared without a default-SMS-handler intent filter",
+          evidence,
+          {"rule": "sms_without_default_handler", "permissions": [p.name for p in sms_perms],
+           "receivers": [c.name for c in receivers], "roles": {k: v for k, v in roles.items()},
+           "app_purpose": purpose, "justified_by_purpose": justified},
+          needs_review=not justified and severity != "SUGGESTION")))
+  if call_perms and not any(roles.get(r) for r in constants.CALL_LOG_ROLES):
+    log.info("sms_call_log: call-log permission(s) %s without a dialer/assistant role -> CRITICAL",
+             [p.short_name for p in call_perms])
+    findings.append(_stamp_review_only(_manifest_finding(
+        pid, "CRITICAL",
+        "Call-log permission is declared without a default dialer, assistant or in-call handler role",
+        "; ".join(_perm_evidence(p) for p in call_perms) + f"; roles={sorted(roles)}; declared_core_purpose={purpose}",
+        {"rule": "call_log_without_role", "permissions": [p.name for p in call_perms],
+         "roles": {k: v for k, v in roles.items()}, "app_purpose": purpose,
+         "qualifying_roles": sorted(constants.CALL_LOG_ROLES)})))
+  return findings
+
+
+def _accessibility_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """Accessibility service that is not declared as an accessibility tool (WP12).
+
+  ``isAccessibilityTool`` is read from the service's ``res/xml`` config by the
+  profile parser. ``False`` and an unreadable config (``None``) both compose
+  Important: a missing flag is not evidence that the service is a tool.
+  """
+  pid = "accessibility_api_policy"
+  if inputs.profile is None:
+    return []
+  findings: List[Dict[str, Any]] = []
+  for svc in inputs.profile.accessibility_services:
+    if not svc.ships_in_play_build:
+      log.info("accessibility: %s does not ship in the Play build; skipped", svc.name)
+      continue
+    if svc.is_accessibility_tool is True:
+      log.info("accessibility: %s isAccessibilityTool=true; no manifest finding", svc.name)
+      continue
+    log.info("accessibility: %s isAccessibilityTool=%s -> IMPORTANT", svc.name, svc.is_accessibility_tool)
+    findings.append(_stamp_review_only(_manifest_finding(
+        pid, "IMPORTANT",
+        f"Accessibility service {svc.name} is not declared android:isAccessibilityTool=\"true\"",
+        f"service {svc.name}; config {svc.config_path or svc.config_resource or 'missing'}; "
+        f"isAccessibilityTool={svc.is_accessibility_tool}",
+        {"rule": "accessibility_tool_flag_missing", "service": svc.name,
+         "config_path": svc.config_path, "is_accessibility_tool": svc.is_accessibility_tool})))
+  return findings
+
+
+def _background_location_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """Background location, disclosure wording, and the API-37 location button (WP13).
+
+  Three independent rows, each emitted only when its permission ships:
+
+  * ``ACCESS_BACKGROUND_LOCATION`` is Important. No purpose in the closed list
+    is a location-primary purpose, so the row does not lower; an unestablished
+    purpose adds review.
+  * The same permission requires the disclosure phrase
+    ``BACKGROUND_LOCATION_PHRASE`` somewhere in the default-locale strings.
+    A miss is a Suggestion. The lookup is exact and case-insensitive.
+  * ``ACCESS_FINE_LOCATION`` on ``targetSdk >= LOCATION_BUTTON_TARGET_SDK``
+    (37) is a Suggestion to use the platform location button for one-shot access.
+  """
+  pid = "location_access_policy"
+  if inputs.profile is None or not constants.WAVE5_POLICIES_ENABLED:
+    return []
+  findings: List[Dict[str, Any]] = []
+  values = _target_values(inputs)
+  target = values[0] if values else 0
+  purpose = inputs.purpose_label()
+  established = purpose != "not established" and "below CONF_APP_PURPOSE" not in purpose
+  background = _shipped_permission(inputs, "ACCESS_BACKGROUND_LOCATION")
+  fine = _shipped_permission(inputs, "ACCESS_FINE_LOCATION")
+  if background is not None:
+    log.info("location: ACCESS_BACKGROUND_LOCATION with purpose %s -> IMPORTANT", purpose)
+    findings.append(_manifest_finding(
+        pid, "IMPORTANT",
+        "Background location is requested for a feature that is not the app's core purpose",
+        f"{_perm_evidence(background)}; declared_core_purpose={purpose}",
+        {"rule": "background_location_secondary", "permission": background.name,
+         "app_purpose": purpose, "target_sdk": target},
+        needs_review=not established))
+    index = inputs.profile.resource_index
+    texts = list((index.strings or {}).values()) if index is not None else []
+    phrase = constants.BACKGROUND_LOCATION_PHRASE.lower()
+    if not any(phrase in (t or "").lower() for t in texts):
+      log.info("location: disclosure strings (%d) omit the background phrase -> SUGGESTION", len(texts))
+      findings.append(_manifest_finding(
+          pid, "SUGGESTION",
+          "Background-location disclosure does not contain the required phrase "
+          f"\"{constants.BACKGROUND_LOCATION_PHRASE}\"",
+          f"{len(texts)} default-locale strings scanned; none contain the phrase",
+          {"rule": "background_location_wording", "strings_scanned": len(texts),
+           "required_phrase": constants.BACKGROUND_LOCATION_PHRASE}))
+  if fine is not None and target >= constants.LOCATION_BUTTON_TARGET_SDK:
+    log.info("location: ACCESS_FINE_LOCATION on target %d -> SUGGESTION location button", target)
+    findings.append(_manifest_finding(
+        pid, "SUGGESTION",
+        f"Fine location is requested while targeting API {target}; one-shot access should use the location button",
+        f"{_perm_evidence(fine)}; targetSdk={target}",
+        {"rule": "fine_location_button", "permission": fine.name, "target_sdk": target,
+         "location_button_target_sdk": constants.LOCATION_BUTTON_TARGET_SDK}))
+  return findings
+
+
+def _contacts_picker_findings(inputs: ManifestInputs) -> List[Dict[str, Any]]:
+  """``READ_CONTACTS`` on API 37+ should be the Contact Picker (WP13)."""
+  if inputs.profile is None or not constants.WAVE5_POLICIES_ENABLED:
+    return []
+  read = _shipped_permission(inputs, "READ_CONTACTS")
+  values = _target_values(inputs)
+  target = values[0] if values else 0
+  if read is None or target < constants.CONTACTS_PICKER_TARGET_SDK:
+    return []
+  log.info("contacts: READ_CONTACTS on target %d -> SUGGESTION contact picker", target)
+  return [_manifest_finding(
+      "contacts_access_policy", "SUGGESTION",
+      f"READ_CONTACTS is requested while targeting API {target}; one-shot selection should use the Contact Picker",
+      f"{_perm_evidence(read)}; targetSdk={target}",
+      {"rule": "contacts_picker", "permission": read.name, "target_sdk": target,
+       "contacts_picker_target_sdk": constants.CONTACTS_PICKER_TARGET_SDK})]
 
 
 def _account_deletion_spec() -> PolicySpec:
@@ -958,6 +1132,14 @@ REGISTRY: Tuple[PolicySpec, ...] = (
       if constants.PHOTO_VIDEO_POLICY_ENABLED else []),
     *([_manifest_spec("files_and_docs_policy", _files_and_docs_findings), _files_and_docs_code_spec()]
       if constants.FILES_AND_DOCS_POLICY_ENABLED else []),
+    # WP12 wave 4: review-only until labelled fixture apps exist.
+    *([_manifest_spec("sms_call_log_policy", _sms_call_log_findings, review_only=True),
+       _manifest_spec("accessibility_api_policy", _accessibility_findings, review_only=True)]
+      if constants.WAVE4_POLICIES_ENABLED else []),
+    # WP13 wave 5: extra manifest rows on the existing permission policies.
+    *([_manifest_spec("location_access_policy", _background_location_findings),
+       _manifest_spec("contacts_access_policy", _contacts_picker_findings)]
+      if constants.WAVE5_POLICIES_ENABLED else []),
     _play_declaration_spec(),
 )
 

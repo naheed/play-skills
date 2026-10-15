@@ -72,6 +72,7 @@ from typesafe_eval import evaluate
 from typesafe_eval import identity
 from typesafe_eval import questions as q
 from typesafe_eval import registry
+from typesafe_eval import restricted
 from typesafe_eval import snippets
 from typesafe_eval import structure
 from typesafe_eval import templates
@@ -1032,7 +1033,111 @@ def _run_manifest(ctx: RunContext, findings_by_goal) -> None:
           "client": "error", "needs_manual_review": True,
       }]
     findings_by_goal[spec.goal].extend(found)
-    ctx.counters.setdefault("manifest_findings", {})[spec.policy_id] = len(found)
+    ctx.counters.setdefault("manifest_findings", {})[spec.policy_id] = (
+        ctx.counters.setdefault("manifest_findings", {}).get(spec.policy_id, 0) + len(found))
+
+
+# ---------------------------------------------------------------------------
+# Stage 6a: wave-4 code signals (WP12) — Nouls on a deterministic prefilter
+# ---------------------------------------------------------------------------
+
+
+def _wave4_relpaths(ctx: RunContext) -> List[str]:
+  """Shipped first-party source paths, building the index when it is missing."""
+  if ctx.first_party_index is None and ctx.app_dir:
+    excluded = ctx.counters.get("excluded_flavors") or []
+    ctx.first_party_index = structure.build_first_party_index(ctx.app_dir, excluded_flavors=excluded)
+  if ctx.first_party_index is None:
+    return []
+  return list(ctx.first_party_index.package_by_file.keys())
+
+
+def _run_wave4_signals(ctx: RunContext, client: JevClient, model: Optional[str], findings_by_goal) -> None:
+  """Ask the two wave-4 Nouls when the manifest already activated the policy.
+
+  ``reads_one_time_code`` annotates an existing SMS finding (the platform
+  retriever recommendation) and, when there is no SMS finding to attach to,
+  emits its own Suggestion. ``siphons_screen_content_offdevice`` emits a
+  Critical of its own. Both are review-only while ``WAVE4_REVIEW_ONLY`` is
+  set. A client failure is logged and does not remove the manifest finding.
+  """
+  if not constants.WAVE4_POLICIES_ENABLED or not constants.WAVE4_CODE_SIGNALS_ENABLED:
+    log.info("wave4 code signals: disabled")
+    return
+  if ctx.profile is None or not ctx.app_dir:
+    ctx.counters["wave4"] = {"skipped": "no profile"}
+    return
+  sms_active = any(ctx.profile.has_permission(n) for n in ("READ_SMS", "RECEIVE_SMS", "SEND_SMS")) or bool(
+      ctx.profile.sms_receivers())
+  a11y_active = any(s.ships_in_play_build for s in ctx.profile.accessibility_services)
+  ctx.counters["wave4"] = {"sms_active": sms_active, "accessibility_active": a11y_active, "asked": []}
+  if not sms_active and not a11y_active:
+    log.info("wave4 code signals: no SMS permission/receiver and no accessibility service")
+    return
+  relpaths = _wave4_relpaths(ctx)
+  goal = "permissions_and_apis"
+  if sms_active:
+    hits = restricted.scan(ctx.app_dir, relpaths, "sms")
+    battery = q.reads_one_time_code_battery()
+    for hit in hits:
+      row: Dict[str, Any] = {"kind": "sms", "file": hit["relpath"]}
+      try:
+        answers = client.system_one(restricted.state_for(hit, ctx.app_facts), battery, model=model)
+        p = float(answers["reads_one_time_code"].noul or 0.0)
+        row["p"] = round(p, 3)
+      except Exception as exc:  # pylint: disable=broad-exception-caught
+        log.warning("wave4 reads_one_time_code failed on %s (%s)", hit["relpath"], exc)
+        row["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        p = 0.0
+      ctx.counters["wave4"]["asked"].append(row)
+      if p < constants.T_ONE_TIME_CODE:
+        log.info("wave4 reads_one_time_code %s p=%.2f -> below bar", hit["relpath"], p)
+        continue
+      note = (f" One-time-code read in {hit['relpath']} (p={p:.2f}): use the platform SMS retriever "
+              "instead of reading the message body.")
+      hosts = [f for f in findings_by_goal.get(goal, []) if f.get("policy_id") == "sms_call_log_policy"
+               and f.get("decision_trace", {}).get("rule") == "sms_without_default_handler"]
+      if hosts:
+        hosts[0]["recommendation"] = (hosts[0].get("recommendation") or "") + note
+        hosts[0]["decision_trace"]["reads_one_time_code"] = row
+        log.info("wave4 reads_one_time_code %s p=%.2f -> annotated the SMS finding", hit["relpath"], p)
+      else:
+        finding = registry._stamp_review_only(registry._manifest_finding(  # pylint: disable=protected-access
+            "sms_call_log_policy", "SUGGESTION",
+            "Shipped code reads SMS or call-log content; prefer the platform one-time-code API",
+            f"{hit['relpath']} tokens={hit['tokens']} p={p:.2f}",
+            {"rule": "reads_one_time_code", "file": hit["relpath"], "p": round(p, 3)}))
+        finding["files_involved"] = [str(hit["relpath"])]
+        finding["client"] = client.name
+        findings_by_goal[goal].append(finding)
+        log.info("wave4 reads_one_time_code %s p=%.2f -> SUGGESTION (no manifest host)", hit["relpath"], p)
+  if a11y_active:
+    hits = restricted.scan(ctx.app_dir, relpaths, "accessibility")
+    battery = q.siphons_screen_battery()
+    for hit in hits:
+      row = {"kind": "accessibility", "file": hit["relpath"]}
+      try:
+        answers = client.system_one(restricted.state_for(hit, ctx.app_facts), battery, model=model)
+        p = float(answers["siphons_screen_content_offdevice"].noul or 0.0)
+        row["p"] = round(p, 3)
+      except Exception as exc:  # pylint: disable=broad-exception-caught
+        log.warning("wave4 siphons_screen_content_offdevice failed on %s (%s)", hit["relpath"], exc)
+        row["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
+        p = 0.0
+      ctx.counters["wave4"]["asked"].append(row)
+      if p < constants.T_SCREEN_SIPHON:
+        log.info("wave4 screen siphon %s p=%.2f -> below bar", hit["relpath"], p)
+        continue
+      finding = registry._stamp_review_only(registry._manifest_finding(  # pylint: disable=protected-access
+          "accessibility_api_policy", "CRITICAL",
+          "Accessibility event content is sent off the device",
+          f"{hit['relpath']} tokens={hit['tokens']} p={p:.2f}",
+          {"rule": "siphons_screen_content_offdevice", "file": hit["relpath"], "p": round(p, 3),
+           "threshold": constants.T_SCREEN_SIPHON}))
+      finding["files_involved"] = [str(hit["relpath"])]
+      finding["client"] = client.name
+      findings_by_goal[goal].append(finding)
+      log.info("wave4 screen siphon %s p=%.2f -> CRITICAL + review", hit["relpath"], p)
 
 
 # ---------------------------------------------------------------------------
@@ -1654,6 +1759,7 @@ def run(
 
   _run_deterministic(ctx, det_tasks, client, model, findings_by_goal)
   _run_manifest(ctx, findings_by_goal)
+  _run_wave4_signals(ctx, client, model, findings_by_goal)
   # WP11: whole-app facts (provisioning vs deletion paths; login gate).
   assessment = _identity_assessment(ctx, capability_cache, model) if (
       constants.IDENTITY_LIFECYCLE_ENABLED or constants.LOGIN_GATE_ENABLED) else None

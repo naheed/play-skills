@@ -612,6 +612,70 @@ USER_SERVER_SHAPE_RE = (
 )
 
 # ---------------------------------------------------------------------------
+# WP12 wave 4 — SMS / call log and accessibility, review-only until labels exist.
+#
+# The manifest rules are exact (a permission, a default-handler intent filter,
+# the isAccessibilityTool flag). The two Nouls (reads_one_time_code,
+# siphons_screen_content_offdevice) only annotate or add a finding when a
+# deterministic prefilter already found a file that touches the API; they never
+# suppress the manifest finding. Every wave-4 finding is stamped
+# needs_manual_review while WAVE4_REVIEW_ONLY is set. Clear that flag for one
+# policy only after its labelled recall is 1.0 and precision at the emitted
+# severity is at least 0.90.
+#
+# Rollback: WAVE4_POLICIES_ENABLED = False removes the specs from the registry.
+# WAVE4_CODE_SIGNALS_ENABLED = False keeps the manifest rules and skips the Nouls.
+# ---------------------------------------------------------------------------
+WAVE4_POLICIES_ENABLED = True
+WAVE4_REVIEW_ONLY = True
+WAVE4_CODE_SIGNALS_ENABLED = True
+T_ONE_TIME_CODE = 0.75          # prior, same bar as CONF_ACT; not calibrated (no labels yet)
+T_SCREEN_SIPHON = 0.75          # prior; a positive composes CRITICAL + review
+SMS_CALL_LOG_PERMISSIONS = (
+    "READ_SMS", "RECEIVE_SMS", "SEND_SMS", "READ_CALL_LOG", "WRITE_CALL_LOG",
+    "PROCESS_OUTGOING_CALLS",
+)
+# Established purposes that are the default-handler exception. Anything else,
+# including unknown, keeps the Critical (purpose only lowers when established).
+SMS_CALL_LOG_PURPOSES = frozenset({"messaging_default_handler"})
+# Call-log permissions are justified by a dialer / assistant / in-call role,
+# not by the SMS role. Role names match AppProfile.default_handler_roles().
+CALL_LOG_ROLES = frozenset({"dialer", "assistant", "call_redirection", "call_screening", "in_call"})
+SMS_CONTENT_RE = (
+    r"\b(?:SmsMessage|getMessageBody|getOriginatingAddress|createFromPdu"
+    r"|Telephony\.Sms|CallLog\.Calls)\b"
+)
+ACCESSIBILITY_EVENT_RE = (
+    r"\b(?:AccessibilityEvent|onAccessibilityEvent|AccessibilityNodeInfo"
+    r"|getRootInActiveWindow)\b"
+)
+MAX_WAVE4_FILES = 4000
+MAX_WAVE4_CANDIDATES = 2
+WAVE4_SNIPPET_LINES = 30
+
+# ---------------------------------------------------------------------------
+# WP13 wave 5 — refinements of the existing permission specs.
+#
+# Background location for a purpose that is not a location-primary purpose is
+# Important. No closed purpose option is a navigation app yet (add one only
+# with a fixture), so every current purpose is secondary and the row is
+# Important; an unestablished purpose is Important + review.
+# The disclosure wording row is a deterministic string lookup: the required
+# phrase must appear in some default-locale string or the finding is a
+# Suggestion. Fine location on targetSdk >= 37 and READ_CONTACTS on the same
+# floor are Suggestions pointing at the platform one-shot APIs.
+# The audio Noul is a prior (T_CONTINUOUS_AUDIO = CONF_ACT) and always adds
+# review, because it has no labels yet.
+# Rollback: WAVE5_POLICIES_ENABLED / CONTINUOUS_AUDIO_ENABLED = False.
+# ---------------------------------------------------------------------------
+WAVE5_POLICIES_ENABLED = True
+CONTINUOUS_AUDIO_ENABLED = True
+T_CONTINUOUS_AUDIO = 0.75
+LOCATION_BUTTON_TARGET_SDK = 37
+CONTACTS_PICKER_TARGET_SDK = 37
+BACKGROUND_LOCATION_PHRASE = "when the app is closed or not in use"
+
+# ---------------------------------------------------------------------------
 # Confidence gates (Choice/Score answers carry a calibrated confidence in [0, 1]).
 #
 # Mirrors the three-band pattern from the TypeSafe confidence docs: act, review,

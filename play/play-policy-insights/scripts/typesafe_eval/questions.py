@@ -32,6 +32,7 @@ from typing import Any
 from typing import Dict
 from typing import Optional
 
+from typesafe_eval import constants
 from typesafe_eval import taxonomy
 
 
@@ -351,9 +352,8 @@ def permission_battery(
   the shared rubrics. ``token`` is the scanner pattern that anchored the signal
   (embedded in the relevance gate; see :func:`_relevance`).
   """
-  del policy_id  # the policy is applied in code (evaluate.py), not in the question
   subject = f"the data type {data_type}"
-  return {
+  battery = {
       "signal_relevant": _relevance(subject, token),
       "is_core_functionality": _noul(
           instructions=(
@@ -386,6 +386,21 @@ def permission_battery(
       ),
       "severity": _severity(subject),
   }
+  # WP13: one extra Noul on the audio policy only. Other permission policies
+  # keep the previous battery text, so their cached answers stay valid.
+  if policy_id == "audio_recording_policy" and constants.CONTINUOUS_AUDIO_ENABLED:
+    battery["captures_audio_continuously_in_background"] = _noul(
+        instructions=(
+            "Does `code_snippet` capture audio continuously, or while the app "
+            "is in the background — a recorder that is started and left running, "
+            "a foreground service that records, or a capture that is not tied to "
+            "one user gesture? A one-shot capture the user starts and that stops "
+            "when the gesture ends is not continuous."
+        ),
+        yes="Audio is captured continuously or in the background.",
+        no="Audio is captured only for a user gesture, or not captured here.",
+    )
+  return battery
 
 
 def declaration_battery(data_type: str, name: str) -> Dict[str, Dict[str, Any]]:
@@ -706,4 +721,45 @@ def app_purpose_battery() -> Dict[str, Dict[str, Any]]:
           ),
           "criteria": dict(APP_PURPOSE_OPTIONS),
       }
+  }
+
+
+def reads_one_time_code_battery() -> Dict[str, Dict[str, Any]]:
+  """Noul on one SMS-touching file (WP12).
+
+  Asked only after the deterministic prefilter found an SMS-body or call-log
+  API in shipped source, and only when an SMS permission or incoming-SMS
+  receiver ships. A positive annotates the manifest finding (use the platform
+  one-time-code API) instead of replacing it.
+  """
+  return {
+      "reads_one_time_code": _noul(
+          instructions=(
+              "Does `code_snippet` read the body or sender of an SMS or MMS — "
+              "for example to extract a one-time code — rather than only "
+              "declaring a permission or logging that a message arrived?"
+          ),
+          yes="The snippet reads SMS/MMS content, such as a one-time code.",
+          no="The snippet does not read message content.",
+      ),
+  }
+
+
+def siphons_screen_battery() -> Dict[str, Dict[str, Any]]:
+  """Noul on one accessibility-event file (WP12).
+
+  A positive composes a Critical review-only finding: the service is reading
+  screen content and sending it off the device. A negative is traced only.
+  """
+  return {
+      "siphons_screen_content_offdevice": _noul(
+          instructions=(
+              "Does `code_snippet` read accessibility window or event content "
+              "(text, view ids, window state) AND send that content off the "
+              "device or to another app? Reading it only to drive an on-device "
+              "assistive action is not this."
+          ),
+          yes="Screen content from accessibility events is sent off-device.",
+          no="Screen content stays on the device, or is not read here.",
+      ),
   }

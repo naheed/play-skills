@@ -82,6 +82,16 @@ _RECOMMENDATIONS: Dict[str, object] = {
         "Use the system Microphone Button API or a SpeechRecognizer intent for"
         " occasional voice input instead of holding broad RECORD_AUDIO access."
     ),
+    "sms_call_log_policy": (
+        "Remove SMS and call-log permissions unless the app is the default SMS,"
+        " dialer or assistant handler, and declare that role with the platform"
+        " intent filters. To read a one-time code, use the platform SMS retriever"
+        " API instead of READ_SMS."
+    ),
+    "accessibility_api_policy": (
+        "Set android:isAccessibilityTool=\"true\" only when the service is an"
+        " assistive tool, and do not send window content off the device."
+    ),
     "prominent_disclosure_policy": (
         "Add a prominent disclosure and affirmative-consent gate before"
         " collecting or transmitting this data, and declare it in the Play"
@@ -249,6 +259,12 @@ def declaration_mismatch_recommendation(name: str) -> str:
       f"Declare {name} in the Play Console Data Safety form (collection and, if "
       "applicable, sharing), or stop transmitting it off-device."
   )
+
+
+def continuous_audio_summary() -> str:
+  """WP13: the audio policy row for a recorder that keeps running."""
+  return ("Audio is captured continuously or in the background under RECORD_AUDIO; "
+          "verify this is a core, disclosed use")
 
 
 def issue_summary(

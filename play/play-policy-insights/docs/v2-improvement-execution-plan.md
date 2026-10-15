@@ -899,6 +899,18 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
 - **Exit.** Rules fire on synthetic fixtures; `review_only` cleared for a
   policy only when its labelled recall is 1.0 and precision ≥ 0.90.
 - **Size.** Medium; blocked on fixture acquisition for the final gate.
+- **Outcome (done, review-only).** Manifest rules and the two Nouls ship behind
+  `PolicySpec.review_only` and `WAVE4_REVIEW_ONLY`. SMS / call-log without the
+  matching default-handler role is Critical; an established
+  `messaging_default_handler` purpose lowers only the SMS row. A missing
+  `isAccessibilityTool` flag is Important. `reads_one_time_code` annotates the
+  SMS finding (or emits a Suggestion when there is no host finding);
+  `siphons_screen_content_offdevice` is its own Critical. The Nouls run only
+  after `restricted.py` finds the platform API in shipped code. Neither dev
+  app declares these permissions, so both live runs emit zero wave-4 findings,
+  which matches the plan. Fixture apps are still required before
+  `WAVE4_REVIEW_ONLY` is cleared. Selftest covers every row. Rollback:
+  `WAVE4_POLICIES_ENABLED = False`.
 
 ### WP13 — Wave 5 refinements to existing permission specs
 
@@ -914,6 +926,16 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
 - **Exit.** App A reproduces the legacy background-location Important and
   wording Suggestion.
 - **Size.** Small–medium in `registry.py`, `questions.py`, `evaluate.py`.
+- **Outcome (done).** On the live App A run the three location rows fire:
+  `ACCESS_BACKGROUND_LOCATION` → Important (purpose `per_app_network_control`),
+  the required disclosure phrase is absent from 2163 default-locale strings →
+  Suggestion, and `ACCESS_FINE_LOCATION` on target 37 → location-button
+  Suggestion. `READ_CONTACTS` is not in that app, so the Contact Picker row is
+  covered by the selftest (silent below API 37, Suggestion at 37). The audio
+  Noul `captures_audio_continuously_in_background` raises a compliant battery
+  to Critical + review at `T_CONTINUOUS_AUDIO = 0.75` (a prior; the offline
+  stand-in answers 0.15). Rollback: `WAVE5_POLICIES_ENABLED` /
+  `CONTINUOUS_AUDIO_ENABLED = False`.
 
 ---
 
@@ -1137,6 +1159,6 @@ touching the rest of the cascade.
 - [x] WP10 `data_type_confirmed`
 - [x] WP11 wave 3 policies
 - [x] **M3 gate** (passed; 47/48 join and one unlabelled-destination LOCAL recorded)
-- [ ] WP12 wave 4 (review-only) + fixture apps
-- [ ] WP13 wave 5 refinements
+- [x] WP12 wave 4 (review-only; fixture apps still required before clearing review-only)
+- [x] WP13 wave 5 refinements
 - [ ] **M4 gate**

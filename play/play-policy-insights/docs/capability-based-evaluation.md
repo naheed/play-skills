@@ -908,6 +908,10 @@ permissions that ship in the Play build are examined. Wave 1 (WP5):
 | `target_api_level` | lowest `targetSdk` among the shipped flavours: `< PLAY_EXISTING_APP_MIN_TARGET_SDK` → **Critical**, `< PLAY_REQUIRED_TARGET_SDK` → Important, unknown → Suggestion + review. The requirement is a dated constant (`PLAY_TARGET_SDK_PROVENANCE`), never a model question |
 | `photo_video_access_policy` (WP9) | uncapped `READ_EXTERNAL_STORAGE` on a `>= 33` target → Important; broad media permission: purpose in `PHOTO_VIDEO_PURPOSES` → Suggestion, otherwise Important (review-marked when not established); `READ_MEDIA_IMAGES`/`VIDEO` on `>= 34` without `READ_MEDIA_VISUAL_USER_SELECTED` → Suggestion |
 | `files_and_docs_policy` (WP9) | uncapped `WRITE_EXTERNAL_STORAGE` on a `>= 30` target → Important; `requestLegacyExternalStorage="true"` on `>= 30` → Suggestion |
+| `sms_call_log_policy` (WP12, review-only) | SMS permission or an incoming-SMS receiver without a default-SMS intent filter → **Critical** (Suggestion when the established purpose is `messaging_default_handler`); call-log permission without a dialer / assistant / in-call role → **Critical**. A `reads_one_time_code` Noul, asked only when shipped code touches `SmsMessage` / `CallLog.Calls`, annotates the SMS finding with the platform retriever recommendation |
+| `accessibility_api_policy` (WP12, review-only) | accessibility service whose config is not `isAccessibilityTool="true"` → Important; `siphons_screen_content_offdevice` on a file that handles `AccessibilityEvent` → **Critical** |
+| `location_access_policy` (WP13) | `ACCESS_BACKGROUND_LOCATION` → Important (review when the purpose is not established); default-locale strings missing "when the app is closed or not in use" → Suggestion; `ACCESS_FINE_LOCATION` on target ≥ 37 → location-button Suggestion |
+| `contacts_access_policy` (WP13) | `READ_CONTACTS` on target ≥ 37 → Contact Picker Suggestion |
 
 Purpose conditioning goes through `evaluate.purpose_in` only, so an `unknown`, `other` or
 low-confidence purpose can raise a severity (and marks the finding for review) but never

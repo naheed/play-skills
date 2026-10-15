@@ -3781,6 +3781,202 @@ def _test_lexical_pregate() -> None:
     _check("calibrate_rejoin_exit_code", rc == 2)
 
 
+def _test_wave4_and_wave5() -> None:
+  """WP12 review-only SMS / accessibility rules and WP13 permission refinements.
+
+  Manifest rows are exact. The two wave-4 Nouls fire only after a deterministic
+  prefilter, and every wave-4 finding is review-only. The audio Noul raises a
+  compliant permission battery to Critical + review.
+  """
+  from typesafe_eval import android_manifest as am
+  from typesafe_eval import engine
+  from typesafe_eval import evaluate
+  from typesafe_eval import registry
+  from typesafe_eval.client import JevAnswer
+  from typesafe_eval.client import JevClient
+
+  def purpose(label, p=0.9):
+    return {"purpose": label, "confidence": p, "source": "model"}
+
+  def build(d, body, strings="<resources></resources>", target=35):
+    def write(rel, text):
+      p = os.path.join(d, rel)
+      os.makedirs(os.path.dirname(p), exist_ok=True)
+      with open(p, "w", encoding="utf-8") as f:
+        f.write(text)
+    write("app/src/main/AndroidManifest.xml",
+          '<?xml version="1.0" encoding="utf-8"?>\n'
+          '<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.w4">\n'
+          f'  <uses-sdk android:targetSdkVersion="{target}"/>\n  {body}\n</manifest>\n')
+    write("app/src/main/res/values/strings.xml", strings)
+    write("app/src/main/java/com/w4/Sms.kt",
+          "class Sms {\n  fun read(msg: SmsMessage) { val t = msg.getMessageBody() }\n}\n")
+    write("app/src/main/java/com/w4/A11y.kt",
+          "class A11y {\n  fun onAccessibilityEvent(e: AccessibilityEvent) { e.text }\n}\n")
+    return am.load_profile(d, {})
+
+  def run(pid, inputs):
+    spec = next(s for s in registry.manifest_specs() if s.policy_id == pid)
+    return spec.compose_manifest(inputs)
+
+  _check("wave4_specs_review_only",
+         all(s.review_only for s in registry.manifest_specs()
+             if s.policy_id in ("sms_call_log_policy", "accessibility_api_policy")))
+
+  with tempfile.TemporaryDirectory() as d:
+    prof = build(d, """
+      <uses-permission android:name="android.permission.READ_SMS"/>
+      <uses-permission android:name="android.permission.READ_CALL_LOG"/>
+      <application>
+        <receiver android:name=".Sms">
+          <intent-filter><action android:name="android.provider.Telephony.SMS_RECEIVED"/></intent-filter>
+        </receiver>
+        <service android:name=".A11y" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+          <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+          <meta-data android:name="android.accessibilityservice" android:resource="@xml/a11y"/>
+        </service>
+      </application>""")
+    write_xml = os.path.join(d, "app/src/main/res/xml/a11y.xml")
+    os.makedirs(os.path.dirname(write_xml), exist_ok=True)
+    with open(write_xml, "w", encoding="utf-8") as f:
+      f.write('<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android" '
+              'android:isAccessibilityTool="false"/>')
+    prof = am.load_profile(d, {})
+    sms = run("sms_call_log_policy", registry.ManifestInputs(profile=prof, app_purpose=purpose("file_manager"), app_dir=d))
+    rules = sorted(f["decision_trace"]["rule"] for f in sms)
+    _check("sms_without_role_critical_review",
+           rules == ["call_log_without_role", "sms_without_default_handler"]
+           and all(f["severity"] == "CRITICAL" and f.get("review_only") and f.get("needs_manual_review") for f in sms),
+           json.dumps(rules))
+    justified = run("sms_call_log_policy", registry.ManifestInputs(
+        profile=prof, app_purpose=purpose("messaging_default_handler"), app_dir=d))
+    sms_row = next(f for f in justified if f["decision_trace"]["rule"] == "sms_without_default_handler")
+    call_row = next(f for f in justified if f["decision_trace"]["rule"] == "call_log_without_role")
+    _check("sms_purpose_lowers_only_the_sms_row",
+           sms_row["severity"] == "SUGGESTION" and call_row["severity"] == "CRITICAL",
+           f"{sms_row['severity']} {call_row['severity']}")
+    a11y = run("accessibility_api_policy", registry.ManifestInputs(profile=prof, app_purpose={}, app_dir=d))
+    _check("a11y_flag_false_important_review",
+           len(a11y) == 1 and a11y[0]["severity"] == "IMPORTANT" and a11y[0].get("review_only"),
+           json.dumps(a11y)[:240])
+
+    # Default SMS handler: no SMS finding. Call-log permission still Critical.
+    handler = build(d, """
+      <uses-permission android:name="android.permission.READ_SMS"/>
+      <uses-permission android:name="android.permission.READ_CALL_LOG"/>
+      <application>
+        <activity android:name=".Compose">
+          <intent-filter>
+            <action android:name="android.provider.Telephony.SMS_DELIVER"/>
+          </intent-filter>
+        </activity>
+        <service android:name=".Dial" android:permission="android.permission.BIND_INCALL_SERVICE">
+          <intent-filter><action android:name="android.telecom.InCallService"/></intent-filter>
+        </service>
+      </application>""")
+    both = run("sms_call_log_policy", registry.ManifestInputs(profile=handler, app_purpose=purpose("other"), app_dir=d))
+    _check("sms_and_call_roles_silent", both == [], json.dumps([f["decision_trace"]["rule"] for f in both]))
+
+    # Accessibility tool flag true: no manifest finding.
+    tool = build(d, """
+      <application>
+        <service android:name=".A11y" android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+          <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+          <meta-data android:name="android.accessibilityservice" android:resource="@xml/a11y"/>
+        </service>
+      </application>""")
+    with open(os.path.join(d, "app/src/main/res/xml/a11y.xml"), "w", encoding="utf-8") as f:
+      f.write('<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android" '
+              'android:isAccessibilityTool="true"/>')
+    tool = am.load_profile(d, {})
+    _check("a11y_tool_silent", run("accessibility_api_policy", registry.ManifestInputs(profile=tool, app_purpose={}, app_dir=d)) == [])
+
+    # WP13 location and contacts.
+    loc = build(d, """
+      <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
+      <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+      <uses-permission android:name="android.permission.READ_CONTACTS"/>
+      <application/>""", target=37)
+    rows = run("location_access_policy", registry.ManifestInputs(profile=loc, app_purpose=purpose("file_manager"), app_dir=d))
+    loc_rules = sorted(f["decision_trace"]["rule"] for f in rows)
+    _check("location_wave5_three_rows",
+           loc_rules == ["background_location_secondary", "background_location_wording", "fine_location_button"]
+           and next(f for f in rows if f["decision_trace"]["rule"] == "background_location_secondary")["severity"] == "IMPORTANT"
+           and next(f for f in rows if f["decision_trace"]["rule"] == "fine_location_button")["severity"] == "SUGGESTION",
+           str(loc_rules))
+    phrase = build(d, """
+      <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION"/>
+      <application/>""",
+      strings='<resources><string name="loc">Collected when the app is closed or not in use</string></resources>',
+      target=30)
+    worded = run("location_access_policy", registry.ManifestInputs(profile=phrase, app_purpose=purpose("unknown"), app_dir=d))
+    _check("location_phrase_present_drops_wording_row",
+           [f["decision_trace"]["rule"] for f in worded] == ["background_location_secondary"]
+           and worded[0].get("needs_manual_review") is True, str([f["decision_trace"]["rule"] for f in worded]))
+    low_target = build(d, """
+      <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION"/>
+      <uses-permission android:name="android.permission.READ_CONTACTS"/>
+      <application/>""", target=36)
+    _check("location_and_contacts_below_37_silent",
+           run("location_access_policy", registry.ManifestInputs(profile=low_target, app_purpose={}, app_dir=d)) == []
+           and run("contacts_access_policy", registry.ManifestInputs(profile=low_target, app_purpose={}, app_dir=d)) == [])
+    contacts = run("contacts_access_policy", registry.ManifestInputs(profile=loc, app_purpose={}, app_dir=d))
+    _check("contacts_picker_suggestion",
+           len(contacts) == 1 and contacts[0]["severity"] == "SUGGESTION"
+           and contacts[0]["decision_trace"]["rule"] == "contacts_picker", json.dumps(contacts)[:200])
+
+    # Wave-4 Nouls: annotate when a host finding exists; Suggestion when the role is held.
+    class _P(JevClient):
+      def __init__(self, p):
+        super().__init__()
+        self.name = "fixed"
+        self.p = p
+      def system_one(self, state, questions, model=None):
+        return {qid: JevAnswer(type="noul", noul=self.p) for qid in questions}
+
+    ctx = engine.RunContext(temp_dir=d, app_dir=d, app_facts={"name": "w4"}, manifest={}, profile=prof)
+    findings = {"permissions_and_apis": [dict(f) for f in sms]}
+    engine._run_wave4_signals(ctx, _P(0.9), None, findings)  # pylint: disable=protected-access
+    host = next(f for f in findings["permissions_and_apis"] if f["decision_trace"]["rule"] == "sms_without_default_handler")
+    _check("otp_annotates_sms_finding", "retriever" in host["recommendation"] and "reads_one_time_code" in host["decision_trace"],
+           host["recommendation"][-180:])
+    ctx2 = engine.RunContext(temp_dir=d, app_dir=d, app_facts={"name": "w4"}, manifest={}, profile=handler)
+    alone = {"permissions_and_apis": []}
+    engine._run_wave4_signals(ctx2, _P(0.9), None, alone)  # pylint: disable=protected-access
+    otp = [f for f in alone["permissions_and_apis"] if f["decision_trace"]["rule"] == "reads_one_time_code"]
+    _check("otp_suggestion_when_no_sms_finding", len(otp) == 1 and otp[0]["severity"] == "SUGGESTION" and otp[0].get("review_only"),
+           json.dumps(otp)[:240])
+    ctx3 = engine.RunContext(temp_dir=d, app_dir=d, app_facts={"name": "w4"}, manifest={}, profile=tool)
+    sip = {"permissions_and_apis": []}
+    engine._run_wave4_signals(ctx3, _P(0.91), None, sip)  # pylint: disable=protected-access
+    crit = [f for f in sip["permissions_and_apis"] if f["policy_id"] == "accessibility_api_policy"]
+    _check("screen_siphon_critical_review", len(crit) == 1 and crit[0]["severity"] == "CRITICAL" and crit[0].get("review_only"),
+           json.dumps(crit)[:240])
+    quiet = {"permissions_and_apis": []}
+    engine._run_wave4_signals(ctx3, _P(0.2), None, quiet)  # pylint: disable=protected-access
+    _check("screen_siphon_below_bar_silent", quiet["permissions_and_apis"] == [])
+
+  # WP13 audio Noul: a compliant battery (core + disclosed + local) becomes Critical + review.
+  def ans(p_rel=0.9, core=0.9, disc=0.9, tx=0.1, cont=0.1):
+    return {
+        "signal_relevant": JevAnswer(type="noul", noul=p_rel),
+        "is_core_functionality": JevAnswer(type="noul", noul=core),
+        "has_prominent_disclosure": JevAnswer(type="noul", noul=disc),
+        "transmits_offdevice": JevAnswer(type="noul", noul=tx),
+        "severity": JevAnswer(type="score", score=0.0),
+        "captures_audio_continuously_in_background": JevAnswer(type="noul", noul=cont),
+    }
+  state = {"signal": {"file": "Mic.kt", "line": 4, "matched_line": "startRecording"}, "anchor": {"tier": 3}}
+  raised = evaluate._compose_permission_finding(  # pylint: disable=protected-access
+      "AUDIO", "audio_recording_policy", state, ans(cont=0.9), "fixed")
+  _check("continuous_audio_raises_compliant_to_critical",
+         raised is not None and raised["severity"] == "CRITICAL" and raised.get("needs_manual_review")
+         and raised["decision_trace"]["continuous_capture"]["p"] == 0.9, json.dumps(raised)[:300] if raised else "none")
+  quiet_audio = evaluate._compose_permission_finding(  # pylint: disable=protected-access
+      "AUDIO", "audio_recording_policy", state, ans(cont=0.15), "fixed")
+  _check("continuous_audio_below_bar_stays_compliant", quiet_audio is None, str(quiet_audio)[:200])
+
+
 def main() -> int:
   _test_triage_diff()
   _test_app_profile()
@@ -3788,6 +3984,7 @@ def main() -> int:
   _test_wave2_storage_policies()
   _test_data_type_confirmed()
   _test_identity_lifecycle()
+  _test_wave4_and_wave5()
   _test_lexical_pregate()
   _test_parse_finding()
   _test_snippet_and_colocation()
