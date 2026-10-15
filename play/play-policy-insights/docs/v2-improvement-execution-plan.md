@@ -845,6 +845,44 @@ Implements plan §6.1 and the structural half of L5; unblocks WP5.
   `account_deletion` finding and `login_gate_type=user_remote_server_credentials`
   recorded. Both match the legacy adjudication.
 - **Size.** Medium in `registry.py`, `questions.py`, `evaluate.py`.
+- **Outcome (done).** Implemented as an **app-level** stage rather than a
+  per-file `CODE_SIGNAL` spec, because neither policy is decidable from one
+  file. `identity.py` scans the shipped first-party source once (closed
+  regex families; comments and string literals skipped) and `engine.py`
+  Stage 6b composes at most one finding per policy per app into the
+  `user_account` goal. Three refinements:
+  1. A provision verb plus an identity token counts only with network reach:
+     the file's own lines, an import classified as egress / telemetry, or
+     **one first-party hop** resolved over the whole file (the API object is
+     usually a constructor parameter).
+  2. Provisioning with no deletion-shaped call is IMPORTANT
+     `no_deletion_path` only when a site persists the identity; otherwise
+     SUGGESTION + review `persistence_unconfirmed`. With candidates,
+     `is_remote_delete` confirms the compliant path (traced, no finding);
+     otherwise `clears_local_state_only` decides `local_only` vs
+     `unconfirmed`. A model answer only confirms compliance.
+  3. `login_gate_type` is asked once per app, only when login evidence
+     exists, and cached by digest. `unknown` and client failures compose as
+     SUGGESTION + review.
+  Live results: **App A → IMPORTANT `account_deletion` (`no_deletion_path`)**
+  from six provisioning sites, four persisting the identity, zero deletion
+  candidates; login gate `user_remote_server_credentials` at p 0.83 →
+  recorded, no finding. **App B → no `account_deletion` finding** and
+  `login_gate_type = user_remote_server_credentials` at p 0.99 → recorded,
+  no finding. Both match the legacy adjudication. `calibrate --rejoin`
+  exit 0, zero missing positives. Selftest 564 → 596 checks. Rollback:
+  `IDENTITY_LIFECYCLE_ENABLED` / `LOGIN_GATE_ENABLED = False`. Version bump
+  folded into M3.
+- **Environment note.** The working environment was reset after the WP11
+  live runs. The two dev-app checkouts, the label file and the answer caches
+  were rebuilt from the surviving artifact copy of the 48-case label set.
+  Schema-v2 `confirmed_type` was restored only for the three adjudications
+  this plan records; `destination_class` labels are to be re-adjudicated
+  before that block of `calibrate` is read again. App A was re-cloned and
+  App B re-exported at current revisions, so one negative label
+  (`OrbotBottomSheet.kt`) no longer meets a finding (47 of 48 join; every
+  positive still does). The rebuilt runs reproduced the outcomes above.
+  Label file, snapshots and caches are mirrored to a persistent store.
 
 ### WP12 — Wave 4 policies in review-only mode (`sms_call_log_policy`, `accessibility_api_policy`)
 
@@ -1069,7 +1107,7 @@ touching the rest of the cascade.
 - [x] WP8 consent defaults, string resources, flavor attribution
 - [x] WP9 wave 2 policies
 - [x] WP10 `data_type_confirmed`
-- [ ] WP11 wave 3 policies
+- [x] WP11 wave 3 policies
 - [ ] **M3 gate**
 - [ ] WP12 wave 4 (review-only) + fixture apps
 - [ ] WP13 wave 5 refinements

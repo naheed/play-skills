@@ -816,6 +816,78 @@ a finding.
   (cached answers for the previous battery text become valid again) and composes exactly as
   WP9 did.
 
+**Account lifecycle and login gate (WP11, wave 3)**
+(`identity.py`, `questions.account_deletion_lifecycle_battery`, `questions.login_gate_battery`,
+`engine._identity_assessment` / `_run_identity_lifecycle` / `_ask_login_gate`,
+`templates.lifecycle_summary` / `login_gate_summary`). Two policies in the user-account area
+cannot be decided from any one file: whether an app that *creates* an account for the user
+also lets the user *delete* it (`account_deletion`), and whether the app's login screen is a
+gate to an app account at all (`login_credentials`). Both are **app-level** facts, so WP11 adds
+one deterministic scan over the whole shipped first-party source and composes at most one
+finding per policy per app, in the `user_account` goal (`worker_user_account.json`).
+
+- **Deterministic scan.** `identity.scan_app` walks every file in the WP6 first-party index
+  (the shipped flavours only; capped at `MAX_LIFECYCLE_FILES`), skips comments and string
+  literals (`structure.is_code_line`, `structure.code_portion`) and records, per line, matches
+  for seven closed regex families in `constants`: **provision** (`registerDevice`,
+  `createAccount`, `sign_up`, …), **delete** (`deleteAccount`, `unregisterDevice`,
+  `request_deletion`, `@DELETE(`, …), **identity** tokens (`accountId`, `customerId`, `uid`,
+  `token`, …), **network** shape (`@POST(`, `HttpURLConnection`, `openConnection(`, a URL
+  literal, …), **persist** shape (`putString(`, `.edit()`, `Dao`, `DataStore`, `KeyStore`,
+  `insert*(`, …), **login** shape (`login`, `password`, `signIn`, `credentials`, …) and
+  **user-server** shape (`host`, `port`, `ftp`, `sftp`, `smb`, `ssh`, `webdav`, `imap`, …).
+  Only files with an *activating* kind (provision, delete or login) are kept, at most
+  `MAX_LIFECYCLE_HITS_PER_FILE` hits per kind. The identifiers are Android-platform, stdlib
+  and protocol names — no vendor names — and the selftest lints them.
+- **Provisioning site** = a provision verb **and** an identity token **and** *network reach*
+  in the same file. Reach is looked for in three places, cheapest first: the file's own lines
+  (`file`), an import classified as network egress / telemetry by the capability cache
+  (`import`), or one first-party hop (`hop`: the callees the file references, resolved through
+  the WP6 index over the *whole* file, because the API object is usually a constructor
+  parameter, not a local). A site is `persisted` when the same file has a persist shape. A
+  **deletion candidate** is a delete verb with an identity token; it is `remote_shaped` when
+  the same reach test succeeds, and candidates are ranked remote-shaped first.
+- **`account_deletion` composition** (`_run_identity_lifecycle`). No provisioning site →
+  nothing (an app that only stores the user's own server credentials, or has no account
+  system, owes no deletion path). Provisioning and no candidate → **IMPORTANT
+  `no_deletion_path`** when a site persists the identity (the account outlives the session
+  and nothing in the shipped source removes it), otherwise **SUGGESTION + review
+  `persistence_unconfirmed`** — the evaluator does not assert an Important it cannot support
+  from the source. Provisioning with candidates → two Nouls on up to `MAX_DELETION_CANDIDATES
+  = 3` candidates, strongest first: `is_remote_delete` at or above `T_REMOTE_DELETE = 0.60`
+  on any candidate is the compliant path (no finding; traced as `remote_delete_confirmed`);
+  otherwise the best candidate decides — `clears_local_state_only` at or above
+  `T_LOCAL_ONLY_DELETE = 0.60` → **IMPORTANT `local_only`**, else **IMPORTANT + review
+  `unconfirmed`**. A client failure keeps the finding and adds review. A model judgement
+  only ever *confirms* the compliant path; it never hides the provisioning fact.
+- **`login_credentials` composition** (`_ask_login_gate`). One closed Choice per app,
+  `login_gate_type` ∈ {`app_account`, `user_remote_server_credentials`,
+  `third_party_sign_in_bridge`, `none`, `unknown`}, asked only when the scan found login
+  evidence and cached in the capability cache by the digest of state + question.
+  `app_account` or `third_party_sign_in_bridge` at or above `CONF_LOGIN_GATE = 0.70` →
+  **IMPORTANT**; `user_remote_server_credentials` or `none` at or above the bar → recorded,
+  **no finding**; anything else, including a client failure, → **SUGGESTION + review**.
+  The answer is copied to `app_facts["login_gate"]` and to `typesafe_triage.json["login_gate"]`.
+- **Trace and triage.** `typesafe_triage.json["identity_lifecycle"]` holds the assessment,
+  every asked row and `outcome`. Counters `identity_lifecycle{...}`, `login_gate_requests`
+  and `login_gate_outcome` are the one-line summary. Every decision is logged at INFO.
+- **What it did on the dev apps.** App A: 549 shipped files, 14 activating, **six
+  provisioning sites** (`registerCustomer` / `registerDevice` / `createOrRegisterCid` /
+  `createOrRegisterDid` in the billing API, the billing backend client, the in-app billing
+  handler and two workers — one reached only through a first-party hop), four persisting the
+  identity, **no deletion candidate** → one **IMPORTANT `account_deletion`
+  (`no_deletion_path`)**, no model call. Login evidence (proxy settings: `password` with
+  `host` / `port`) came back `user_remote_server_credentials` at p 0.83 → recorded, no
+  `login_credentials` finding. App B: no provisioning site → nothing; FTP / SMB / SFTP
+  credential forms came back `user_remote_server_credentials` at p 0.99 → recorded, no
+  finding. `calibrate --rejoin` stays at zero missing positives.
+- **Stand-in client.** `HeuristicJevClient` answers `is_remote_delete` 0.85 when the state
+  carries network indicators (0.15 otherwise) and `clears_local_state_only` as the
+  complement, and peaks `login_gate_type` on `unknown`. Labelled as a stand-in, never used
+  in a live run.
+- Rollback: `IDENTITY_LIFECYCLE_ENABLED = False` and `LOGIN_GATE_ENABLED = False`. With both
+  off the scan is not run. Add a verb only with a selftest fixture that needs it.
+
 **Play declaration check** (`_run_play_declaration`) runs only for TRANSMITS findings and only
 when a Play declaration is present; UNCERTAIN findings are not turned into Non-Compliant
 verdicts on their own.
@@ -874,6 +946,9 @@ facts as a dict (`source`, `sink`) for downstream tooling; the finding's top-lev
 `media_hints` (WP9)), `sinks`, `relevance` (`ok`/`low`), `disclosure_reconciled`,
 `destination` (WP7), `consent` (WP8), `media_access` / `root_folder` (WP9),
 `type_confirmation` / `type_note` (WP10), `model`, `taxonomy_version` and `evaluator_version`.
+The two app-level WP11 findings have their own trace shape: `account_deletion` records `mode`,
+the whole `assessment`, the `asked` candidate rows and the two deletion thresholds;
+`login_credentials` records `login_gate` and `CONF_LOGIN_GATE`.
 
 ### 3.4 Triage file (`typesafe_triage.json`)
 
@@ -893,7 +968,10 @@ third-party, packages, refined, dependencies, capability-cache hits/misses,
 histogram and unknown count), `dependency_capabilities`, `sinks_by_file`, `thresholds`,
 `dropped` (every candidate not asked, with reason and rank data), and `type_confirmations`
 (WP10: every finding whose `data_type_confirmed` answer was not `as_labelled`, with the
-counter `type_confirmations{as_labelled, relabelled, not_personal, unknown}`). This is the
+counter `type_confirmations{as_labelled, relabelled, not_personal, unknown}`),
+`identity_lifecycle` and `login_gate` (WP11: the account-lifecycle assessment with its
+`outcome`, and the once-per-app `login_gate_type` answer; counters `identity_lifecycle{...}`,
+`login_gate_requests`, `login_gate_outcome`). This is the
 observability surface for the run; the legacy pipeline had none.
 
 ## 4. Calibration (`calibrate.py`)
